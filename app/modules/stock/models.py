@@ -1,0 +1,53 @@
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.database import Base
+from app.modules.catalog.models import ExtraIngredient  # noqa: F401  # DB-03: re-export for stock module
+
+
+class Ingredient(Base):
+    __tablename__ = "ingredients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    current_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)
+    alert_threshold: Mapped[float] = mapped_column(Numeric(12, 3), default=0)
+    # [PROD] Rate-limit alertes stock : ne pas renvoyer si alerte < 4h.
+    # Necessite migration Alembic : ALTER TABLE ingredients ADD COLUMN last_alert_sent_at TIMESTAMPTZ.
+    last_alert_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def is_below_threshold(self) -> bool:
+        return float(self.current_qty) < float(self.alert_threshold)
+
+
+class ProductIngredient(Base):
+    __tablename__ = "product_ingredients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    ingredient_id: Mapped[int] = mapped_column(ForeignKey("ingredients.id"), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+
+
+class VariantIngredient(Base):
+    __tablename__ = "variant_ingredients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    variant_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    ingredient_id: Mapped[int] = mapped_column(ForeignKey("ingredients.id"), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+
+
+class StockMovement(Base):
+    __tablename__ = "stock_movements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ingredient_id: Mapped[int] = mapped_column(ForeignKey("ingredients.id"), nullable=False)
+    quantity_delta: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # DB-02: audit trail
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -1,0 +1,433 @@
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import PlainTextResponse
+
+from app.core.database import get_tenant_session
+from app.core.http.deps import get_pagination, require_role
+from app.core.http.limiter import limiter
+from app.core.http.schemas import PaginationParams
+from app.modules.catalog import service
+from app.modules.catalog.models import Category
+from app.modules.catalog.schemas import (
+    CatalogCsvConfirmResponse,
+    CatalogCsvDryRunResponse,
+    CatalogCsvImportRequest,
+    CatalogPaginatedResponse,
+    CategoryCreate,
+    CategoryOut,
+    ExtraCreate,
+    ExtraOut,
+    ExtraUpdate,
+    PriceAuditOut,
+    ProductCreate,
+    ProductDetailOut,
+    ProductExtraLink,
+    ProductOut,
+    ProductRecommendationCreate,
+    ProductRecommendationOut,
+    ProductRecommendationUpdate,
+    ProductSummaryOut,
+    ProductSuggestionOut,
+    ProductUpdate,
+    VariantCreate,
+    VariantOut,
+    VariantUpdate,
+)
+
+router = APIRouter()
+
+
+def _user_id(current_user: dict) -> int | None:
+    value = current_user.get("id")
+    return int(value) if value is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Categories
+# ---------------------------------------------------------------------------
+
+
+@router.get("/categories", response_model=CatalogPaginatedResponse[CategoryOut])
+@limiter.limit("60/minute")
+async def categories(
+    request: Request,
+    pagination: PaginationParams = Depends(get_pagination),
+):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    async with get_tenant_session(slug) as session:
+        items, total = await service.list_categories(session, pagination)
+    return CatalogPaginatedResponse.build(items, total, pagination)
+
+
+@router.post("/categories", response_model=CategoryOut, status_code=201)
+async def create_category(body: CategoryCreate, current_user=Depends(require_role("admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        category = Category(**body.model_dump())
+        session.add(category)
+        await session.commit()
+        await session.refresh(category)
+        return category
+
+
+# ---------------------------------------------------------------------------
+# Products - public/client API
+# ---------------------------------------------------------------------------
+
+
+@router.get("/products", response_model=CatalogPaginatedResponse[ProductSummaryOut])
+@limiter.limit("60/minute")
+async def products(
+    request: Request,
+    pagination: PaginationParams = Depends(get_pagination),
+    q: str | None = Query(None, min_length=2, max_length=100, description="Recherche full-text (francais)"),
+    category_id: int | None = Query(None, description="Filtre par categorie"),
+    allergen_slug: str | None = Query(None, description="Slug allergene explicite"),
+    dietary_tag_slug: str | None = Query(None, description="Slug dietary tag explicite"),
+    allergen: str | None = Query(None, deprecated=True, description="Alias retrocompatible de allergen_slug"),
+    dietary_tag: str | None = Query(None, deprecated=True, description="Alias retrocompatible de dietary_tag_slug"),
+):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    effective_allergen = allergen_slug or allergen
+    effective_dietary = dietary_tag_slug or dietary_tag
+    async with get_tenant_session(slug) as session:
+        if q or category_id is not None or effective_allergen or effective_dietary:
+            offset = (pagination.page - 1) * pagination.page_size
+            items, total = await service.search_products(
+                session,
+                q=q,
+                category_id=category_id,
+                allergen_slug=effective_allergen,
+                dietary_tag_slug=effective_dietary,
+                limit=pagination.page_size,
+                offset=offset,
+            )
+        else:
+            items, total = await service.list_products(session, pagination)
+        summaries = await service.build_product_summaries(session, items, include_availability=True)
+    return CatalogPaginatedResponse.build(summaries, total, pagination)
+
+
+@router.get("/products/suggestions", response_model=list[ProductSuggestionOut])
+@limiter.limit("60/minute")
+async def product_suggestions(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=100),
+    limit: int = Query(8, ge=1, le=20),
+):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    async with get_tenant_session(slug) as session:
+        return await service.suggest_products(session, q, limit)
+
+
+@router.get("/products/{product_id}", response_model=ProductDetailOut)
+@limiter.limit("60/minute")
+async def product_detail(request: Request, product_id: int):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    async with get_tenant_session(slug) as session:
+        return await service.get_product_detail(session, product_id)
+
+
+# ---------------------------------------------------------------------------
+# Products - admin writes
+# ---------------------------------------------------------------------------
+
+
+@router.post("/products", response_model=ProductOut, status_code=201)
+async def create_product(body: ProductCreate, current_user=Depends(require_role("admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_product(session, body, user_id=_user_id(current_user))
+
+
+@router.put("/products/{product_id}", response_model=ProductOut)
+async def update_product(
+    product_id: int,
+    body: ProductUpdate,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        if body.is_active is True:
+            from app.modules.catalog.allergen.allergen_service import validate_product_for_publication
+
+            await validate_product_for_publication(session, product_id)
+        return await service.update_product(session, product_id, body, user_id=_user_id(current_user))
+
+
+@router.delete("/products/{product_id}", status_code=204)
+async def delete_product(product_id: int, current_user=Depends(require_role("admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.update_product(
+            session,
+            product_id,
+            ProductUpdate(is_active=False),
+            user_id=_user_id(current_user),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Variants
+# ---------------------------------------------------------------------------
+
+
+@router.post("/products/{product_id}/variants", response_model=VariantOut, status_code=201)
+async def create_variant(
+    product_id: int,
+    body: VariantCreate,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_variant(session, product_id, body, user_id=_user_id(current_user))
+
+
+@router.get("/products/{product_id}/variants", response_model=list[VariantOut])
+@limiter.limit("60/minute")
+async def list_variants(
+    request: Request,
+    product_id: int,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.list_variants(session, product_id)
+
+
+@router.put("/products/{product_id}/variants/{variant_id}", response_model=VariantOut)
+async def update_variant(
+    product_id: int,
+    variant_id: int,
+    body: VariantUpdate,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.update_variant(
+            session,
+            product_id,
+            variant_id,
+            body,
+            user_id=_user_id(current_user),
+        )
+
+
+@router.delete("/products/{product_id}/variants/{variant_id}", status_code=204)
+async def delete_variant(
+    product_id: int,
+    variant_id: int,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.delete_variant(session, product_id, variant_id)
+
+
+# ---------------------------------------------------------------------------
+# Extras <-> Products
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/products/{product_id}/extras/{extra_id}",
+    response_model=ProductExtraLink,
+    status_code=201,
+)
+async def link_extra(
+    product_id: int,
+    extra_id: int,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.link_extra_to_product(session, product_id, extra_id)
+    return ProductExtraLink(product_id=product_id, extra_id=extra_id, linked=True)
+
+
+@router.delete("/products/{product_id}/extras/{extra_id}", status_code=204)
+async def unlink_extra(
+    product_id: int,
+    extra_id: int,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.unlink_extra_from_product(session, product_id, extra_id)
+
+
+@router.get("/products/{product_id}/extras", response_model=list[ExtraOut])
+@limiter.limit("60/minute")
+async def list_product_extras(
+    request: Request,
+    product_id: int,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.list_product_extras(session, product_id)
+
+
+# ---------------------------------------------------------------------------
+# Extras
+# ---------------------------------------------------------------------------
+
+
+@router.get("/extras", response_model=CatalogPaginatedResponse[ExtraOut])
+@limiter.limit("60/minute")
+async def extras(
+    request: Request,
+    pagination: PaginationParams = Depends(get_pagination),
+):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    async with get_tenant_session(slug) as session:
+        items, total = await service.list_extras(session, pagination)
+    return CatalogPaginatedResponse.build(items, total, pagination)
+
+
+@router.post("/extras", response_model=ExtraOut, status_code=201)
+async def create_extra(body: ExtraCreate, current_user=Depends(require_role("admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_extra(session, body, user_id=_user_id(current_user))
+
+
+@router.put("/extras/{extra_id}", response_model=ExtraOut)
+async def update_extra(
+    extra_id: int,
+    body: ExtraUpdate,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.update_extra(session, extra_id, body, user_id=_user_id(current_user))
+
+
+# ---------------------------------------------------------------------------
+# Recommendations / bundles simples
+# ---------------------------------------------------------------------------
+
+
+@router.get("/products/{product_id}/recommendations", response_model=list[ProductRecommendationOut])
+async def list_recommendations(
+    product_id: int,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.list_product_recommendations(session, product_id)
+
+
+@router.post("/products/{product_id}/recommendations", response_model=ProductRecommendationOut, status_code=201)
+async def add_recommendation(
+    product_id: int,
+    body: ProductRecommendationCreate,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        recommendation = await service.add_product_recommendation(session, product_id, body)
+        items = await service.list_product_recommendations(session, product_id)
+        return next(item for item in items if item.id == recommendation.id)
+
+
+@router.put("/products/{product_id}/recommendations/{recommendation_id}", response_model=ProductRecommendationOut)
+async def update_recommendation(
+    product_id: int,
+    recommendation_id: int,
+    body: ProductRecommendationUpdate,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.update_product_recommendation(session, product_id, recommendation_id, body)
+        items = await service.list_product_recommendations(session, product_id)
+        return next(item for item in items if item.id == recommendation_id)
+
+
+@router.delete("/products/{product_id}/recommendations/{recommendation_id}", status_code=204)
+async def delete_recommendation(
+    product_id: int,
+    recommendation_id: int,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.delete_product_recommendation(session, product_id, recommendation_id)
+
+
+# ---------------------------------------------------------------------------
+# Import / export CSV
+# ---------------------------------------------------------------------------
+
+
+@router.post("/imports/csv/dry-run", response_model=CatalogCsvDryRunResponse)
+async def import_csv_dry_run(
+    body: CatalogCsvImportRequest,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.dry_run_catalog_csv(
+            session,
+            body.csv_text,
+            body.filename,
+            user_id=_user_id(current_user),
+        )
+
+
+@router.post("/imports/csv/{token}/confirm", response_model=CatalogCsvConfirmResponse)
+async def import_csv_confirm(
+    token: str,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.confirm_catalog_csv(session, token, user_id=_user_id(current_user))
+
+
+@router.get("/exports/csv", response_class=PlainTextResponse)
+async def export_csv(current_user=Depends(require_role("admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        csv_text = await service.export_catalog_csv(session)
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=catalog.csv"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin completeness and price audit
+# ---------------------------------------------------------------------------
+
+
+@router.get("/admin/completeness")
+async def catalog_completeness(current_user=Depends(require_role("staff", "admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_catalog_completeness(session)
+
+
+@router.get("/price-audit/{entity_type}/{entity_id}", response_model=CatalogPaginatedResponse[PriceAuditOut])
+async def price_audit(
+    entity_type: str,
+    entity_id: int,
+    pagination: PaginationParams = Depends(get_pagination),
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        items, total = await service.get_price_audit(session, entity_type, entity_id, pagination)
+    return CatalogPaginatedResponse.build(items, total, pagination)
+
+
+# ---------------------------------------------------------------------------
+# Super-admin read-only catalog access
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/super-admin/tenants/{tenant_slug}/products",
+    response_model=CatalogPaginatedResponse[ProductSummaryOut],
+)
+async def super_admin_products(
+    tenant_slug: str,
+    pagination: PaginationParams = Depends(get_pagination),
+    current_user=Depends(require_role("super-admin")),
+):
+    async with get_tenant_session(tenant_slug) as session:
+        items, total = await service.list_products(session, pagination, include_inactive=True)
+        summaries = await service.build_product_summaries(session, items, include_availability=True)
+    return CatalogPaginatedResponse.build(summaries, total, pagination)
+
+
+@router.get(
+    "/super-admin/tenants/{tenant_slug}/products/{product_id}",
+    response_model=ProductDetailOut,
+)
+async def super_admin_product_detail(
+    tenant_slug: str,
+    product_id: int,
+    current_user=Depends(require_role("super-admin")),
+):
+    async with get_tenant_session(tenant_slug) as session:
+        return await service.get_product_detail(session, product_id, include_inactive=True)
