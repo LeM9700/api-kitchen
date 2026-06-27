@@ -13,3 +13,4 @@ htmlcov/
 /.planning
 /.venv*
 /.superpowers
+/docs

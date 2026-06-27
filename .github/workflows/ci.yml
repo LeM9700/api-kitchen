@@ -63,8 +63,8 @@ jobs:
           python-version: "3.12"
       - name: Install uv
         run: pip install uv
-      - name: Install dependencies (lockfile)
-        run: uv sync --frozen --extra dev
+      - name: Install dependencies
+        run: uv sync --extra dev
       - name: Run Alembic migrations
         run: uv run alembic upgrade head
       - name: Run tests
