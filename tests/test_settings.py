@@ -1,0 +1,56 @@
+"""Tests de normalisation du schema DATABASE_URL.
+
+[PROD] Railway (et d'autres PaaS) exposent la variable Postgres avec le schema
+sync ``postgresql://`` (voire ``postgres://``), jamais ``postgresql+asyncpg://``.
+Si cette URL est transmise telle quelle a ``create_async_engine``, SQLAlchemy
+resout le driver sync par defaut (psycopg2, absent des dependances) et le
+service crash au demarrage avec ``ModuleNotFoundError: No module named
+'psycopg2'``. Le validator doit forcer le driver asyncpg quel que soit le
+schema fourni par l'infra.
+"""
+
+from app.core.config.settings import Settings
+
+_REQUIRED_KWARGS = {
+    "mongo_url": "mongodb://localhost:27017",
+    "arq_redis_url": "redis://localhost:6379",
+    "redis_url": "redis://localhost:6379",
+    "cloudinary_cloud_name": "test",
+    "cloudinary_api_key": "test",
+    "cloudinary_api_secret": "test",
+    "stripe_secret_key": "sk_test",
+    "stripe_webhook_secret": "whsec_test",
+    "jwt_secret": "x" * 32,
+}
+
+
+def _settings(**overrides) -> Settings:
+    return Settings(_env_file=None, **{**_REQUIRED_KWARGS, **overrides})
+
+
+def test_plain_postgresql_scheme_gets_asyncpg_driver():
+    s = _settings(database_url="postgresql://user:pass@host:5432/db")
+    assert s.database_url == "postgresql+asyncpg://user:pass@host:5432/db"
+
+
+def test_legacy_postgres_scheme_gets_asyncpg_driver():
+    s = _settings(database_url="postgres://user:pass@host:5432/db")
+    assert s.database_url == "postgresql+asyncpg://user:pass@host:5432/db"
+
+
+def test_explicit_asyncpg_scheme_is_left_untouched():
+    s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db")
+    assert s.database_url == "postgresql+asyncpg://user:pass@host:5432/db"
+
+
+def test_test_database_url_is_also_normalized():
+    s = _settings(
+        database_url="postgresql+asyncpg://user:pass@host:5432/db",
+        test_database_url="postgres://user:pass@host:5432/db_test",
+    )
+    assert s.test_database_url == "postgresql+asyncpg://user:pass@host:5432/db_test"
+
+
+def test_empty_test_database_url_is_left_untouched():
+    s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db")
+    assert s.test_database_url == ""

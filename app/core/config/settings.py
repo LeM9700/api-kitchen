@@ -1,6 +1,6 @@
 import pathlib
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to this file so the path works regardless of cwd.
@@ -12,6 +12,20 @@ class Settings(BaseSettings):
 
     database_url: str
     test_database_url: str = ""
+
+    @field_validator("database_url", "test_database_url")
+    @classmethod
+    def _force_asyncpg_driver(cls, v: str) -> str:
+        # Railway/Heroku-style Postgres plugins expose DATABASE_URL with the
+        # sync scheme ("postgres://" or "postgresql://"). Passed as-is to
+        # create_async_engine, SQLAlchemy silently resolves the default sync
+        # driver (psycopg2, not a project dependency) and crashes at startup
+        # with ModuleNotFoundError instead of a clear config error.
+        if v.startswith("postgres://"):
+            v = "postgresql://" + v[len("postgres://") :]
+        if v.startswith("postgresql://"):
+            v = "postgresql+asyncpg://" + v[len("postgresql://") :]
+        return v
     mongo_url: str
     mongo_db: str = "pizzeria_stats"
     arq_redis_url: str
