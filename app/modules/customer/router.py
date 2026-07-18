@@ -6,6 +6,7 @@ from app.core.http.limiter import limiter
 from app.modules.auth.schemas import TokenResponse
 from app.modules.customer import service
 from app.modules.customer.schemas import (
+    CustomerDataExportOut,
     CustomerDeleteRequest,
     CustomerOut,
     CustomerRegisterRequest,
@@ -32,6 +33,18 @@ async def register(
 @router.get("/me", response_model=CustomerOut)
 async def get_me(current_user: dict = Depends(require_role("customer"))):
     return await service.get_profile(int(current_user["id"]), current_user["tenant_slug"])
+
+
+@router.get("/me/export", response_model=CustomerDataExportOut)
+@limiter.limit("5/minute")
+async def export_me(request: Request, current_user: dict = Depends(require_role("customer"))):
+    """Exporte les donnees personnelles du client (profil + commandes).
+
+    [RGPD] Droit a la portabilite des donnees -- voir PRIVACY.md pour le
+    perimetre couvert. Rate-limite car potentiellement couteux (requete
+    commandes) et non destine a un usage frequent/automatise.
+    """
+    return await service.export_my_data(int(current_user["id"]), current_user["tenant_slug"])
 
 
 @router.patch("/me", response_model=CustomerOut)

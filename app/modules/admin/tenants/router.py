@@ -22,6 +22,7 @@ from app.core.database import get_tenant_session
 from app.core.http.deps import get_arq_pool, get_client_ip, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse
+from app.core.services.cache import get_cached_json, set_cached_json
 from app.modules.admin.tenants import service as tenant_service
 from app.modules.admin.tenants.schemas import (
     BusinessHoursCreate,
@@ -45,14 +46,25 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 
+def _tenant_status_cache_key(tenant_slug: str) -> str:
+    return f"tenant:status:{tenant_slug}"
+
+
 @router.get("/status", response_model=TenantStatusResponse)
 async def get_tenant_status(
     tenant_slug: str = Query(..., description="Slug du tenant"),
+    redis=Depends(get_arq_pool),
 ) -> TenantStatusResponse:
     """Retourne le statut operationnel courant du restaurant.
 
     Endpoint public -- ne requiert aucune authentification.
     Utilise par la vitrine cliente pour afficher l'etat d'ouverture.
+
+    [PERF] Mis en cache 10s -- endpoint a fort volume (consulte a chaque
+    ouverture d'app cliente) et faible frequence de changement reelle. Un
+    changement de statut (fermeture manuelle, etc.) est deja notifie en temps
+    reel via WebSocket (``notify_config_change``) independamment de ce cache ;
+    celui-ci n'affecte que le polling HTTP, pas la notification push.
 
     Args:
         tenant_slug: Slug du tenant (query param).
@@ -60,8 +72,16 @@ async def get_tenant_status(
     Returns:
         TenantStatusResponse avec is_open, prep_time, message, next_opening.
     """
+    cache_key = _tenant_status_cache_key(tenant_slug)
+    cached = await get_cached_json(redis, cache_key)
+    if cached is not None:
+        return cached
+
     async with get_tenant_session(tenant_slug) as session:
-        return await tenant_service.get_tenant_status(session)
+        result = await tenant_service.get_tenant_status(session)
+
+    await set_cached_json(redis, cache_key, result.model_dump(mode="json"), ttl_seconds=10)
+    return result
 
 
 @router.get("/next-opening", response_model=NextOpeningResponse)
@@ -145,7 +165,7 @@ async def patch_config(
     user_agent = request.headers.get("user-agent", "")
 
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await tenant_service.update_config(
+        result = await tenant_service.update_config(
             session,
             body,
             user_id=current_user["id"],
@@ -155,6 +175,8 @@ async def patch_config(
             arq_pool=arq_pool,
             tenant_slug=current_user["tenant_slug"],
         )
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
+    return result
 
 
 @router.patch("/toggle-closure", response_model=TenantConfigResponse)
@@ -188,7 +210,7 @@ async def toggle_closure(
     )
 
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await tenant_service.update_config(
+        result = await tenant_service.update_config(
             session,
             update_data,
             user_id=current_user["id"],
@@ -198,6 +220,8 @@ async def toggle_closure(
             arq_pool=arq_pool,
             tenant_slug=current_user["tenant_slug"],
         )
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
+    return result
 
 
 @router.put("/scheduled-closure", response_model=TenantConfigResponse)
@@ -206,13 +230,14 @@ async def schedule_closure(
     request: Request,
     body: TenantScheduledClosureRequest,
     current_user: dict = Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
 ) -> TenantConfigResponse:
     """Planifie ou annule une fermeture automatique du restaurant."""
     ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
 
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await tenant_service.schedule_closure(
+        result = await tenant_service.schedule_closure(
             session,
             body,
             user_id=current_user["id"],
@@ -220,6 +245,8 @@ async def schedule_closure(
             user_agent=user_agent,
             user_email=current_user.get("email"),
         )
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +298,7 @@ async def replace_business_hours(
     day: int,
     slots: list[BusinessHoursCreate],
     current_user: dict = Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
 ) -> list[BusinessHoursResponse]:
     """Remplace tous les creneaux d'un jour de la semaine.
 
@@ -290,7 +318,7 @@ async def replace_business_hours(
     user_agent = request.headers.get("user-agent", "")
 
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await tenant_service.upsert_business_hours(
+        result = await tenant_service.upsert_business_hours(
             session,
             day,
             slots,
@@ -298,6 +326,8 @@ async def replace_business_hours(
             ip_address=ip,
             user_agent=user_agent,
         )
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
+    return result
 
 
 @router.delete("/hours/{day}", status_code=status.HTTP_204_NO_CONTENT)
@@ -306,6 +336,7 @@ async def delete_business_hours(
     request: Request,
     day: int,
     current_user: dict = Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
 ) -> None:
     """Supprime tous les creneaux d'un jour de la semaine.
 
@@ -316,6 +347,7 @@ async def delete_business_hours(
     """
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await tenant_service.delete_business_hours_day(session, day)
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +377,7 @@ async def create_closure(
     request: Request,
     body: ExceptionalClosureCreate,
     current_user: dict = Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
 ) -> ExceptionalClosureResponse:
     """Cree une fermeture exceptionnelle pour une date future.
 
@@ -357,7 +390,9 @@ async def create_closure(
         ExceptionalClosureResponse creee.
     """
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await tenant_service.add_exceptional_closure(session, body)
+        result = await tenant_service.add_exceptional_closure(session, body)
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
+    return result
 
 
 @router.delete("/closures/{closure_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -366,6 +401,7 @@ async def delete_closure(
     request: Request,
     closure_id: int,
     current_user: dict = Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
 ) -> None:
     """Supprime une fermeture exceptionnelle par son identifiant.
 
@@ -376,3 +412,4 @@ async def delete_closure(
     """
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await tenant_service.delete_exceptional_closure(session, closure_id)
+    await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))

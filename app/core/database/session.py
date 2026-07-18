@@ -9,7 +9,14 @@ from sqlalchemy.orm import DeclarativeBase
 from app.core.config import settings
 from app.core.http.errors import AppError
 
-engine = create_async_engine(settings.database_url, echo=False)
+engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=1800,  # evite les connexions fermees cote serveur managé (Railway/Render)
+    pool_pre_ping=True,
+)
 public_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 TENANT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$")

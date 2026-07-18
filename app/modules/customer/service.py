@@ -10,9 +10,21 @@ from app.core.auth.security import get_password_hash, verify_password
 from app.core.auth.token_revocation import flag_user_disabled
 from app.core.database import get_public_session, get_tenant_session
 from app.core.http.errors import AppError
+from app.core.http.schemas import PaginationParams
 from app.modules.auth.models import RefreshToken, User
 from app.modules.auth.service import issue_tokens
-from app.modules.customer.schemas import CustomerOut, CustomerRegisterRequest, CustomerUpdateRequest
+from app.modules.customer.schemas import (
+    CustomerDataExportOut,
+    CustomerOrderExportOut,
+    CustomerOut,
+    CustomerRegisterRequest,
+    CustomerUpdateRequest,
+)
+
+# [RGPD] Nombre max de commandes incluses dans un export -- couvre la grande
+# majorite des clients sans risquer une reponse non bornee. `orders_truncated`
+# signale explicitement si des commandes plus anciennes ont ete omises.
+_EXPORT_MAX_ORDERS = 100
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -142,6 +154,43 @@ async def get_profile(user_id: int, tenant_slug: str) -> CustomerOut:
         if user is None:
             raise AppError("UNAUTHORIZED", "User not found", 401)
         return _build_customer_out(user)
+
+
+async def export_my_data(user_id: int, tenant_slug: str) -> CustomerDataExportOut:
+    """Exporte les donnees personnelles du client (profil + historique de commandes).
+
+    [RGPD] Repond au droit a la portabilite des donnees (Art. 20 RGPD) pour le
+    perimetre couvert par ce module -- profil + commandes. Voir PRIVACY.md pour
+    le perimetre complet et les limites connues.
+
+    Args:
+        user_id: Identifiant de l'utilisateur dans le schema tenant.
+        tenant_slug: Slug du tenant cible.
+
+    Returns:
+        CustomerDataExportOut avec le profil, les commandes recentes et un
+        indicateur de troncature si l'historique depasse `_EXPORT_MAX_ORDERS`.
+
+    Raises:
+        AppError: UNAUTHORIZED (401) si l'utilisateur est introuvable.
+    """
+    from app.modules.orders.service import list_my_orders  # noqa: PLC0415 (evite import circulaire au chargement du module)
+
+    async with get_tenant_session(tenant_slug) as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            raise AppError("UNAUTHORIZED", "User not found", 401)
+        profile = _build_customer_out(user)
+
+        pagination = PaginationParams(page=1, page_size=_EXPORT_MAX_ORDERS)
+        orders, total = await list_my_orders(session, pagination, user_id)
+
+    return CustomerDataExportOut(
+        profile=profile,
+        orders=[CustomerOrderExportOut(**order) for order in orders],
+        orders_truncated=total > _EXPORT_MAX_ORDERS,
+        exported_at=datetime.now(timezone.utc),
+    )
 
 
 async def update_profile(

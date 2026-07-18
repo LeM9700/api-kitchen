@@ -34,9 +34,9 @@ class WorkerSettings:
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
         ),
         # [⚠️ PROD] Expire les points de fidélité obsolètes — 3h00 UTC pour éviter
-        # de concurrencer le pic du soir. Timeout spécifique étendu à 600s
-        # pour les tenants avec beaucoup d'utilisateurs.
-        cron(expire_loyalty_points, hour=3, minute=0),
+        # de concurrencer le pic du soir. Timeout étendu à 600s (au lieu des 120s
+        # globaux ci-dessous) pour les tenants avec beaucoup d'utilisateurs.
+        cron(expire_loyalty_points, hour=3, minute=0, timeout=600),
         cron(aggregate_stock_snapshot, hour=set(range(24)), minute={0}),
         cron(
             process_scheduled_closures,

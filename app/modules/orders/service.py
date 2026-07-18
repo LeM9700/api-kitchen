@@ -384,11 +384,14 @@ async def list_my_orders(
     session: AsyncSession,
     pagination: PaginationParams,
     user_id: int,
+    statuses: list[str] | None = None,
 ) -> tuple[list[dict], int]:
-    stmt = select(Order).where(Order.user_id == user_id)
-    total = await session.scalar(
-        select(func.count()).select_from(Order).where(Order.user_id == user_id)
-    ) or 0
+    filters = [Order.user_id == user_id]
+    if statuses:
+        filters.append(Order.status.in_(statuses))
+
+    stmt = select(Order).where(*filters)
+    total = await session.scalar(select(func.count()).select_from(Order).where(*filters)) or 0
     result = await session.execute(
         stmt.order_by(Order.created_at.desc())
         .offset((pagination.page - 1) * pagination.page_size)
@@ -601,7 +604,7 @@ async def update_status(
     if actual_status == "confirmed":
         # Deduction de stock atomique avec la confirmation.
         low_stock = await deduct_for_order(
-            session, order_id, tenant_slug or "default", auto_commit=False
+            session, order_id, tenant_slug or "default", auto_commit=False, actor_user_id=actor_user_id
         )
         # Desactive le code promo atomiquement avec la confirmation.
         if order.promo_code:
@@ -614,7 +617,7 @@ async def update_status(
     elif actual_status == "cancelled" and previous_status == "confirmed":
         # [FIX 3] Le stock a deja ete deduit a la confirmation -- on le restitue
         # dans la meme transaction avant commit.
-        await restore_for_order(session, tenant_slug or "default", order_id)
+        await restore_for_order(session, tenant_slug or "default", order_id, actor_user_id=actor_user_id)
 
     await session.commit()
     await session.refresh(order)

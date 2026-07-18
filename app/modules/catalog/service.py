@@ -290,12 +290,17 @@ async def _availability_map(session: AsyncSession, product_ids: list[int]) -> di
         return {}
     from app.modules.stock import service as stock_service
 
+    try:
+        raw_availability = await stock_service.get_products_availability(session, product_ids)
+    except Exception:
+        raw_availability = {}
+
     availability: dict[int, ProductAvailabilityOut] = {}
     for product_id in product_ids:
-        try:
-            data = await stock_service.get_product_availability(session, product_id)
-        except Exception:
-            data = {"product_id": product_id, "available": True, "limiting_ingredient": None}
+        data = raw_availability.get(
+            product_id,
+            {"product_id": product_id, "available": True, "limiting_ingredient": None},
+        )
         availability[product_id] = ProductAvailabilityOut(**data)
     return availability
 
@@ -376,6 +381,9 @@ async def search_products(
     limit: int,
     offset: int,
     include_inactive: bool = False,
+    price_min: float | None = None,
+    price_max: float | None = None,
+    allergen_free: bool = False,
 ) -> tuple[list[Product], int]:
     stmt = select(Product)
     if not include_inactive:
@@ -383,6 +391,23 @@ async def search_products(
 
     if category_id is not None:
         stmt = stmt.where(Product.category_id == category_id)
+
+    if price_min is not None:
+        stmt = stmt.where(Product.base_price >= price_min)
+
+    if price_max is not None:
+        stmt = stmt.where(Product.base_price <= price_max)
+
+    if allergen_free:
+        # Aucun allergene "present" declare sur le produit.
+        stmt = stmt.where(
+            text(
+                "NOT EXISTS ("
+                "  SELECT 1 FROM product_allergens pa"
+                "  WHERE pa.product_id = products.id AND pa.level = 'present'"
+                ")"
+            )
+        )
 
     if q:
         stmt = stmt.where(
@@ -612,6 +637,39 @@ async def update_extra(
     await session.commit()
     await session.refresh(extra)
     return extra
+
+
+async def delete_extra(session: AsyncSession, extra_id: int) -> None:
+    """Supprime definitivement un extra.
+
+    Refuse la suppression tant que l'extra est encore lie a au moins un
+    produit (product_extras) — l'admin doit d'abord le delier via
+    ``DELETE /products/{product_id}/extras/{extra_id}``.
+
+    Args:
+        session: Session SQLAlchemy async dans le schema tenant courant.
+        extra_id: Cle primaire de l'extra a supprimer.
+
+    Raises:
+        AppError: EXTRA_NOT_FOUND (404) si l'extra n'existe pas.
+        AppError: EXTRA_STILL_LINKED (409) si l'extra est encore lie a un produit.
+    """
+    extra = await session.get(Extra, extra_id)
+    if extra is None:
+        raise AppError("EXTRA_NOT_FOUND", f"Extra {extra_id} not found", 404)
+
+    linked_count = await session.scalar(
+        select(func.count()).select_from(ProductExtra).where(ProductExtra.extra_id == extra_id)
+    )
+    if linked_count:
+        raise AppError(
+            "EXTRA_STILL_LINKED",
+            f"Extra {extra_id} is still linked to {linked_count} product(s); unlink it first",
+            409,
+        )
+
+    await session.delete(extra)
+    await session.commit()
 
 
 async def link_extra_to_product(session: AsyncSession, product_id: int, extra_id: int) -> None:

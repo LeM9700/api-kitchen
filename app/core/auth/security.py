@@ -51,8 +51,8 @@ def compute_token_lookup(token: str) -> str:
     un SELECT WHERE token_lookup = ? au lieu de scanner tous les tokens bcrypt.
 
     [SECURITE] HMAC-SHA256 resiste aux attaques par timing et ne revele pas
-    le token original. La cle HMAC est settings.jwt_secret ; un secret dedie
-    est preferable en production pour separer les responsabilites.
+    le token original. La cle HMAC est settings.jwt_hmac_secret (secret dedie,
+    separe de jwt_secret) — fallback sur jwt_secret si non configure.
 
     [PERF] Le lookup passe de O(n*bcrypt) a O(1) index + 1 bcrypt.
 
@@ -62,8 +62,9 @@ def compute_token_lookup(token: str) -> str:
     Returns:
         Digest hexadecimal HMAC-SHA256 (64 caracteres).
     """
+    hmac_secret = settings.jwt_hmac_secret or settings.jwt_secret
     return _hmac.new(
-        settings.jwt_secret.encode("utf-8"),
+        hmac_secret.encode("utf-8"),
         token.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()

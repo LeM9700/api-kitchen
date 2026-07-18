@@ -18,7 +18,14 @@ class Settings(BaseSettings):
     stripe_secret_key: str
     stripe_webhook_secret: str
     jwt_secret: str
+    # Cle dediee pour le HMAC de lookup des refresh tokens (compute_token_lookup).
+    # Vide = fallback sur jwt_secret (comportement historique) — définir une valeur
+    # dédiée sépare la responsabilité de signature JWT de celle du lookup en DB.
+    jwt_hmac_secret: str = ""
     environment: str = "local"
+
+    # Sentry — APM + tracking d'erreurs. Vide = désactivé (ex: en local/CI).
+    sentry_dsn: str = ""
 
     jwt_access_expire_minutes: int = 15
     jwt_refresh_expire_days: int = 30

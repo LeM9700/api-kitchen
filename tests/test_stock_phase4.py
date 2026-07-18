@@ -142,6 +142,34 @@ async def test_restore_for_order_applies_variant_and_extra_ingredients():
     assert all(movement.reason == "cancel:10" for movement in session.added)
 
 
+@pytest.mark.asyncio
+async def test_deduct_and_restore_for_order_set_actor_user_id():
+    """P2-15 : les StockMovement automatiques (deduction/restauration) doivent
+    tracer l'utilisateur (staff) qui a declenche la transition de statut, au
+    meme titre que les mouvements manuels (supply)."""
+    from app.modules.orders.models import OrderItem
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient, ProductIngredient
+
+    ingredient = Ingredient(id=1, name="Pate", unit="kg", current_qty=10, alert_threshold=1)
+    item = OrderItem(order_id=10, product_id=100, quantity=2, unit_price=10, total=20)
+    session = FakeSession(
+        order_items=[item],
+        product_recipes=[ProductIngredient(product_id=100, ingredient_id=1, quantity=1)],
+        variant_recipes=[],
+        extra_recipes=[],
+        ingredients={1: ingredient},
+    )
+
+    await service.deduct_for_order(session, 10, auto_commit=False, actor_user_id=21)
+    assert all(movement.user_id == 21 for movement in session.added)
+
+    session.added.clear()
+    ingredient.current_qty = 8
+    await service.restore_for_order(session, "default", 10, actor_user_id=21)
+    assert all(movement.user_id == 21 for movement in session.added)
+
+
 async def test_create_variant_recipe_endpoint_persists_link(client, monkeypatch, staff_user_override):
     from app.modules.stock.models import VariantIngredient
 

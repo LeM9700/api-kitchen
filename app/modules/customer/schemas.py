@@ -77,3 +77,27 @@ class CustomerUpdateRequest(BaseModel):
 
 class CustomerDeleteRequest(BaseModel):
     password: str
+
+
+class CustomerOrderExportOut(BaseModel):
+    """Resume d'une commande pour l'export de donnees personnelles."""
+
+    id: int
+    status: str
+    total: float
+    created_at: datetime
+
+
+class CustomerDataExportOut(BaseModel):
+    """Export complet des donnees personnelles du client (portabilite RGPD).
+
+    Perimetre volontairement scope aux donnees directement identifiantes/liees
+    au compte (profil + historique de commandes, borne aux 100 plus recentes).
+    """
+
+    profile: CustomerOut
+    orders: list[CustomerOrderExportOut]
+    orders_truncated: bool = Field(
+        description="True si le client a plus de commandes que celles incluses ci-dessus."
+    )
+    exported_at: datetime

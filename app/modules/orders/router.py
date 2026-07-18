@@ -85,9 +85,11 @@ async def create_order(
 async def list_my_orders(
     current_user=Depends(get_current_user),
     pagination: PaginationParams = Depends(get_pagination),
+    status: str | None = Query(None, description="Comma-separated statuses"),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        items, total = await service.list_my_orders(session, pagination, int(current_user["id"]))
+        statuses = [part.strip() for part in status.split(",") if part.strip()] if status else None
+        items, total = await service.list_my_orders(session, pagination, int(current_user["id"]), statuses)
     return PaginatedResponse.build(items, total, pagination)
 
 

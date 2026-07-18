@@ -230,6 +230,7 @@ async def deduct_for_order(
     tenant_slug: str = "default",
     auto_commit: bool = True,
     arq_pool: ArqRedis | None = None,
+    actor_user_id: int | None = None,
 ) -> list[Ingredient]:
     """Deduit le stock pour tous les items d'une commande.
 
@@ -244,6 +245,8 @@ async def deduct_for_order(
         auto_commit: Si True (defaut), commit la session et enqueue les alertes
             stock arq avant de retourner. Si False, ni commit ni enqueue.
         arq_pool: Pool arq singleton injecte depuis le lifespan.
+        actor_user_id: Utilisateur (staff) ayant declenche la confirmation,
+            enregistre sur le StockMovement pour l'audit trail.
 
     Returns:
         Liste des ingredients passes sous ou au niveau de leur seuil d'alerte.
@@ -266,6 +269,7 @@ async def deduct_for_order(
                     ingredient_id=ingredient.id,
                     quantity_delta=-delta,
                     reason=f"order:{order_id}",
+                    user_id=actor_user_id,
                 )
             )
             if float(ingredient.current_qty) <= float(ingredient.alert_threshold):
@@ -296,6 +300,7 @@ async def restore_for_order(
     session: AsyncSession,
     tenant_slug: str,
     order_id: int,
+    actor_user_id: int | None = None,
 ) -> None:
     """Restitue le stock consomme par une commande (utilise lors d'une annulation).
 
@@ -310,6 +315,8 @@ async def restore_for_order(
         session: Session SQLAlchemy async partageant la transaction du caller.
         tenant_slug: Slug tenant (pour contexte de log eventuel).
         order_id: Cle primaire de la commande dont le stock doit etre restitue.
+        actor_user_id: Utilisateur (staff/customer) ayant declenche l'annulation,
+            enregistre sur le StockMovement pour l'audit trail.
     """
     items_result = await session.execute(
         select(OrderItem).where(OrderItem.order_id == order_id)
@@ -325,6 +332,7 @@ async def restore_for_order(
                     ingredient_id=ingredient.id,
                     quantity_delta=+delta,
                     reason=f"cancel:{order_id}",
+                    user_id=actor_user_id,
                 )
             )
 
@@ -371,3 +379,65 @@ async def get_product_availability(
             }
 
     return {"product_id": product_id, "available": True, "limiting_ingredient": None}
+
+
+async def get_products_availability(
+    session: AsyncSession,
+    product_ids: list[int],
+) -> dict[int, dict]:
+    """Version batchee de get_product_availability : 2 requetes au total au lieu
+    d'une requete (recette + N lookups ingredient) par produit.
+
+    [PERF] Utilisee par le listing catalogue (build_product_summaries) pour
+    eliminer le N+1 sur une page pouvant contenir jusqu'a 100 produits.
+
+    Args:
+        session: Session SQLAlchemy async dans le schema tenant courant.
+        product_ids: Liste des cles primaires produits a verifier.
+
+    Returns:
+        Dict {product_id: {"product_id": int, "available": bool, "limiting_ingredient": str | None}}.
+        Un product_id sans recette (ou inconnu) est considere disponible par defaut,
+        au meme titre que get_product_availability.
+    """
+    if not product_ids:
+        return {}
+
+    recipes_result = await session.execute(
+        select(ProductIngredient).where(ProductIngredient.product_id.in_(product_ids))
+    )
+    recipes_by_product: dict[int, list[ProductIngredient]] = {}
+    ingredient_ids: set[int] = set()
+    for recipe in recipes_result.scalars():
+        recipes_by_product.setdefault(recipe.product_id, []).append(recipe)
+        ingredient_ids.add(recipe.ingredient_id)
+
+    ingredients_by_id: dict[int, Ingredient] = {}
+    if ingredient_ids:
+        ingredients_result = await session.execute(
+            select(Ingredient).where(Ingredient.id.in_(ingredient_ids))
+        )
+        ingredients_by_id = {ingredient.id: ingredient for ingredient in ingredients_result.scalars()}
+
+    availability: dict[int, dict] = {}
+    for product_id in product_ids:
+        recipes = recipes_by_product.get(product_id)
+        if not recipes:
+            availability[product_id] = {"product_id": product_id, "available": True, "limiting_ingredient": None}
+            continue
+
+        limiting_ingredient: str | None = None
+        for recipe in recipes:
+            ingredient = ingredients_by_id.get(recipe.ingredient_id)
+            if ingredient is None:
+                continue
+            if float(ingredient.current_qty) < float(recipe.quantity):
+                limiting_ingredient = ingredient.name
+                break
+
+        availability[product_id] = {
+            "product_id": product_id,
+            "available": limiting_ingredient is None,
+            "limiting_ingredient": limiting_ingredient,
+        }
+    return availability

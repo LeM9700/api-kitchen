@@ -39,6 +39,11 @@ async def update_zone(zone_id: int, body: DeliveryZoneCreate, current_user=Depen
 
 @router.post("/check")
 async def check_address(body: AddressCheckRequest, current_user=Depends(get_current_user)):
+    """Verifie si des coordonnees GPS tombent dans une zone de livraison active.
+
+    Le geocodage (adresse texte -> lat/lng) est a la charge du client — voir
+    la docstring de ``AddressCheckRequest`` pour les providers recommandes.
+    """
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         zone = await service.check_address(session, body.lat, body.lng)
         return {

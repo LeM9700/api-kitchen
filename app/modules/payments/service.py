@@ -291,13 +291,33 @@ async def handle_webhook(session: AsyncSession, tenant_slug: str, payload: dict)
     - ``charge.dispute.created``          → alerte SIEM (log critique)
     - ``charge.refunded``                 → synchronise le statut de remboursement
 
+    Idempotency : chaque event Stripe (``event.id``) est enregistré dans
+    ``processed_webhook_events`` (contrainte UNIQUE) avant tout traitement. Si
+    l'insertion ne prend pas (event déjà vu — retry Stripe / rejeu manuel),
+    l'event est ignoré sans être retraité. Protège contre les rejeux en rafale
+    qui liraient le même état "pending" et double-traiteraient le paiement.
+
     Args:
         session: Session SQLAlchemy du tenant concerné.
         tenant_slug: Slug du tenant extrait des métadonnées de l'event.
         payload: Payload Stripe complet (event dict).
     """
+    event_id: str | None = payload.get("id")
     event_type: str = payload.get("type") or ""
     data_object: dict = payload.get("data", {}).get("object", {})
+
+    if event_id:
+        result = await session.execute(
+            text(
+                "INSERT INTO processed_webhook_events (stripe_event_id, event_type) "
+                "VALUES (:event_id, :event_type) ON CONFLICT (stripe_event_id) DO NOTHING"
+            ),
+            {"event_id": event_id, "event_type": event_type},
+        )
+        await session.commit()
+        if result.rowcount == 0:
+            logger.info("Webhook event %s already processed, skipping (tenant=%s)", event_id, tenant_slug)
+            return
 
     if event_type in {"payment_intent.succeeded", ""}:
         pi_id = data_object.get("id")

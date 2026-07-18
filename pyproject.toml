@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "email-validator>=2.0",
     "passlib[bcrypt]>=1.7",
+    "bcrypt>=4.0,<4.1",  # passlib 1.7.4 self-test crashes with bcrypt>=4.1 (no __about__, wrap-bug detection fails)
     "slowapi>=0.1.9",
     "stripe>=9.0",
     "motor>=3.4",
@@ -25,6 +26,9 @@ dependencies = [
     "bleach>=6.1.0",
     "pyotp>=2.9.0",
     "qrcode[pil]>=7.4.2",
+    "sentry-sdk[fastapi]>=2.0",
+    "pytz>=2024.1",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

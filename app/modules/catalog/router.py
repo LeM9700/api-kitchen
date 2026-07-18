@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_pagination, require_role
+from app.core.http.deps import get_arq_pool, get_pagination, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginationParams
+from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
 from app.modules.catalog import service
 from app.modules.catalog.models import Category
 from app.modules.catalog.schemas import (
@@ -84,12 +85,38 @@ async def products(
     dietary_tag_slug: str | None = Query(None, description="Slug dietary tag explicite"),
     allergen: str | None = Query(None, deprecated=True, description="Alias retrocompatible de allergen_slug"),
     dietary_tag: str | None = Query(None, deprecated=True, description="Alias retrocompatible de dietary_tag_slug"),
+    price_min: float | None = Query(None, ge=0, description="Prix minimum (inclus)"),
+    price_max: float | None = Query(None, ge=0, description="Prix maximum (inclus)"),
+    allergen_free: bool = Query(False, description="Ne retourner que les produits sans allergene declare"),
+    redis=Depends(get_arq_pool),
 ):
     slug = request.headers.get("X-Tenant-Slug", "default")
     effective_allergen = allergen_slug or allergen
     effective_dietary = dietary_tag_slug or dietary_tag
+    is_default_listing = not (
+        q
+        or category_id is not None
+        or effective_allergen
+        or effective_dietary
+        or price_min is not None
+        or price_max is not None
+        or allergen_free
+    )
+
+    # [PERF] Le listing par defaut (sans filtre) est la vue la plus consultee du
+    # catalogue -- mise en cache courte duree (30s) pour absorber le trafic sans
+    # servir des donnees perimees longtemps. Les listings filtres/recherches ne
+    # sont pas mis en cache (trop de combinaisons possibles, faible reutilisation).
+    cache_key = f"catalog:products:{slug}:{pagination.page}:{pagination.page_size}"
+    if is_default_listing:
+        cached = await get_cached_json(redis, cache_key)
+        if cached is not None:
+            return cached
+
     async with get_tenant_session(slug) as session:
-        if q or category_id is not None or effective_allergen or effective_dietary:
+        if is_default_listing:
+            items, total = await service.list_products(session, pagination)
+        else:
             offset = (pagination.page - 1) * pagination.page_size
             items, total = await service.search_products(
                 session,
@@ -99,11 +126,16 @@ async def products(
                 dietary_tag_slug=effective_dietary,
                 limit=pagination.page_size,
                 offset=offset,
+                price_min=price_min,
+                price_max=price_max,
+                allergen_free=allergen_free,
             )
-        else:
-            items, total = await service.list_products(session, pagination)
         summaries = await service.build_product_summaries(session, items, include_availability=True)
-    return CatalogPaginatedResponse.build(summaries, total, pagination)
+
+    response = CatalogPaginatedResponse.build(summaries, total, pagination)
+    if is_default_listing:
+        await set_cached_json(redis, cache_key, response.model_dump(mode="json"), ttl_seconds=30)
+    return response
 
 
 @router.get("/products/suggestions", response_model=list[ProductSuggestionOut])
@@ -131,10 +163,29 @@ async def product_detail(request: Request, product_id: int):
 # ---------------------------------------------------------------------------
 
 
+async def _invalidate_catalog_cache(redis, tenant_slug: str) -> None:
+    """Invalide le cache du listing catalogue par defaut pour ce tenant.
+
+    [PERF] Appele apres toute mutation qui change ce qu'un listing catalogue
+    par defaut (sans filtre) doit afficher -- create/update/delete produit,
+    import CSV. Les mutations de variantes/extras isolees ne l'invalident pas
+    explicitement : le TTL de 30s (voir ``products()``) borne deja leur
+    fraicheur maximale, un compromis deliberement accepte plutot que
+    d'instrumenter chaque route d'ecriture du module.
+    """
+    await invalidate_prefix(redis, f"catalog:products:{tenant_slug}:")
+
+
 @router.post("/products", response_model=ProductOut, status_code=201)
-async def create_product(body: ProductCreate, current_user=Depends(require_role("admin"))):
+async def create_product(
+    body: ProductCreate,
+    current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
+):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await service.create_product(session, body, user_id=_user_id(current_user))
+        product = await service.create_product(session, body, user_id=_user_id(current_user))
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return product
 
 
 @router.put("/products/{product_id}", response_model=ProductOut)
@@ -142,17 +193,24 @@ async def update_product(
     product_id: int,
     body: ProductUpdate,
     current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         if body.is_active is True:
             from app.modules.catalog.allergen.allergen_service import validate_product_for_publication
 
             await validate_product_for_publication(session, product_id)
-        return await service.update_product(session, product_id, body, user_id=_user_id(current_user))
+        product = await service.update_product(session, product_id, body, user_id=_user_id(current_user))
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return product
 
 
 @router.delete("/products/{product_id}", status_code=204)
-async def delete_product(product_id: int, current_user=Depends(require_role("admin"))):
+async def delete_product(
+    product_id: int,
+    current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
+):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.update_product(
             session,
@@ -160,6 +218,7 @@ async def delete_product(product_id: int, current_user=Depends(require_role("adm
             ProductUpdate(is_active=False),
             user_id=_user_id(current_user),
         )
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +348,16 @@ async def update_extra(
         return await service.update_extra(session, extra_id, body, user_id=_user_id(current_user))
 
 
+@router.delete("/extras/{extra_id}", status_code=204)
+async def delete_extra(
+    extra_id: int,
+    current_user=Depends(require_role("admin")),
+):
+    """Supprime definitivement un extra. Refuse (409) s'il est encore lie a un produit."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.delete_extra(session, extra_id)
+
+
 # ---------------------------------------------------------------------------
 # Recommendations / bundles simples
 # ---------------------------------------------------------------------------
@@ -361,9 +430,12 @@ async def import_csv_dry_run(
 async def import_csv_confirm(
     token: str,
     current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await service.confirm_catalog_csv(session, token, user_id=_user_id(current_user))
+        result = await service.confirm_catalog_csv(session, token, user_id=_user_id(current_user))
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return result
 
 
 @router.get("/exports/csv", response_class=PlainTextResponse)

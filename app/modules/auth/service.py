@@ -419,6 +419,12 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         estimated_minutes INTEGER NOT NULL,
         is_active BOOLEAN NOT NULL DEFAULT TRUE
     )""",
+    """CREATE TABLE IF NOT EXISTS processed_webhook_events (
+        id SERIAL PRIMARY KEY,
+        stripe_event_id VARCHAR(255) NOT NULL UNIQUE,
+        event_type VARCHAR(128) NOT NULL,
+        processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
 ]
 
 
@@ -597,8 +603,8 @@ async def setup_mfa(tenant_slug: str, user_id: int) -> dict:
         user = await session.get(User, user_id)
         if user is None:
             raise AppError("UNAUTHORIZED", "User not found", 401)
-        if user.role != "super-admin":
-            raise AppError("FORBIDDEN", "MFA setup is reserved to super-admin users", 403)
+        if user.role not in ("super-admin", "admin"):
+            raise AppError("FORBIDDEN", "MFA setup is reserved to admin/super-admin users", 403)
         if user.mfa_enabled:
             raise AppError("MFA_ALREADY_ENABLED", "MFA is already enabled", 409)
 
@@ -619,8 +625,8 @@ async def confirm_mfa(tenant_slug: str, user_id: int, totp_code: str | None) -> 
         user = await session.get(User, user_id)
         if user is None:
             raise AppError("UNAUTHORIZED", "User not found", 401)
-        if user.role != "super-admin":
-            raise AppError("FORBIDDEN", "MFA confirmation is reserved to super-admin users", 403)
+        if user.role not in ("super-admin", "admin"):
+            raise AppError("FORBIDDEN", "MFA confirmation is reserved to admin/super-admin users", 403)
         if not user.mfa_secret or not _verify_totp(user.mfa_secret, totp_code):
             raise AppError("INVALID_MFA_CODE", "Invalid MFA code", 400, "totp_code")
 
@@ -638,8 +644,8 @@ async def regenerate_mfa_backup_codes(
         user = await session.get(User, user_id)
         if user is None:
             raise AppError("UNAUTHORIZED", "User not found", 401)
-        if user.role != "super-admin":
-            raise AppError("FORBIDDEN", "MFA backup codes are reserved to super-admin users", 403)
+        if user.role not in ("super-admin", "admin"):
+            raise AppError("FORBIDDEN", "MFA backup codes are reserved to admin/super-admin users", 403)
         if not user.mfa_enabled or not user.mfa_secret:
             raise AppError("MFA_NOT_ENABLED", "MFA is not enabled", 400)
         if not _verify_totp(user.mfa_secret, totp_code):
@@ -713,7 +719,7 @@ async def authenticate(
     if not verify_password(password, user.password_hash):
         raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
 
-    if user.role == "super-admin" and user.mfa_enabled:
+    if user.role in ("super-admin", "admin") and user.mfa_enabled:
         await _verify_login_mfa(session, user, mfa_code)
 
     access, refresh, session_id = await issue_tokens(session, user, tenant_id, tenant_slug)
@@ -997,7 +1003,8 @@ async def forgot_password(body, arq_pool=None) -> None:
             if user is None:
                 return  # Email inconnu — reponse silencieuse
 
-            token = secrets.token_urlsafe(6)[:8]
+            # 256 bits d'entropie (32 bytes) — envoye en clair par email, seul le hash bcrypt est stocke.
+            token = secrets.token_urlsafe(32)
             user.password_reset_token = get_password_hash(token)
             user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
             await session.commit()

@@ -17,7 +17,7 @@ import pytest
 from app.core.http.deps import get_current_user
 from app.core.http.errors import AppError
 from app.main import app
-from app.modules.customer.schemas import CustomerOut
+from app.modules.customer.schemas import CustomerDataExportOut, CustomerOrderExportOut, CustomerOut
 
 # ---------------------------------------------------------------------------
 # Helpers / shared fixtures
@@ -324,5 +324,51 @@ async def test_delete_me_wrong_password(client, monkeypatch):
         )
         assert response.status_code == 401
         assert response.json()["code"] == "INVALID_CREDENTIALS"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/customer/me/export
+# ---------------------------------------------------------------------------
+
+
+async def test_export_me_success(client, monkeypatch):
+    """200 with profile + orders when customer calls GET /me/export."""
+    export_out = CustomerDataExportOut(
+        profile=_CUSTOMER_OUT,
+        orders=[
+            CustomerOrderExportOut(
+                id=1, status="delivered", total=15.5, created_at=datetime(2024, 1, 2, tzinfo=timezone.utc)
+            )
+        ],
+        orders_truncated=False,
+        exported_at=datetime(2024, 1, 3, tzinfo=timezone.utc),
+    )
+
+    async def fake_export_my_data(user_id, tenant_slug):
+        return export_out
+
+    monkeypatch.setattr("app.modules.customer.router.service.export_my_data", fake_export_my_data)
+
+    app.dependency_overrides[get_current_user] = _override_current_user(_customer_user_dict())
+    try:
+        response = await client.get("/api/v1/customer/me/export")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["profile"]["email"] == "customer@example.com"
+        assert len(data["orders"]) == 1
+        assert data["orders"][0]["id"] == 1
+        assert data["orders_truncated"] is False
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+async def test_export_me_wrong_role_forbidden(client):
+    """403 when a non-customer (admin) calls GET /me/export."""
+    app.dependency_overrides[get_current_user] = _override_current_user(_admin_user_dict())
+    try:
+        response = await client.get("/api/v1/customer/me/export")
+        assert response.status_code == 403
     finally:
         app.dependency_overrides.pop(get_current_user, None)

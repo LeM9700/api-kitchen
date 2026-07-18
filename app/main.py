@@ -1,21 +1,39 @@
 import asyncio
+import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 from arq import create_pool
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
+from sentry_sdk.integrations.fastapi import FastApiIntegration
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
 
 from app.core.services.cloudinary import init_cloudinary
 from app.core.config import settings
+from app.core.database.session import engine
 from app.core.http.errors import AppError, app_error_handler
 from app.core.http.limiter import limiter
+from app.core.http.logging_config import configure_logging, set_request_id
 from app.core.http.security_headers import SecurityHeadersMiddleware
 from app.core.tenancy.tenant import TenantMiddleware
 from worker.main import get_redis_settings
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+if settings.sentry_dsn:
+    sentry_sdk.init(
+        dsn=settings.sentry_dsn,
+        environment=settings.environment,
+        integrations=[FastApiIntegration()],
+        traces_sample_rate=0.1,
+    )
 
 # [🔒 SÉCURITÉ] Import déclenche l'enregistrement du listener SQLAlchemy qui
 # bloque la publication d'un produit sans allergènes réglementaires complets.
@@ -163,13 +181,51 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Tenant-Slug", "stripe-signature", "Idempotency-Key"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Tenant-Slug",
+            "stripe-signature",
+            "Idempotency-Key",
+            "X-Request-ID",
+        ],
+        expose_headers=["X-Request-ID"],
     )
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(TenantMiddleware)
     # [🔒 SÉCURITÉ] Limite la taille des requêtes HTTP à 1 Mo.
     # Doit être en dernier dans add_middleware (premier exécuté en LIFO Starlette).
     app.add_middleware(_RequestSizeLimitMiddleware)
+
+    @app.middleware("http")
+    async def _log_request_duration(request: Request, call_next):
+        """Log la durée de chaque requête en JSON structuré avec un request_id de
+        corrélation — complète les traces Sentry pour le débogage manuel de logs bruts.
+
+        [PROD] Le request_id est repris depuis le header entrant ``X-Request-ID``
+        s'il est fourni (ex: propagé par un proxy/CDN), sinon généré. Il est
+        renvoyé sur la réponse pour permettre au client de le référencer dans un
+        rapport d'incident, et attaché au contexte de logging (voir
+        ``logging_config.py``) pour que tous les logs émis pendant cette requête
+        — pas seulement cette ligne — le portent automatiquement.
+        """
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        set_request_id(request_id)
+
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - start) * 1000, 1)
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "request completed",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
 
     from app.modules.auth.router import router as auth_router
     from app.modules.catalog.allergen.allergen_router import router as allergen_router
@@ -207,9 +263,9 @@ def create_app() -> FastAPI:
     app.include_router(customer_router, prefix=prefix + "/customer", tags=["customer"])
 
     # ---------------------------------------------------------------------------
-    # Health check — utilisé par Railway pour les liveness/readiness probes.
+    # Health check — utilisé par Railway pour la liveness probe.
     # Pas de dépendance sur la BDD : si l'app répond, le process est vivant.
-    # Pour une readiness probe DB, ajouter un endpoint /health/ready séparé.
+    # La readiness probe (DB + Redis) est exposée séparément sur /health/ready.
     # ---------------------------------------------------------------------------
     _startup_time = time.time()
 
@@ -226,6 +282,41 @@ def create_app() -> FastAPI:
             "uptime_seconds": round(time.time() - _startup_time),
             "environment": settings.environment,
         }
+
+    @app.get("/health/ready", tags=["ops"], include_in_schema=not is_production)
+    async def health_ready() -> JSONResponse:
+        """Readiness probe — vérifie que la DB et Redis répondent avant de recevoir du trafic.
+
+        Retourne 503 si l'une des dépendances est indisponible, pour que Railway
+        retire l'instance du load balancer plutôt que de lui envoyer du trafic
+        qui échouera systématiquement.
+        """
+        checks = {"database": False, "redis": False}
+
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            checks["database"] = True
+        except Exception:
+            logger.exception("health/ready: database check failed")
+
+        try:
+            from redis.asyncio import from_url as redis_from_url
+
+            redis_client = redis_from_url(settings.redis_url)
+            try:
+                await redis_client.ping()
+                checks["redis"] = True
+            finally:
+                await redis_client.close()
+        except Exception:
+            logger.exception("health/ready: redis check failed")
+
+        ok = all(checks.values())
+        return JSONResponse(
+            status_code=200 if ok else 503,
+            content={"status": "ok" if ok else "unavailable", "checks": checks},
+        )
 
     return app
 

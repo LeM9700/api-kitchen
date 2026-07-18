@@ -64,7 +64,7 @@ jobs:
       - name: Install uv
         run: pip install uv
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
       - name: Run Alembic migrations
         run: uv run alembic upgrade head
       - name: Run tests
@@ -72,4 +72,4 @@ jobs:
       - name: Alembic schema check
         run: uv run alembic check
       - name: Security audit (pip-audit)
-        run: uv run pip-audit --requirement <(uv export --no-hashes) || true
+        run: uv run pip-audit --requirement <(uv export --no-hashes)
