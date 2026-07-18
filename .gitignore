@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 .env
+.env.*
+!.env.example
 *.egg-info/
 dist/
 build/
@@ -13,4 +15,12 @@ htmlcov/
 /.planning
 /.venv*
 /.superpowers
-/docs
+/docs/superpowers
+/Microsoft
+/audit
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
