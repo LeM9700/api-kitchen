@@ -1,4 +1,6 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.modules.delivery.common.geo import validate_delivery_polygon
 
 
 class DeliveryZoneCreate(BaseModel):
@@ -7,6 +9,20 @@ class DeliveryZoneCreate(BaseModel):
     fee: float
     min_order_amount: float = 0
     estimated_minutes: int = 30
+
+    @field_validator("polygon")
+    @classmethod
+    def _validate_polygon(cls, value: dict) -> dict:
+        """Applique le sous-ensemble GeoJSON Polygon strict du module delivery.
+
+        Leve volontairement `InvalidDeliveryPolygonError` (une `AppError`,
+        pas un `ValueError`) -- voir la docstring de cette exception dans
+        `app.modules.delivery.common.errors` pour le raisonnement : cela
+        court-circuite l'enveloppe `pydantic.ValidationError` generique pour
+        renvoyer directement le contrat d'erreur metier standard du projet
+        avec le code `INVALID_DELIVERY_POLYGON`.
+        """
+        return validate_delivery_polygon(value)
 
 
 class DeliveryZoneOut(BaseModel):

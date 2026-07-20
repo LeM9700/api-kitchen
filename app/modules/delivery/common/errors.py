@@ -30,3 +30,30 @@ class ForbiddenAuditMetadataError(AppError):
             ),
             status_code=400,
         )
+
+
+class InvalidDeliveryPolygonError(AppError):
+    """Levee quand `DeliveryZoneCreate.polygon` ne respecte pas le sous-ensemble
+    GeoJSON Polygon strict accepte par le module (voir
+    `app.modules.delivery.common.geo.validate_delivery_polygon`).
+
+    Deliberement levee directement (pas un `ValueError` intercepte par
+    Pydantic et transforme en `pydantic.ValidationError`) : Pydantic v2 ne
+    capture que `ValueError`/`TypeError`/`AssertionError` dans un
+    `field_validator` pour les envelopper dans son format de validation
+    generique (`{"detail": [{"loc": ..., "msg": ...}]}`, sans code metier).
+    En levant une `AppError` (type non intercepte par pydantic-core), elle
+    traverse la validation telle quelle et est geree par le handler global
+    `app_error_handler` (voir `app/core/http/errors.py`), produisant le
+    contrat `{code, detail, field}` standard du projet avec le code metier
+    `INVALID_DELIVERY_POLYGON` demande par le plan, plutot que le format
+    generique FastAPI/Pydantic.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(
+            code="INVALID_DELIVERY_POLYGON",
+            detail=detail,
+            status_code=422,
+            field="polygon",
+        )
