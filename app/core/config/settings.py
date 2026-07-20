@@ -83,5 +83,11 @@ class Settings(BaseSettings):
     fcm_project_id: str | None = Field(None, env="FCM_PROJECT_ID")
     fcm_service_account_json: str | None = Field(None, env="FCM_SERVICE_ACCOUNT_JSON")
 
+    # Reseau de livreurs independants — desactive par defaut dans cette phase
+    # (fondations uniquement : conventions/enums/audit, aucune route metier
+    # montee). Passer a True seulement quand les plans 02-05 (checkout,
+    # affectation, suivi) seront livres et valides.
+    delivery_network_enabled: bool = False
+
 
 settings = Settings()
