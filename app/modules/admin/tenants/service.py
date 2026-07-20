@@ -17,6 +17,8 @@ from app.modules.admin.tenants.models import (
 from app.modules.admin.tenants.schemas import (
     BusinessHoursCreate,
     ExceptionalClosureCreate,
+    TenantBrandingResponse,
+    TenantBrandingUpdate,
     TenantScheduledClosureRequest,
     TenantConfigUpdate,
     TenantStatusResponse,
@@ -783,4 +785,74 @@ async def _compute_next_opening(
                 return f"Demain {time_str}"
             return f"{_DAY_NAMES_FR[day_of_week]} {time_str}"
 
-    return None
+# ---------------------------------------------------------------------------
+# Branding public (Plan 02)
+# ---------------------------------------------------------------------------
+
+
+async def get_branding(session: AsyncSession) -> TenantBrandingResponse:
+    """Retourne les données de branding du tenant.
+
+    [⚠️ PROD] Endpoint public — ne retourne que TenantBrandingResponse,
+    jamais l'objet TenantConfig complet qui contient des données opérationnelles.
+
+    Args:
+        session: Session async sur le schema du tenant concerné.
+
+    Returns:
+        TenantBrandingResponse avec les 5 champs branding (tous nullable).
+    """
+    config = await get_or_create_config(session)
+    return TenantBrandingResponse.model_validate(config)
+
+
+async def update_branding(
+    session: AsyncSession,
+    data: TenantBrandingUpdate,
+    *,
+    user_id: int,
+    user_email: str | None,
+    ip_address: str | None,
+    user_agent: str,
+) -> TenantBrandingResponse:
+    """Met à jour partiellement les champs branding du tenant.
+
+    Seuls les champs non-None dans `data` sont modifiés (patch sémantique).
+    Chaque modification est tracée dans TenantConfigAudit.
+
+    Args:
+        session: Session async sur le schema du tenant.
+        data: TenantBrandingUpdate avec les champs à modifier.
+        user_id: ID de l'admin effectuant la modification.
+        user_email: Email de l'admin (dénormalisé pour l'audit).
+        ip_address: IP de la requête.
+        user_agent: User-Agent de la requête.
+
+    Returns:
+        TenantBrandingResponse après mise à jour.
+    """
+    config = await get_or_create_config(session)
+
+    branding_fields = ("display_name", "logo_url", "primary_color", "secondary_color", "font_family")
+    updates = data.model_dump(exclude_none=True)
+
+    for field in branding_fields:
+        if field not in updates:
+            continue
+        old_value = getattr(config, field)
+        new_value = updates[field]
+        setattr(config, field, new_value)
+        await _write_audit(
+            session,
+            user_id=user_id,
+            field_name=f"branding.{field}",
+            old_value=str(old_value) if old_value is not None else None,
+            new_value=str(new_value),
+            ip_address=ip_address,
+            user_agent=user_agent,
+            user_email=user_email,
+        )
+
+    await session.commit()
+    await session.refresh(config)
+    return TenantBrandingResponse.model_validate(config)

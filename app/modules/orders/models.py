@@ -18,6 +18,10 @@ class Order(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 'delivery' | 'pickup' -- contrainte CHECK en base (cf. migration 0034 et
+    # _TENANT_DDL_STATEMENTS). String plutot qu'un type ENUM Postgres natif, pour
+    # rester coherent avec status/payment_status/role deja en place dans ce module.
+    order_type: Mapped[str] = mapped_column(String(16), nullable=False, default="delivery")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     payment_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     subtotal: Mapped[float] = mapped_column(Numeric(10, 2), default=0)

@@ -1,9 +1,14 @@
 # app/modules/admin/tenant_schemas.py
 """Schemas Pydantic pour le tableau de bord tenant self-service."""
+import re
 from datetime import date, datetime, time, timezone
 
 import pytz
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# ── Branding — constantes de validation ──────────────────────────────────────
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+SUPPORTED_FONTS: frozenset[str] = frozenset({"inter", "poppins", "playfair_display"})
 
 
 class TenantConfigUpdate(BaseModel):
@@ -174,3 +179,53 @@ class TenantResponse(BaseModel):
     is_suspended: bool
     suspended_at: datetime | None
     suspension_message: str | None
+
+
+# ── Branding public (Plan 02) ─────────────────────────────────────────────────
+
+
+class TenantBrandingResponse(BaseModel):
+    """Données de branding public — retournées sans authentification.
+
+    [⚠️ PROD] Ne jamais ajouter de champs sensibles ici (tokens, clés, données clients).
+    Ce schéma est la seule surface autorisée de GET /tenant/branding.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    display_name: str | None
+    logo_url: str | None
+    primary_color: str | None
+    secondary_color: str | None
+    font_family: str | None
+
+
+class TenantBrandingUpdate(BaseModel):
+    """Mise à jour branding — réservée aux admins tenant (PATCH /tenant/branding).
+
+    Tous les champs sont optionnels (patch partiel).
+    """
+
+    display_name: str | None = Field(None, max_length=120)
+    logo_url: str | None = None
+    primary_color: str | None = None
+    secondary_color: str | None = None
+    font_family: str | None = None
+
+    @field_validator("primary_color", "secondary_color", mode="before")
+    @classmethod
+    def validate_hex_color(cls, v: str | None) -> str | None:
+        """Vérifie le format #RRGGBB strict."""
+        if v is not None and not _HEX_COLOR_RE.match(v):
+            raise ValueError(f"Couleur invalide : '{v}' — format attendu #RRGGBB")
+        return v
+
+    @field_validator("font_family", mode="before")
+    @classmethod
+    def validate_font(cls, v: str | None) -> str | None:
+        """Restreint aux fonts embarquées dans le binaire Flutter."""
+        if v is not None and v not in SUPPORTED_FONTS:
+            raise ValueError(
+                f"Font non supportée : '{v}'. Valeurs autorisées : {sorted(SUPPORTED_FONTS)}"
+            )
+        return v

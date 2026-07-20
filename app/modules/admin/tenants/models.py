@@ -78,6 +78,17 @@ class TenantConfig(Base):
         server_default="4",
     )
 
+    # ── Branding public (Plan 02) ─────────────────────────────────────────────
+    # Ces champs sont exposés sans auth via GET /tenant/branding.
+    # Ne jamais y ajouter de données sensibles.
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Format #RRGGBB strict — validé par TenantBrandingUpdate côté Pydantic.
+    primary_color: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    secondary_color: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    # Enum applicatif : inter | poppins | playfair_display — validé Pydantic.
+    font_family: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
 
 class BusinessHours(Base):
     """Creneau horaire d'ouverture pour un jour de la semaine.

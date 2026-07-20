@@ -94,7 +94,7 @@ async def test_create_order_requires_idempotency_key():
     from app.modules.orders.schemas import OrderCreate, OrderItemCreate
 
     session = AsyncMock()
-    body = OrderCreate(items=[OrderItemCreate(product_id=1, quantity=1)])
+    body = OrderCreate(order_type="pickup", items=[OrderItemCreate(product_id=1, quantity=1)])
 
     with pytest.raises(AppError) as exc_info:
         await service.create_order(session, body, user_id=1)
@@ -118,6 +118,7 @@ async def test_create_order_ignores_client_delivery_fee_without_zone():
     session.refresh = AsyncMock()
 
     body = OrderCreate(
+        order_type="pickup",
         delivery_fee=999,
         items=[OrderItemCreate(product_id=1, quantity=2)],
     )
@@ -144,6 +145,7 @@ async def test_create_order_prices_allowed_extras_server_side():
     session.refresh = AsyncMock()
 
     body = OrderCreate(
+        order_type="pickup",
         items=[
             OrderItemCreate(
                 product_id=1,

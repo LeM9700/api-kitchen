@@ -1,7 +1,9 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+OrderType = Literal["delivery", "pickup"]
 
 
 class OrderItemExtraCreate(BaseModel):
@@ -19,6 +21,7 @@ class OrderItemCreate(BaseModel):
 
 
 class OrderCreate(BaseModel):
+    order_type: OrderType = "delivery"
     customer_email: str | None = None
     delivery_address: str | None = None
     delivery_zone_id: int | None = None
@@ -29,6 +32,12 @@ class OrderCreate(BaseModel):
     discount_total: float = 0
     promo_code: str | None = None
     items: list[OrderItemCreate] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_delivery_fields(self) -> "OrderCreate":
+        if self.order_type == "delivery" and not self.delivery_address:
+            raise ValueError("delivery_address est requis pour une commande en livraison")
+        return self
 
 
 class OrderStatusUpdate(BaseModel):
@@ -41,6 +50,7 @@ class OrderListOut(BaseModel):
 
     id: int
     customer_email: str | None
+    order_type: str = "delivery"
     status: str
     payment_status: str = "pending"
     subtotal: float

@@ -30,6 +30,8 @@ from app.modules.admin.tenants.schemas import (
     ExceptionalClosureCreate,
     ExceptionalClosureResponse,
     NextOpeningResponse,
+    TenantBrandingResponse,
+    TenantBrandingUpdate,
     TenantClosureToggle,
     TenantConfigAuditResponse,
     TenantConfigResponse,
@@ -39,6 +41,40 @@ from app.modules.admin.tenants.schemas import (
 )
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Routes publiques — branding
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/branding",
+    response_model=TenantBrandingResponse,
+    summary="Branding public du tenant (sans auth)",
+    description=(
+        "Retourne les données de branding (couleurs, logo, nom d'affichage) pour le tenant "
+        "identifié par le query param `tenant_slug`. "
+        "Endpoint public — aucune authentification requise. "
+        "Appelé par l'app Flutter au boot pour charger le thème avant toute navigation."
+    ),
+)
+async def get_tenant_branding(
+    tenant_slug: str = Query(..., description="Slug du tenant"),
+) -> TenantBrandingResponse:
+    """GET /tenant/branding — public, sans auth.
+
+    [⚠️ PROD] Ne retourne que TenantBrandingResponse — ne jamais exposer
+    TenantConfig complet ici.
+
+    Args:
+        tenant_slug: Slug du tenant (query param).
+
+    Returns:
+        TenantBrandingResponse (5 champs branding, tous nullable).
+    """
+    async with get_tenant_session(tenant_slug) as session:
+        return await tenant_service.get_branding(session)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +155,49 @@ async def list_business_hours(
     """
     async with get_tenant_session(tenant_slug) as session:
         return await tenant_service.get_business_hours(session)
+
+
+# ---------------------------------------------------------------------------
+# Routes admin -- branding
+# ---------------------------------------------------------------------------
+
+
+@router.patch(
+    "/branding",
+    response_model=TenantBrandingResponse,
+    summary="Mettre à jour le branding du tenant (admin)",
+)
+@limiter.limit("30/minute")
+async def patch_tenant_branding(
+    request: Request,
+    body: TenantBrandingUpdate,
+    current_user: dict = Depends(require_role("admin")),
+) -> TenantBrandingResponse:
+    """PATCH /tenant/branding — admin uniquement.
+
+    Mise à jour partielle du branding (patch sémantique — seuls les champs
+    non-None sont modifiés). Chaque champ modifié est tracé dans l'audit.
+
+    Args:
+        request: Requête FastAPI (requis par SlowAPI).
+        body: TenantBrandingUpdate avec les champs à modifier.
+        current_user: Utilisateur admin injecté par dépendance.
+
+    Returns:
+        TenantBrandingResponse après mise à jour.
+    """
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
+
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await tenant_service.update_branding(
+            session,
+            body,
+            user_id=current_user["id"],
+            user_email=current_user.get("email"),
+            ip_address=ip,
+            user_agent=user_agent,
+        )
 
 
 # ---------------------------------------------------------------------------

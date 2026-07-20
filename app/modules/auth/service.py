@@ -77,7 +77,12 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         overhead_per_order_minutes INTEGER NOT NULL DEFAULT 3,
         timezone VARCHAR(64) NOT NULL DEFAULT 'Europe/Paris',
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        scheduled_close_at TIMESTAMPTZ
+        scheduled_close_at TIMESTAMPTZ,
+        display_name VARCHAR(120),
+        logo_url TEXT,
+        primary_color VARCHAR(7),
+        secondary_color VARCHAR(7),
+        font_family VARCHAR(50)
     )""",
     """CREATE TABLE IF NOT EXISTS business_hours (
         id SERIAL PRIMARY KEY,
@@ -256,13 +261,15 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         id SERIAL PRIMARY KEY,
         user_id INTEGER,
         customer_email VARCHAR(255),
+        order_type VARCHAR(16) NOT NULL DEFAULT 'delivery',
         status VARCHAR(32) NOT NULL DEFAULT 'pending',
         subtotal NUMERIC(10,2) NOT NULL,
         discount_total NUMERIC(10,2) NOT NULL,
         delivery_fee NUMERIC(10,2) NOT NULL,
         total NUMERIC(10,2) NOT NULL,
         delivery_address TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT ck_orders_order_type CHECK (order_type IN ('delivery', 'pickup'))
     )""",
     """CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,

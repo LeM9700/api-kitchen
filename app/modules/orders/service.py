@@ -44,6 +44,7 @@ def _serialize_order_list(order: Order) -> dict:
     return {
         "id": order.id,
         "customer_email": order.customer_email,
+        "order_type": getattr(order, "order_type", None) or "delivery",
         "status": order.status,
         "payment_status": getattr(order, "payment_status", "pending") or "pending",
         "subtotal": _money(order.subtotal),
@@ -122,11 +123,22 @@ async def _estimate_delivery_at(
 
 async def _resolve_delivery(
     session: AsyncSession,
+    order_type: str,
     delivery_zone_id: int | None,
     subtotal: float,
-) -> tuple[float, int]:
+) -> tuple[float, int, int | None]:
+    """Calcule delivery_fee, delai de trajet additionnel, et delivery_zone_id effectif.
+
+    Pour order_type == "pickup" : pas de frais, pas de delai de trajet -- le delai
+    estime en aval (_estimate_delivery_at) ne comptera alors que le temps de
+    preparation. delivery_zone_id est ignore meme s'il est envoye par le client,
+    un retrait en boutique n'ayant pas de notion de zone de livraison.
+    """
+    if order_type == "pickup":
+        return 0.0, 0, None
+
     if delivery_zone_id is None:
-        return 0.0, 0
+        return 0.0, 0, None
 
     zone = await session.get(DeliveryZone, delivery_zone_id)
     if zone is None or not zone.is_active:
@@ -138,7 +150,7 @@ async def _resolve_delivery(
             422,
             "delivery_zone_id",
         )
-    return _money(zone.fee), int(zone.estimated_minutes or 0)
+    return _money(zone.fee), int(zone.estimated_minutes or 0), delivery_zone_id
 
 
 async def _resolve_extras(session: AsyncSession, product_id: int, item_extras: list) -> tuple[list[dict], float]:
@@ -283,8 +295,9 @@ async def create_order(
             items=promo_items,
         )
 
-    delivery_fee, delivery_minutes = await _resolve_delivery(
-        session, getattr(body, "delivery_zone_id", None), subtotal
+    order_type = getattr(body, "order_type", None) or "delivery"
+    delivery_fee, delivery_minutes, effective_delivery_zone_id = await _resolve_delivery(
+        session, order_type, getattr(body, "delivery_zone_id", None), subtotal
     )
     estimated_delivery_at = await _estimate_delivery_at(session, delivery_minutes)
 
@@ -292,11 +305,14 @@ async def create_order(
     order = Order(
         user_id=user_id,
         customer_email=body.customer_email,
-        delivery_address=body.delivery_address,
+        order_type=order_type,
+        # [pickup] delivery_address ignore meme si envoye par le client -- pas de
+        # notion d'adresse pour un retrait en boutique (cf. schemas.OrderCreate).
+        delivery_address=body.delivery_address if order_type != "pickup" else None,
         subtotal=subtotal,
         discount_total=discount_total,
         delivery_fee=delivery_fee,
-        delivery_zone_id=getattr(body, "delivery_zone_id", None),
+        delivery_zone_id=effective_delivery_zone_id,
         estimated_delivery_at=estimated_delivery_at,
         total=total,
         promo_code=body.promo_code,
