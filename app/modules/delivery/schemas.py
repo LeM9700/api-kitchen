@@ -6,9 +6,9 @@ from app.modules.delivery.common.geo import validate_delivery_polygon
 class DeliveryZoneCreate(BaseModel):
     name: str
     polygon: dict
-    fee: float
-    min_order_amount: float = 0
-    estimated_minutes: int = 30
+    fee: float = Field(..., ge=0)
+    min_order_amount: float = Field(0, ge=0)
+    estimated_minutes: int = Field(30, gt=0)
 
     @field_validator("polygon")
     @classmethod
@@ -46,10 +46,24 @@ class AddressCheckRequest(BaseModel):
     informatif (logs/support) et n'est pas utilise pour le calcul de zone.
     """
 
-    lat: float = Field(..., description="Latitude WGS84 geocodee cote client (ex: via Google Maps/Mapbox).")
-    lng: float = Field(..., description="Longitude WGS84 geocodee cote client (ex: via Google Maps/Mapbox).")
+    lat: float = Field(..., ge=-90, le=90, description="Latitude WGS84 geocodee cote client (ex: via Google Maps/Mapbox).")
+    lng: float = Field(..., ge=-180, le=180, description="Longitude WGS84 geocodee cote client (ex: via Google Maps/Mapbox).")
     address: str | None = Field(
         None,
         description="Adresse en texte libre saisie par l'utilisateur — informatif uniquement, non utilise pour le calcul.",
         max_length=512,
     )
+
+
+class AddressCheckOut(BaseModel):
+    """Reponse typee de `POST /delivery/check` (Tache 3).
+
+    Meme forme JSON que le `dict` brut retourne auparavant par la route --
+    `{"zone_id", "name", "fee", "estimated_minutes"}` -- pour ne pas casser
+    `app-client`, qui consomme deja cet endpoint.
+    """
+
+    zone_id: int
+    name: str
+    fee: float
+    estimated_minutes: int

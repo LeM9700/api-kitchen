@@ -57,3 +57,58 @@ class InvalidDeliveryPolygonError(AppError):
             status_code=422,
             field="polygon",
         )
+
+
+class TenantRequiredError(AppError):
+    """Levee quand `GET /delivery/zones` est appelee sans en-tete `X-Tenant-Slug`.
+
+    Seule cette route lit encore le tenant depuis un header brut (les autres
+    routes du module passent par `current_user["tenant_slug"]` via JWT). Le
+    plan exige explicitement le code `TENANT_REQUIRED` -- distinct de
+    `MISSING_TENANT_SLUG` deja utilise par `customer/router.py` pour une
+    route differente -- pour que ce module ait ses propres codes d'erreur
+    stables cote client (`app-client`).
+    """
+
+    def __init__(self):
+        super().__init__(
+            code="TENANT_REQUIRED",
+            detail="X-Tenant-Slug header is required",
+            status_code=400,
+            field="X-Tenant-Slug",
+        )
+
+
+class TenantNotFoundError(AppError):
+    """Levee quand le slug fourni via `X-Tenant-Slug` ne correspond a aucun
+    tenant existant dans `public.tenants`.
+
+    Empeche le fallback silencieux sur un tenant `"default"` inexistant que
+    la route `GET /delivery/zones` acceptait auparavant (voir le "Constat
+    actuel" du plan). Code `TENANT_NOT_FOUND` explicitement exige par le plan.
+    """
+
+    def __init__(self, slug: str):
+        super().__init__(
+            code="TENANT_NOT_FOUND",
+            detail=f"Tenant '{slug}' not found",
+            status_code=404,
+            field="tenant_slug",
+        )
+
+
+class DeliveryZoneNotFoundError(AppError):
+    """Levee quand `PUT`/`DELETE /delivery/zones/{id}` cible une zone absente.
+
+    Avant ce durcissement, `PUT` faisait `session.get(...)` puis
+    `setattr(zone, ...)` sans verifier que `zone` n'etait pas `None`, ce qui
+    produisait une `AttributeError` non capturee (500) sur un id absent. Le
+    plan exige que ce cas remonte systematiquement un 404 metier, jamais un 500.
+    """
+
+    def __init__(self, zone_id: int):
+        super().__init__(
+            code="DELIVERY_ZONE_NOT_FOUND",
+            detail=f"Delivery zone {zone_id} not found",
+            status_code=404,
+        )

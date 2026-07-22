@@ -19,8 +19,10 @@ l'erreur remonte bien comme un 422 avec le code metier
 """
 
 import math
+from contextlib import asynccontextmanager
 
 import pytest
+import sqlalchemy as sa
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
@@ -253,3 +255,150 @@ async def test_valid_polygon_yields_201_over_http():
         )
 
     assert response.status_code == 201
+
+
+# ---------------------------------------------------------------------------
+# Tache 3 -- couche service (`app.modules.delivery.service`), sans passer par
+# HTTP. Exercee directement contre la vraie logique (pas de mock du service
+# lui-meme, contrairement a `tests/test_delivery.py` qui mocke le service
+# pour isoler le router) -- seule `service.resolve_known_tenant_slug` touche
+# reellement Postgres (`public.tenants`), via une session de test isolee par
+# savepoint/rollback (`db_session`, voir conftest.py) pour ne rien persister.
+# ---------------------------------------------------------------------------
+
+from app.modules.delivery import service as delivery_service
+from app.modules.delivery.common.errors import (
+    DeliveryZoneNotFoundError,
+    TenantNotFoundError,
+    TenantRequiredError,
+)
+from app.modules.delivery.models import DeliveryZone
+
+
+class _FakeSession:
+    """Simule les operations `AsyncSession` utilisees par le service (`get`,
+    `add`, `commit`, `refresh`) contre un dict en memoire -- evite de dependre
+    de Postgres pour tester la logique pure du service (existence, idempotence).
+    """
+
+    def __init__(self, zones: dict[int, DeliveryZone] | None = None):
+        self._zones = dict(zones or {})
+        self._next_id = max(self._zones.keys(), default=0) + 1
+        self.commit_count = 0
+
+    async def get(self, model, zone_id):
+        assert model is DeliveryZone
+        return self._zones.get(zone_id)
+
+    def add(self, obj):
+        obj.id = self._next_id
+        self._zones[obj.id] = obj
+        self._next_id += 1
+
+    async def commit(self):
+        self.commit_count += 1
+
+    async def refresh(self, obj):
+        pass
+
+
+def _make_zone_create_body() -> DeliveryZoneCreate:
+    return DeliveryZoneCreate(name="Centre-ville", polygon=_square_polygon(), fee=2.5, min_order_amount=10, estimated_minutes=30)
+
+
+async def test_service_create_zone_persists_and_returns_zone():
+    session = _FakeSession()
+    zone = await delivery_service.create_zone(session, _make_zone_create_body())
+    assert zone.id is not None
+    assert zone.name == "Centre-ville"
+    assert session.commit_count == 1
+    assert session._zones[zone.id] is zone
+
+
+async def test_service_update_zone_raises_not_found_for_missing_id():
+    session = _FakeSession()
+    with pytest.raises(DeliveryZoneNotFoundError):
+        await delivery_service.update_zone(session, 999999, _make_zone_create_body())
+    assert session.commit_count == 0
+
+
+async def test_service_update_zone_updates_fields_and_commits():
+    existing = DeliveryZone(id=1, name="Old", polygon=_square_polygon(), fee=1.0, min_order_amount=0, estimated_minutes=20, is_active=True)
+    session = _FakeSession({1: existing})
+    body = _make_zone_create_body()
+    zone = await delivery_service.update_zone(session, 1, body)
+    assert zone is existing
+    assert zone.name == "Centre-ville"
+    assert zone.fee == 2.5
+    assert session.commit_count == 1
+
+
+async def test_service_delete_zone_raises_not_found_for_never_existed_id():
+    session = _FakeSession()
+    with pytest.raises(DeliveryZoneNotFoundError):
+        await delivery_service.delete_zone(session, 999999)
+    assert session.commit_count == 0
+
+
+async def test_service_delete_zone_sets_inactive_and_commits_once():
+    existing = DeliveryZone(id=1, name="Zone", polygon=_square_polygon(), fee=1.0, min_order_amount=0, estimated_minutes=20, is_active=True)
+    session = _FakeSession({1: existing})
+    await delivery_service.delete_zone(session, 1)
+    assert existing.is_active is False
+    assert session.commit_count == 1
+
+
+async def test_service_delete_zone_is_idempotent_on_already_inactive_zone():
+    """Deuxieme appel sur la meme zone deja inactive : no-op reussi, pas de
+    nouveau commit (l'idempotence porte sur "deja supprimee", verifiee au
+    niveau du service lui-meme, pas seulement du router mocke)."""
+    existing = DeliveryZone(id=1, name="Zone", polygon=_square_polygon(), fee=1.0, min_order_amount=0, estimated_minutes=20, is_active=True)
+    session = _FakeSession({1: existing})
+
+    await delivery_service.delete_zone(session, 1)
+    assert session.commit_count == 1
+
+    # Deuxieme appel : ne doit ni lever, ni re-commit, ni changer l'etat.
+    await delivery_service.delete_zone(session, 1)
+    assert existing.is_active is False
+    assert session.commit_count == 1
+
+
+async def test_resolve_known_tenant_slug_raises_required_when_header_missing():
+    with pytest.raises(TenantRequiredError):
+        await delivery_service.resolve_known_tenant_slug(None)
+
+
+async def test_resolve_known_tenant_slug_raises_required_when_header_empty_string():
+    with pytest.raises(TenantRequiredError):
+        await delivery_service.resolve_known_tenant_slug("")
+
+
+async def test_resolve_known_tenant_slug_raises_not_found_for_unknown_slug():
+    # Requete reelle contre `public.tenants` (vide dans la DB de test) --
+    # verifie la logique de la Tache 3 sans mock, pas seulement via le router.
+    with pytest.raises(TenantNotFoundError):
+        await delivery_service.resolve_known_tenant_slug("slug-that-does-not-exist-anywhere")
+
+
+async def test_resolve_known_tenant_slug_returns_slug_for_existing_tenant(monkeypatch, db_session):
+    """Insere un tenant reel (via la session isolee par savepoint/rollback de
+    `db_session`) et verifie que `resolve_known_tenant_slug` le retrouve --
+    en redirigeant `get_public_session` du service vers cette meme session
+    isolee (meme convention que `tenant_session_override` dans
+    `test_stock_phase3_integration.py`), pour que l'insertion et la lecture
+    voient la meme transaction non committee."""
+    await db_session.execute(
+        sa.text("INSERT INTO public.tenants (slug, name, plan) VALUES (:slug, :name, :plan)"),
+        {"slug": "acme-test-tenant", "name": "Acme", "plan": "starter"},
+    )
+    await db_session.flush()
+
+    @asynccontextmanager
+    async def _fake_get_public_session():
+        yield db_session
+
+    monkeypatch.setattr("app.modules.delivery.service.get_public_session", _fake_get_public_session)
+
+    result = await delivery_service.resolve_known_tenant_slug("acme-test-tenant")
+    assert result == "acme-test-tenant"
