@@ -21,7 +21,18 @@ def _point_in_polygon(lat: float, lng: float, polygon: list[list[float]]) -> boo
 
 
 async def check_address(session: AsyncSession, lat: float, lng: float) -> DeliveryZone:
-    result = await session.execute(select(DeliveryZone).where(DeliveryZone.is_active.is_(True)))
+    """Trouve la zone de livraison active couvrant le point (lat, lng).
+
+    Tache 4 (Plan 01) : si plusieurs zones actives contiennent le point, le
+    resultat doit etre deterministe -- on retourne systematiquement celle
+    dont l'`id` est le plus faible, jamais celle que renvoie en premier
+    l'ordre implicite de PostgreSQL (non garanti). `ORDER BY id ASC` rend ce
+    choix explicite au niveau de la requete plutot que de dependre de l'ordre
+    physique de la table.
+    """
+    result = await session.execute(
+        select(DeliveryZone).where(DeliveryZone.is_active.is_(True)).order_by(DeliveryZone.id.asc())
+    )
     for zone in result.scalars():
         coords = zone.polygon.get("coordinates", [[]])[0]
         if coords and _point_in_polygon(lat, lng, coords):

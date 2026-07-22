@@ -402,3 +402,114 @@ async def test_resolve_known_tenant_slug_returns_slug_for_existing_tenant(monkey
 
     result = await delivery_service.resolve_known_tenant_slug("acme-test-tenant")
     assert result == "acme-test-tenant"
+
+
+# ---------------------------------------------------------------------------
+# Tache 4 -- controle de couverture deterministe (tie-break plus petit id
+# actif). Insere deux zones actives reelles (via `db_session`, isolees par
+# savepoint/rollback) dont les polygones se chevauchent sur un point commun,
+# en creant explicitement la zone au plus grand id EN PREMIER, pour que le
+# test ne puisse pas passer "par accident" a cause de l'ordre d'insertion
+# physique en base -- seul un `ORDER BY id ASC` explicite dans
+# `service.check_address` peut faire passer ce test de facon fiable.
+# ---------------------------------------------------------------------------
+
+
+def _overlapping_squares() -> tuple[dict, dict]:
+    """Deux carres qui se chevauchent tous les deux sur le point (2.325, 48.855)."""
+    zone_a = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [2.30, 48.85],
+                [2.35, 48.85],
+                [2.35, 48.90],
+                [2.30, 48.90],
+                [2.30, 48.85],
+            ]
+        ],
+    }
+    zone_b = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [2.31, 48.84],
+                [2.36, 48.84],
+                [2.36, 48.89],
+                [2.31, 48.89],
+                [2.31, 48.84],
+            ]
+        ],
+    }
+    return zone_a, zone_b
+
+
+async def test_check_address_picks_lowest_active_zone_id_when_zones_overlap(db_session):
+    overlapping_point = (48.855, 2.325)  # (lat, lng) -- dans les deux carres
+    polygon_high_id, polygon_low_id = _overlapping_squares()
+
+    # Cree la zone au plus grand id EN PREMIER (insertion volontairement dans
+    # l'ordre "inverse" de l'id attendu gagnant) pour exclure un succes
+    # accidentel du au seul ordre physique d'insertion.
+    zone_high_id = DeliveryZone(
+        id=9001,
+        name="Zone grand id",
+        polygon=polygon_high_id,
+        fee=5.0,
+        min_order_amount=0,
+        estimated_minutes=45,
+        is_active=True,
+    )
+    zone_low_id = DeliveryZone(
+        id=42,
+        name="Zone petit id",
+        polygon=polygon_low_id,
+        fee=2.0,
+        min_order_amount=0,
+        estimated_minutes=20,
+        is_active=True,
+    )
+    db_session.add(zone_high_id)
+    await db_session.flush()
+    db_session.add(zone_low_id)
+    await db_session.flush()
+
+    winner = await delivery_service.check_address(db_session, *overlapping_point)
+
+    assert winner.id == 42
+    assert winner.name == "Zone petit id"
+
+
+async def test_check_address_ignores_inactive_zone_even_with_lower_id(db_session):
+    """L'ordre de tie-break ne doit s'appliquer qu'entre zones actives -- une
+    zone inactive au plus petit id ne doit jamais l'emporter."""
+    overlapping_point = (48.855, 2.325)
+    polygon_high_id, polygon_low_id = _overlapping_squares()
+
+    inactive_low_id = DeliveryZone(
+        id=1,
+        name="Zone inactive",
+        polygon=polygon_low_id,
+        fee=1.0,
+        min_order_amount=0,
+        estimated_minutes=10,
+        is_active=False,
+    )
+    active_high_id = DeliveryZone(
+        id=9002,
+        name="Zone active",
+        polygon=polygon_high_id,
+        fee=5.0,
+        min_order_amount=0,
+        estimated_minutes=45,
+        is_active=True,
+    )
+    db_session.add(inactive_low_id)
+    await db_session.flush()
+    db_session.add(active_high_id)
+    await db_session.flush()
+
+    winner = await delivery_service.check_address(db_session, *overlapping_point)
+
+    assert winner.id == 9002
+    assert winner.name == "Zone active"
