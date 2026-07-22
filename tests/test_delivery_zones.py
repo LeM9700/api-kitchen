@@ -513,3 +513,68 @@ async def test_check_address_ignores_inactive_zone_even_with_lower_id(db_session
 
     assert winner.id == 9002
     assert winner.name == "Zone active"
+
+
+# ---------------------------------------------------------------------------
+# Tache 5 -- cas obligatoire restant du plan non couvert par les Taches 1-4 :
+# "point sur bord". Aucun test existant n'exercait le ray-casting
+# (`service._point_in_polygon`) sur un point situe exactement sur le contour
+# d'un polygone (sommet ou milieu d'arete) -- seulement des points clairement
+# a l'interieur/exterieur (Tache 4) ou les bornes lat/lng du schema Pydantic
+# (Tache 3, `AddressCheckRequest`, sans rapport avec le contour d'un polygone
+# donne). Fige le comportement actuel (deterministe, jamais de crash) plutot
+# que de le laisser non specifie : l'algorithme de ray-casting utilise classe
+# les points sur les aretes bas/gauche comme "dedans" et ceux des aretes
+# haut/droite comme "dehors" (convention half-open standard de cet algorithme,
+# non documentee explicitement dans le code avant ce test).
+# ---------------------------------------------------------------------------
+
+
+def _reference_square_polygon_ring() -> list[list[float]]:
+    return [
+        [2.30, 48.85],
+        [2.35, 48.85],
+        [2.35, 48.90],
+        [2.30, 48.90],
+        [2.30, 48.85],
+    ]
+
+
+@pytest.mark.parametrize(
+    "lat,lng,expected_inside,label",
+    [
+        (48.85, 2.325, True, "milieu arete basse"),
+        (48.85, 2.30, True, "sommet bas-gauche"),
+        (48.875, 2.30, True, "milieu arete gauche"),
+        (48.90, 2.325, False, "milieu arete haute"),
+        (48.875, 2.35, False, "milieu arete droite"),
+        (48.90, 2.35, False, "sommet haut-droit"),
+    ],
+)
+def test_point_on_polygon_boundary_has_deterministic_result(lat, lng, expected_inside, label):
+    from app.modules.delivery.service import _point_in_polygon
+
+    result = _point_in_polygon(lat, lng, _reference_square_polygon_ring())
+    assert result is expected_inside, f"{label}: attendu inside={expected_inside}, obtenu {result}"
+
+
+async def test_check_address_point_exactly_on_zone_edge_matches_ray_casting(db_session):
+    """Bout en bout (avec une vraie zone en base) : un point sur l'arete basse
+    (convention "dedans" de l'algorithme) doit renvoyer cette zone, pas lever
+    DELIVERY_ZONE_UNREACHABLE."""
+    zone = DeliveryZone(
+        id=777,
+        name="Zone bord",
+        polygon={"type": "Polygon", "coordinates": [_reference_square_polygon_ring()]},
+        fee=3.0,
+        min_order_amount=0,
+        estimated_minutes=15,
+        is_active=True,
+    )
+    db_session.add(zone)
+    await db_session.flush()
+
+    point_on_bottom_edge = (48.85, 2.325)  # (lat, lng)
+    winner = await delivery_service.check_address(db_session, *point_on_bottom_edge)
+
+    assert winner.id == 777
