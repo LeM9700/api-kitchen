@@ -511,6 +511,87 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         event_type VARCHAR(128) NOT NULL,
         processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )""",
+    """CREATE TABLE IF NOT EXISTS establishments (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(128) NOT NULL,
+        timezone VARCHAR(64) NOT NULL DEFAULT 'Europe/Paris',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    """INSERT INTO establishments (name, timezone)
+       SELECT 'Établissement principal', 'Europe/Paris'
+       WHERE NOT EXISTS (SELECT 1 FROM establishments)""",
+    """CREATE TABLE IF NOT EXISTS employee_profiles (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        establishment_id INTEGER NOT NULL REFERENCES establishments(id),
+        hourly_rate_cents INTEGER,
+        weekly_hours_contract INTEGER NOT NULL DEFAULT 35,
+        hire_date DATE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_employee_profiles_user_id ON employee_profiles (user_id)",
+    """CREATE TABLE IF NOT EXISTS shifts (
+        id SERIAL PRIMARY KEY,
+        employee_id INTEGER NOT NULL REFERENCES employee_profiles(id),
+        establishment_id INTEGER NOT NULL REFERENCES establishments(id),
+        starts_at TIMESTAMPTZ NOT NULL,
+        ends_at TIMESTAMPTZ NOT NULL,
+        break_minutes INTEGER NOT NULL DEFAULT 0,
+        status VARCHAR(16) NOT NULL DEFAULT 'scheduled',
+        created_by_user_id INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_shifts_employee_starts_at ON shifts (employee_id, starts_at)",
+    """CREATE TABLE IF NOT EXISTS time_clock_entries (
+        id SERIAL PRIMARY KEY,
+        employee_id INTEGER NOT NULL REFERENCES employee_profiles(id),
+        shift_id INTEGER REFERENCES shifts(id),
+        establishment_id INTEGER NOT NULL REFERENCES establishments(id),
+        clock_in_at TIMESTAMPTZ NOT NULL,
+        clock_out_at TIMESTAMPTZ,
+        method VARCHAR(16) NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'open',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_time_clock_entries_employee_clock_in "
+    "ON time_clock_entries (employee_id, clock_in_at)",
+    """CREATE TABLE IF NOT EXISTS time_clock_corrections (
+        id SERIAL PRIMARY KEY,
+        entry_id INTEGER NOT NULL REFERENCES time_clock_entries(id),
+        corrected_by_user_id INTEGER NOT NULL,
+        old_clock_in_at TIMESTAMPTZ,
+        old_clock_out_at TIMESTAMPTZ,
+        new_clock_in_at TIMESTAMPTZ,
+        new_clock_out_at TIMESTAMPTZ,
+        reason TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    """CREATE TABLE IF NOT EXISTS hr_alerts (
+        id SERIAL PRIMARY KEY,
+        employee_id INTEGER NOT NULL REFERENCES employee_profiles(id),
+        type VARCHAR(32) NOT NULL,
+        severity VARCHAR(16) NOT NULL DEFAULT 'warning',
+        payload JSON NOT NULL DEFAULT '{}',
+        triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        resolved_at TIMESTAMPTZ,
+        last_alert_sent_at TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_hr_alerts_employee_type ON hr_alerts (employee_id, type)",
+    """CREATE TABLE IF NOT EXISTS establishment_hr_config (
+        id SERIAL PRIMARY KEY,
+        establishment_id INTEGER NOT NULL UNIQUE REFERENCES establishments(id),
+        weekly_hours_legal_threshold INTEGER NOT NULL DEFAULT 35,
+        late_tolerance_minutes INTEGER NOT NULL DEFAULT 10,
+        alert_cooldown_hours INTEGER NOT NULL DEFAULT 4,
+        labor_cost_target_ratio NUMERIC(4,3) NOT NULL DEFAULT 0.30
+    )""",
+    """INSERT INTO establishment_hr_config (establishment_id)
+       SELECT id FROM establishments
+       WHERE id NOT IN (SELECT establishment_id FROM establishment_hr_config)""",
 ]
 
 
