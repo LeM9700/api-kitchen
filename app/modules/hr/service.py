@@ -1,7 +1,9 @@
 """Logique metier du module RH."""
 
+import csv
 from datetime import datetime as _datetime
 from datetime import timezone as _timezone
+from io import StringIO
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -389,3 +391,56 @@ async def resolve_alert(session: AsyncSession, alert_id: int) -> HrAlert:
     await session.commit()
     await session.refresh(alert)
     return alert
+
+
+async def export_shifts_csv(
+    session: AsyncSession,
+    employee_id: int | None = None,
+    date_from: _datetime | None = None,
+    date_to: _datetime | None = None,
+) -> str:
+    shifts = await list_shifts(session, employee_id, date_from, date_to)
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "employee_id", "establishment_id", "starts_at", "ends_at", "status"])
+    for shift in shifts:
+        writer.writerow(
+            [
+                shift.id,
+                shift.employee_id,
+                shift.establishment_id,
+                shift.starts_at.isoformat(),
+                shift.ends_at.isoformat(),
+                shift.status,
+            ]
+        )
+    return output.getvalue()
+
+
+async def export_time_clock_csv(
+    session: AsyncSession,
+    employee_id: int | None = None,
+    date_from: _datetime | None = None,
+    date_to: _datetime | None = None,
+) -> str:
+    entries = await list_time_clock_entries(
+        session,
+        employee_id=employee_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "employee_id", "clock_in_at", "clock_out_at", "method", "status"])
+    for entry in entries:
+        writer.writerow(
+            [
+                entry.id,
+                entry.employee_id,
+                entry.clock_in_at.isoformat(),
+                entry.clock_out_at.isoformat() if entry.clock_out_at else "",
+                entry.method,
+                entry.status,
+            ]
+        )
+    return output.getvalue()

@@ -3,6 +3,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import PlainTextResponse
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
@@ -157,6 +158,48 @@ async def resolve_alert_endpoint(
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         alert = await hr_service.resolve_alert(session, alert_id)
         return HrAlertOut.model_validate(alert)
+
+
+@router.get("/exports/shifts", response_class=PlainTextResponse)
+async def export_shifts_endpoint(
+    employee_id: int | None = Query(None),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    current_user: dict = Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        csv_text = await hr_service.export_shifts_csv(
+            session,
+            employee_id,
+            date_from,
+            date_to,
+        )
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=shifts.csv"},
+    )
+
+
+@router.get("/exports/timeclock", response_class=PlainTextResponse)
+async def export_time_clock_endpoint(
+    employee_id: int | None = Query(None),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    current_user: dict = Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        csv_text = await hr_service.export_time_clock_csv(
+            session,
+            employee_id,
+            date_from,
+            date_to,
+        )
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=timeclock.csv"},
+    )
 
 
 @router.post("/timeclock/clock-out", response_model=TimeClockEntryOut)
