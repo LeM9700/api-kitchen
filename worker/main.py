@@ -16,6 +16,8 @@ def get_redis_settings() -> RedisSettings:
 class WorkerSettings:
     functions = [
         "worker.tasks.stock_alerts.send_stock_alert",
+        "worker.tasks.hr_alerts.send_hr_late_alert",
+        "worker.tasks.hr_alerts.send_hr_overrun_alert",
         "worker.tasks.emails.send_email",
         "worker.tasks.emails.send_verification_email",
         "worker.tasks.emails.send_password_reset_email",
