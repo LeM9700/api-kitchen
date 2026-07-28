@@ -14,6 +14,7 @@ import asyncio
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
@@ -39,7 +40,10 @@ async def db_engine():
     Cree une seule fois pour eviter le cout de la connexion pool a chaque test.
     Utilise ``test_database_url`` si configure, sinon ``database_url``.
     """
-    engine = create_async_engine(settings.test_database_url or settings.database_url)
+    engine = create_async_engine(
+        settings.test_database_url or settings.database_url,
+        poolclass=NullPool,
+    )
     yield engine
     await engine.dispose()
 
