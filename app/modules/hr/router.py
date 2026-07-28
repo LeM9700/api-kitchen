@@ -1,9 +1,10 @@
 """Router FastAPI du module RH."""
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
@@ -160,46 +161,96 @@ async def resolve_alert_endpoint(
         return HrAlertOut.model_validate(alert)
 
 
-@router.get("/exports/shifts", response_class=PlainTextResponse)
+@router.get("/exports/shifts")
 async def export_shifts_endpoint(
+    format: Literal["csv", "xlsx", "pdf"] = Query("csv"),
     employee_id: int | None = Query(None),
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     current_user: dict = Depends(require_role("admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        csv_text = await hr_service.export_shifts_csv(
+        if format == "csv":
+            csv_text = await hr_service.export_shifts_csv(
+                session,
+                employee_id,
+                date_from,
+                date_to,
+            )
+            return PlainTextResponse(
+                content=csv_text,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": "attachment; filename=shifts.csv"},
+            )
+        if format == "xlsx":
+            content = await hr_service.export_shifts_xlsx(
+                session,
+                employee_id,
+                date_from,
+                date_to,
+            )
+            return Response(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=shifts.xlsx"},
+            )
+        content = await hr_service.export_shifts_pdf(
             session,
             employee_id,
             date_from,
             date_to,
         )
-    return PlainTextResponse(
-        content=csv_text,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=shifts.csv"},
-    )
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=shifts.pdf"},
+        )
 
 
-@router.get("/exports/timeclock", response_class=PlainTextResponse)
+@router.get("/exports/timeclock")
 async def export_time_clock_endpoint(
+    format: Literal["csv", "xlsx", "pdf"] = Query("csv"),
     employee_id: int | None = Query(None),
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     current_user: dict = Depends(require_role("admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        csv_text = await hr_service.export_time_clock_csv(
+        if format == "csv":
+            csv_text = await hr_service.export_time_clock_csv(
+                session,
+                employee_id,
+                date_from,
+                date_to,
+            )
+            return PlainTextResponse(
+                content=csv_text,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": "attachment; filename=timeclock.csv"},
+            )
+        if format == "xlsx":
+            content = await hr_service.export_time_clock_xlsx(
+                session,
+                employee_id,
+                date_from,
+                date_to,
+            )
+            return Response(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=timeclock.xlsx"},
+            )
+        content = await hr_service.export_time_clock_pdf(
             session,
             employee_id,
             date_from,
             date_to,
         )
-    return PlainTextResponse(
-        content=csv_text,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=timeclock.csv"},
-    )
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=timeclock.pdf"},
+        )
 
 
 @router.post("/timeclock/clock-out", response_model=TimeClockEntryOut)
