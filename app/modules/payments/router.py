@@ -2,14 +2,16 @@ from datetime import datetime
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import PlainTextResponse
 
 from app.core.config import settings
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_current_user, get_pagination, require_role
+from app.core.http.deps import get_current_user, get_pagination, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse, PaginationParams
 from app.modules.payments import service
 from app.modules.payments.schemas import (
+    LocalTestPaymentRequest,
     PaymentConfirmRequest,
     PaymentDetailOut,
     PaymentIntentRequest,
@@ -18,6 +20,11 @@ from app.modules.payments.schemas import (
     PaymentSummaryOut,
     RefundCreate,
     RefundOut,
+    TerminalConnectionTokenOut,
+    TerminalPaymentIntentOut,
+    TerminalPaymentIntentRequest,
+    TerminalReaderActionOut,
+    TerminalReaderListOut,
 )
 
 stripe.api_key = settings.stripe_secret_key
@@ -50,11 +57,30 @@ async def create_intent(body: PaymentIntentRequest, current_user=Depends(get_cur
 
 @router.post("/confirm", response_model=PaymentOut)
 async def confirm(body: PaymentConfirmRequest, current_user=Depends(get_current_user)):
+    role = current_user.get("role")
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.confirm(
             session,
             body.provider_payment_id,
             tenant_slug=current_user["tenant_slug"],
+            user_id=int(current_user["id"]) if current_user.get("id") is not None else None,
+            is_staff=role in {"staff", "admin", "super-admin"},
+        )
+
+
+@router.post("/local-test/confirm", response_model=PaymentOut)
+async def confirm_local_test_payment(
+    body: LocalTestPaymentRequest,
+    current_user=Depends(get_current_user),
+):
+    role = current_user.get("role")
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.confirm_local_test_payment(
+            session,
+            body.order_id,
+            tenant_slug=current_user["tenant_slug"],
+            user_id=int(current_user["id"]) if current_user.get("id") is not None else None,
+            is_staff=role in {"staff", "admin", "super-admin"},
         )
 
 
@@ -100,7 +126,7 @@ async def webhook(request: Request):
 
 @router.get("/summary", response_model=PaymentSummaryOut)
 async def payment_summary(
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_permission("payments:read", "staff", "admin")),
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> PaymentSummaryOut:
@@ -110,7 +136,7 @@ async def payment_summary(
 
 @router.get("", response_model=PaginatedResponse[PaymentListItemOut])
 async def list_payments(
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_permission("payments:read", "staff", "admin")),
     pagination: PaginationParams = Depends(get_pagination),
     status: str | None = Query(None, description="Comma-separated statuses"),
     date_from: datetime | None = None,
@@ -133,6 +159,98 @@ async def list_payments(
             max_amount=max_amount,
         )
     return PaginatedResponse.build(items, total, pagination)
+
+
+@router.get("/export/csv", response_class=PlainTextResponse)
+async def export_payments_csv(
+    current_user: dict = Depends(require_role("admin")),
+    status: str | None = Query(None, description="Comma-separated payment statuses"),
+    provider: str | None = None,
+    payment_status: str | None = Query(None, description="Comma-separated order payment statuses"),
+    order_type: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> PlainTextResponse:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        csv_text = await service.export_payments_csv(
+            session,
+            status=status,
+            provider=provider,
+            payment_status=payment_status,
+            order_type=order_type,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=payments.csv"},
+    )
+
+
+@router.post("/terminal/connection-token", response_model=TerminalConnectionTokenOut)
+async def terminal_connection_token(
+    current_user: dict = Depends(require_permission("payments:terminal", "staff", "admin")),
+) -> TerminalConnectionTokenOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_terminal_connection_token(session, current_user["tenant_slug"])
+
+
+@router.post("/terminal/intent", response_model=TerminalPaymentIntentOut)
+async def terminal_payment_intent(
+    body: TerminalPaymentIntentRequest,
+    current_user: dict = Depends(require_permission("payments:terminal", "staff", "admin")),
+) -> TerminalPaymentIntentOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_terminal_intent(
+            session,
+            body.order_id,
+            tenant_slug=current_user["tenant_slug"],
+            user_id=int(current_user["id"]) if current_user.get("id") is not None else None,
+            reader_id=body.reader_id,
+            process_on_reader=body.process_on_reader,
+        )
+
+
+@router.get("/terminal/readers", response_model=TerminalReaderListOut)
+async def terminal_readers(
+    current_user: dict = Depends(require_permission("payments:terminal", "staff", "admin")),
+    location_id: str | None = None,
+) -> TerminalReaderListOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.list_terminal_readers(
+            session,
+            current_user["tenant_slug"],
+            location_id=location_id,
+        )
+
+
+@router.post("/terminal/readers/{reader_id}/process", response_model=TerminalReaderActionOut)
+async def process_terminal_reader(
+    reader_id: str,
+    body: PaymentConfirmRequest,
+    current_user: dict = Depends(require_permission("payments:terminal", "staff", "admin")),
+) -> TerminalReaderActionOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.process_terminal_reader(
+            session,
+            current_user["tenant_slug"],
+            reader_id,
+            body.provider_payment_id,
+        )
+
+
+@router.post("/terminal/readers/{reader_id}/cancel", response_model=TerminalReaderActionOut)
+async def cancel_terminal_reader(
+    reader_id: str,
+    current_user: dict = Depends(require_permission("payments:terminal", "staff", "admin")),
+) -> TerminalReaderActionOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.cancel_terminal_reader_action(
+            session,
+            current_user["tenant_slug"],
+            reader_id,
+        )
 
 
 @router.get("/{order_id}", response_model=PaymentDetailOut)
@@ -166,7 +284,7 @@ async def create_refund(
     order_id: int,
     body: RefundCreate,
     response: Response,
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("admin")),
 ) -> RefundOut:
     """Émet un remboursement Stripe total ou partiel sur une commande.
 

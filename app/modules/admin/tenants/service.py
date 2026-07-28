@@ -19,6 +19,8 @@ from app.modules.admin.tenants.schemas import (
     ExceptionalClosureCreate,
     TenantBrandingResponse,
     TenantBrandingUpdate,
+    TenantPrintConfigResponse,
+    TenantPrintConfigUpdate,
     TenantScheduledClosureRequest,
     TenantConfigUpdate,
     TenantStatusResponse,
@@ -208,6 +210,49 @@ async def update_config(
             pass  # Notification non critique — ne pas bloquer la réponse.
 
     return config
+
+
+async def get_print_config(session: AsyncSession) -> TenantPrintConfigResponse:
+    config = await get_or_create_config(session)
+    return TenantPrintConfigResponse(
+        print_enabled=config.print_enabled,
+        print_config=config.print_config,
+    )
+
+
+async def update_print_config(
+    session: AsyncSession,
+    data: TenantPrintConfigUpdate,
+    *,
+    user_id: int,
+    user_email: str | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> TenantPrintConfigResponse:
+    config = await get_or_create_config(session)
+    updates = data.model_dump(exclude_none=True)
+
+    for field, new_value in updates.items():
+        old_value = getattr(config, field, None)
+        if old_value != new_value:
+            await _write_audit(
+                session,
+                user_id=user_id,
+                field_name=field,
+                old_value=json.dumps(old_value, default=str),
+                new_value=json.dumps(new_value, default=str),
+                ip_address=ip_address,
+                user_agent=user_agent,
+                user_email=user_email,
+            )
+            setattr(config, field, new_value)
+
+    await session.commit()
+    await session.refresh(config)
+    return TenantPrintConfigResponse(
+        print_enabled=config.print_enabled,
+        print_config=config.print_config,
+    )
 
 
 async def schedule_closure(

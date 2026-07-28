@@ -7,13 +7,16 @@ Creation et cycle de vie des commandes : pricing serveur-side, application des p
 | Methode | Path | Auth | Roles | Reponse |
 |---------|------|------|-------|---------|
 | POST | `/api/v1/orders` | Bearer JWT + `Idempotency-Key` | tous | `OrderOut` |
+| POST | `/api/v1/orders/manual` | Bearer JWT + `Idempotency-Key` | staff, admin | `ManualOrderOut` |
 | GET | `/api/v1/orders/me` | Bearer JWT | tous | `PaginatedResponse[OrderListOut]` |
 | GET | `/api/v1/orders` | Bearer JWT | staff, admin | `PaginatedResponse[OrderListOut]` |
+| GET | `/api/v1/orders/export/csv` | Bearer JWT | admin | `text/csv` |
 | GET | `/api/v1/orders/{order_id}` | Bearer JWT | proprietaire, staff, admin | `OrderDetailOut` |
 | POST | `/api/v1/orders/{order_id}/cancel` | Bearer JWT | proprietaire | `OrderOut` |
 | POST | `/api/v1/orders/{order_id}/reorder` | Bearer JWT | proprietaire, staff, admin | `ReorderOut` |
 | GET | `/api/v1/orders/{order_id}/receipt` | Bearer JWT | staff, admin | `OrderReceiptOut` |
 | PATCH | `/api/v1/orders/{order_id}/status` | Bearer JWT | staff, admin | `OrderOut` |
+| PATCH | `/api/v1/orders/{order_id}/items/{item_id}/preparation` | Bearer JWT | staff, admin | `OrderItemOut` |
 
 ## Query params
 
@@ -30,9 +33,9 @@ Creation et cycle de vie des commandes : pricing serveur-side, application des p
 
 ## Modeles de donnees
 
-**`orders`** : `id`, `user_id`, `customer_email`, `status`, `payment_status`, `subtotal`, `discount_total`, `delivery_fee`, `total`, `delivery_address`, `delivery_zone_id`, `estimated_delivery_at`, `idempotency_key`, `promo_code`, `created_at`.
+**`orders`** : `id`, `user_id`, `customer_email`, `customer_name`, `customer_phone`, `order_type`, `status`, `payment_status`, `source`, `created_by_user_id`, `subtotal`, `discount_total`, `delivery_fee`, `total`, `delivery_address`, `delivery_zone_id`, `table_number`, `estimated_delivery_at`, `idempotency_key`, `promo_code`, `created_at`.
 
-**`order_items`** : `id`, `order_id`, `product_id`, `variant_id`, `product_name_snapshot`, `variant_name_snapshot`, `extras_snapshot`, `extras_total`, `quantity`, `unit_price`, `total`.
+**`order_items`** : `id`, `order_id`, `product_id`, `variant_id`, `product_name_snapshot`, `variant_name_snapshot`, `extras_snapshot`, `extras_total`, `quantity`, `unit_price`, `total`, `preparation_status`, `preparation_station`, `prepared_at`, `prepared_by_user_id`.
 
 **`order_status_history`** : `id`, `order_id`, `status`, `note`, `created_at`.
 
@@ -50,6 +53,21 @@ La migration `0023_orders_interfaces_security.py` ajoute :
 - `order_items.extras_total`
 - index `orders.user_id`, `orders.status`, `orders.created_at`
 - contrainte unique `user_id + idempotency_key`
+
+La migration `0035_admin_staff_api_contracts.py` ajoute :
+
+- `order_type = dine_in`
+- `orders.customer_name`, `orders.customer_phone`, `orders.source`, `orders.created_by_user_id`, `orders.table_number`
+- `order_items.preparation_status`, `order_items.preparation_station`, `order_items.prepared_at`, `order_items.prepared_by_user_id`
+- les contraintes de statut/station de preparation.
+
+## Types de commande
+
+Valeurs supportees :
+
+- `delivery` : `delivery_address` obligatoire, zone/frais de livraison possibles.
+- `pickup` : aucune adresse requise, `delivery_fee = 0`, `delivery_zone_id = null`.
+- `dine_in` : aucune adresse requise, `delivery_fee = 0`, `delivery_zone_id = null`.
 
 ## Transitions de statut
 
@@ -87,8 +105,30 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - Les prix sont resolus depuis `Product.base_price`, `ProductVariant.price_delta` et les `Extra` autorises via `ProductExtra`.
 - Les extras sont sauvegardes en snapshot JSON dans `order_items.extras_snapshot`.
 - `delivery_fee` est calcule cote serveur depuis `delivery_zone_id`.
+- Pour `pickup` et `dine_in`, l'API ignore adresse/zone de livraison et force `delivery_fee = 0`.
 - `estimated_delivery_at` est calcule depuis `TenantConfig` + `DeliveryZone.estimated_minutes`, puis stocke.
 - `total = subtotal - discount_total + delivery_fee`.
+
+**Commande manuelle (`POST /orders/manual`)**
+
+- Reservee staff/admin.
+- Header `Idempotency-Key` obligatoire.
+- Cree une commande avec `user_id = null`, `source = manual`, `created_by_user_id` et, si fourni, `table_number`.
+- Le payload accepte `customer.email`, `customer.full_name`, `customer.phone`, sans compte client obligatoire.
+- Les prix restent resolus cote serveur depuis catalogue/variants/extras.
+- Le paiement caisse est integre dans le payload via `payment.method`.
+- Methodes acceptees : `cash`, `external_terminal`, `cash_register`.
+- Pour `external_terminal` et `cash_register`, `external_reference` est obligatoire.
+- Si le paiement caisse est valide, la commande passe `payment_status = paid`, puis la transition `pending -> confirmed` reutilise `update_status` pour garder la deduction de stock atomique.
+- Reponse : `{ "order": OrderDetailOut, "payment": PaymentOut, "receipt": OrderReceiptOut }`.
+
+**Preparation item par item**
+
+- `PATCH /orders/{order_id}/items/{item_id}/preparation` accepte `pending`, `preparing`, `ready`.
+- Les commandes terminales (`delivered`, `cancelled`) refusent les changements avec `ORDER_NOT_ACTIVE`.
+- Quand un item passe `ready`, `prepared_at` et `prepared_by_user_id` sont remplis.
+- `OrderDetailOut.station_summary` expose un resume par station : `station`, `total_items`, `ready_items`, `all_ready`.
+- Le statut global de commande reste pilote par `PATCH /orders/{id}/status`.
 
 **Historique client (`GET /orders/me`)**
 
@@ -154,6 +194,7 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - Rate-limit de creation commande base sur `user_id` authentifie, fallback IP si absent.
 - `apply_promo` masque les erreurs derriere `INVALID_PROMO`.
 - `PATCH /orders/{id}/status` reserve staff/admin.
+- `PATCH /orders/{id}/items/{item_id}/preparation` reserve staff/admin.
 - `GET /orders/{id}` protege contre l'IDOR client : un client ne voit que ses commandes.
 - Isolation tenant via `get_tenant_session(current_user["tenant_slug"])`.
 - Atomicite stock/statut : `deduct_for_order` s'execute dans la transaction de `update_status`.
@@ -172,6 +213,10 @@ Resume de commande pour listes client/staff :
 
 - `id`
 - `customer_email`
+- `customer_name`
+- `customer_phone`
+- `source`
+- `created_by_user_id`
 - `status`
 - `payment_status`
 - `subtotal`
@@ -180,6 +225,7 @@ Resume de commande pour listes client/staff :
 - `total`
 - `delivery_address`
 - `delivery_zone_id`
+- `table_number`
 - `estimated_delivery_at`
 - `created_at`
 
@@ -190,6 +236,7 @@ Etend `OrderListOut` avec :
 - `user_id`
 - `promo_code`
 - `items`
+- `station_summary`
 - `status_history`
 
 **`OrderItemOut`**
@@ -203,6 +250,10 @@ Etend `OrderListOut` avec :
 - `extras_total`
 - `total`
 - `extras`
+- `preparation_status`
+- `preparation_station`
+- `prepared_at`
+- `prepared_by_user_id`
 
 **`OrderReceiptOut`**
 
@@ -247,13 +298,8 @@ Etend `OrderListOut` avec :
 Tests executes sur le perimetre :
 
 ```text
-pytest tests/test_orders.py tests/test_payments.py tests/test_catalog.py tests/test_delivery.py -q
-15 passed
+PYTHONPATH=. pytest tests/test_order_type.py tests/test_orders.py tests/test_catalog.py::test_availability_map_batches_single_query tests/test_catalog.py::test_create_product_requires_admin tests/test_catalog.py::test_catalog_paginated_response_exposes_total_count tests/test_catalog.py::test_catalog_csv_validation_accepts_core_rows tests/test_catalog.py::test_product_inherits_preparation_station_from_category tests/test_catalog.py::test_product_preparation_station_overrides_category tests/test_catalog.py::test_availability_override_requires_reason_when_unavailable tests/test_catalog.py::test_availability_map_applies_latest_unavailable_override tests/test_payments_interfaces.py -q
+36 passed
 ```
 
-Controle migration :
-
-```text
-alembic heads
-0023 (head)
-```
+Note locale : les tests d'integration PostgreSQL doivent etre rejoues apres `alembic upgrade head`, car les modeles ORM incluent les colonnes ajoutees par `0035_admin_staff_api_contracts.py`.

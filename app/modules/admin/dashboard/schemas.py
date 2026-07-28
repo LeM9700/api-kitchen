@@ -47,3 +47,10 @@ class StockSnapshotResponse(BaseModel):
 class StatsSummaryResponse(BaseModel):
     live: LiveStatsResponse
     last_day: DailyStatsResponse | None
+
+
+class TopProductResponse(BaseModel):
+    product_id: int
+    product_name: str
+    quantity: int
+    revenue: float

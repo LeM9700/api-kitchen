@@ -2,17 +2,29 @@ from arq import ArqRedis
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import PlainTextResponse
 from slowapi.util import get_remote_address
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_arq_pool, get_current_user, get_optional_user, get_pagination, require_role
+from app.core.http.deps import (
+    get_arq_pool,
+    get_current_user,
+    get_optional_user,
+    get_pagination,
+    require_permission,
+    require_role,
+)
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse, PaginationParams
 from app.modules.orders import service
 from app.modules.orders.schemas import (
+    ManualOrderCreate,
+    ManualOrderOut,
     OrderCreate,
     OrderDetailOut,
+    OrderItemOut,
+    OrderItemPreparationUpdate,
     OrderListOut,
     OrderOut,
     OrderReceiptOut,
@@ -81,6 +93,24 @@ async def create_order(
         )
 
 
+@router.post("/manual", response_model=ManualOrderOut, status_code=201)
+async def create_manual_order(
+    body: ManualOrderCreate,
+    current_user=Depends(require_permission("orders:manual", "staff", "admin")),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    arq_pool: ArqRedis = Depends(get_arq_pool),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_manual_order(
+            session,
+            body,
+            actor_user_id=int(current_user["id"]),
+            tenant_slug=current_user["tenant_slug"],
+            idempotency_key=idempotency_key,
+            arq_pool=arq_pool,
+        )
+
+
 @router.get("/me", response_model=PaginatedResponse[OrderListOut])
 async def list_my_orders(
     current_user=Depends(get_current_user),
@@ -95,7 +125,7 @@ async def list_my_orders(
 
 @router.get("", response_model=PaginatedResponse[OrderListOut])
 async def list_orders(
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("orders:read", "staff", "admin")),
     pagination: PaginationParams = Depends(get_pagination),
     status: str | None = Query(None, description="Comma-separated statuses"),
     date_from: datetime | None = None,
@@ -105,6 +135,31 @@ async def list_orders(
         statuses = [part.strip() for part in status.split(",") if part.strip()] if status else None
         items, total = await service.list_orders(session, pagination, statuses, date_from, date_to)
     return PaginatedResponse.build(items, total, pagination)
+
+
+@router.get("/export/csv", response_class=PlainTextResponse)
+async def export_orders_csv(
+    current_user=Depends(require_role("admin")),
+    status: str | None = Query(None, description="Comma-separated order statuses"),
+    payment_status: str | None = Query(None, description="Comma-separated payment statuses"),
+    order_type: str | None = Query(None),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        csv_text = await service.export_orders_csv(
+            session,
+            status=status,
+            payment_status=payment_status,
+            order_type=order_type,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=orders.csv"},
+    )
 
 
 @router.get("/{order_id}", response_model=OrderDetailOut)
@@ -148,7 +203,7 @@ async def reorder(order_id: int, current_user=Depends(get_current_user)):
 
 
 @router.get("/{order_id}/receipt", response_model=OrderReceiptOut)
-async def get_receipt(order_id: int, current_user=Depends(require_role("staff", "admin"))):
+async def get_receipt(order_id: int, current_user=Depends(require_permission("orders:read", "staff", "admin"))):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.build_receipt(session, order_id)
 
@@ -157,7 +212,7 @@ async def get_receipt(order_id: int, current_user=Depends(require_role("staff", 
 async def update_status(
     order_id: int,
     body: OrderStatusUpdate,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("orders:write", "staff", "admin")),
     arq_pool: ArqRedis = Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -170,4 +225,22 @@ async def update_status(
             arq_pool,
             actor_user_id=int(current_user["id"]),
             is_staff=True,
+        )
+
+
+@router.patch("/{order_id}/items/{item_id}/preparation", response_model=OrderItemOut)
+async def update_item_preparation(
+    order_id: int,
+    item_id: int,
+    body: OrderItemPreparationUpdate,
+    current_user=Depends(require_permission("orders:preparation", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.update_item_preparation(
+            session,
+            order_id,
+            item_id,
+            body.status,
+            body.note,
+            actor_user_id=int(current_user["id"]),
         )

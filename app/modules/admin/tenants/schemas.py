@@ -23,6 +23,7 @@ class TenantConfigUpdate(BaseModel):
     auto_calc_prep_time: bool | None = None
     overhead_per_order_minutes: int | None = Field(None, ge=0, le=60)
     timezone: str | None = None
+    large_stock_adjustment_threshold: float | None = Field(None, ge=0)
 
     @field_validator("temporary_closure_message", "default_closure_message", mode="before")
     @classmethod
@@ -58,6 +59,9 @@ class TenantConfigResponse(BaseModel):
     auto_calc_prep_time: bool
     overhead_per_order_minutes: int
     timezone: str
+    large_stock_adjustment_threshold: float
+    print_enabled: bool = False
+    print_config: dict | None = None
     updated_at: datetime
     scheduled_close_at: datetime | None
 
@@ -162,6 +166,16 @@ class TenantClosureToggle(BaseModel):
         if v and len(v) > 500:
             raise ValueError("Le message ne peut pas depasser 500 caracteres")
         return v
+
+
+class TenantPrintConfigUpdate(BaseModel):
+    print_enabled: bool | None = None
+    print_config: dict | None = None
+
+
+class TenantPrintConfigResponse(BaseModel):
+    print_enabled: bool
+    print_config: dict | None = None
 
 
 class TenantSuspendRequest(BaseModel):

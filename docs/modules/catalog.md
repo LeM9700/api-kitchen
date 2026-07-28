@@ -9,6 +9,7 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 |---------|------|------|-------|
 | GET | `/api/v1/catalog/categories` | Public | — rate-limit 60/min |
 | POST | `/api/v1/catalog/categories` | Bearer JWT | admin |
+| PUT | `/api/v1/catalog/categories/{category_id}` | Bearer JWT | admin |
 
 ### Produits
 | Méthode | Path | Auth | Rôles |
@@ -19,6 +20,8 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 | POST | `/api/v1/catalog/products` | Bearer JWT | admin |
 | PUT | `/api/v1/catalog/products/{product_id}` | Bearer JWT | admin |
 | DELETE | `/api/v1/catalog/products/{product_id}` | Bearer JWT | admin |
+| POST | `/api/v1/catalog/products/{product_id}/availability-override` | Bearer JWT | staff, admin |
+| GET | `/api/v1/catalog/products/{product_id}/availability-history` | Bearer JWT | staff, admin |
 
 ### Variantes
 | Méthode | Path | Auth | Rôles |
@@ -90,9 +93,11 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 
 ## Modèles de données
 
-**`categories`** : `id`, `name`, `display_order`, `is_active`.
+**`categories`** : `id`, `name`, `display_order`, `preparation_station`, `is_active`.
 
-**`products`** : `id`, `category_id`, `name`, `description`, `base_price`, `image_url`, `is_active`.
+**`products`** : `id`, `category_id`, `name`, `description`, `base_price`, `image_url`, `preparation_station`, `is_active`.
+
+**`product_availability_overrides`** : `id`, `product_id`, `available`, `reason`, `changed_by_user_id`, `created_at`. Historique immuable des indisponibilites/reactivations temporaires.
 
 **`product_variants`** : `id`, `product_id`, `name`, `price_delta` (delta sur `base_price`), `is_active`.
 
@@ -124,6 +129,8 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 
 **Variantes** : `price_delta` ajouté à `base_price` pour le prix final. Résolu côté serveur à la création de commande.
 
+**Stations de preparation** : `preparation_station` accepte `kitchen`, `counter`, `none`. La categorie porte une valeur par defaut (`kitchen`). Le produit peut definir une valeur explicite ; sinon il herite de sa categorie. Les reponses produit exposent aussi `effective_preparation_station` pour l'interface staff.
+
 **Soft-delete produits/variantes** : `DELETE` positionne `is_active = False`, pas de suppression physique.
 
 **Payload public enrichi** : `GET /products` retourne désormais un résumé prêt interface client : catégorie, image primaire, allergènes, dietary tags, disponibilité stock de base et `regulatory_complete`. Les réponses paginées catalog exposent aussi `total_count`.
@@ -147,6 +154,8 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 **Recommandations** : associations manuelles produit → produits recommandés, avec `display_order`, `label` et soft-disable via `is_active`.
 
 **Disponibilité stock** : le résumé et le détail produit exposent une disponibilité de base via lecture du service stock existant (`get_product_availability`) sans modifier le module stock.
+
+**Indisponibilite temporaire** : `POST /products/{id}/availability-override` permet au staff/admin de rendre un produit temporairement indisponible ou de le reactiver. `reason` est obligatoire quand `available=false`. Le dernier override `available=false` force `availability.available=false` dans les endpoints publics sans modifier `is_active`. L'historique est consultable via `GET /products/{id}/availability-history`.
 
 **Super-admin** : routes lecture seule par `tenant_slug` explicite pour consulter le catalogue d'un tenant sans manipulation manuelle du `search_path`.
 

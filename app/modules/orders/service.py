@@ -1,5 +1,7 @@
 import logging
+import csv
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 
 from arq import ArqRedis
 from sqlalchemy import and_, func, select
@@ -8,11 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
 from app.modules.admin.tenants.models import TenantConfig
-from app.modules.catalog.models import Extra, Product, ProductExtra, ProductVariant
+from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
 from app.modules.delivery.models import DeliveryZone
-from app.modules.loyalty.config.service import credit_points_for_order
+from app.modules.loyalty.account.models import LoyaltyTransaction
+from app.modules.loyalty.account.service import get_or_create_account
+from app.modules.loyalty.config.service import credit_points_for_order, get_or_create_loyalty_config
 from app.modules.notifications.notification_service import notify_staff, notify_user
 from app.modules.orders.models import Order, OrderItem, OrderStatusHistory
+from app.modules.payments.models import Payment
 from app.modules.promotions import service as promotions_service
 from app.modules.promotions.models import Promotion
 from app.modules.promotions.schemas import PromotionCartItem
@@ -30,10 +35,44 @@ VALID_TRANSITIONS = {
     "delivered": set(),
     "cancelled": set(),
 }
+NON_DELIVERY_ORDER_TYPES = {"pickup", "dine_in"}
+ACTIVE_PREPARATION_ORDER_STATUSES = {"pending", "confirmed", "queued", "preparing", "ready", "out_for_delivery"}
+PREPARATION_STATUSES = {"pending", "preparing", "ready"}
+MANUAL_PAYMENT_PROVIDERS = {"cash", "external_terminal", "cash_register"}
 
 
 def _money(value) -> float:
     return round(float(value or 0), 2)
+
+
+async def _resolve_loyalty_discount(
+    session: AsyncSession,
+    user_id: int | None,
+    points_to_use: int,
+    amount_eligible: float,
+) -> tuple[float, int]:
+    if points_to_use <= 0:
+        return 0.0, 0
+    if user_id is None:
+        raise AppError("LOYALTY_USER_REQUIRED", "loyalty_user_id is required", 422, "loyalty_user_id")
+
+    account = await get_or_create_account(session, user_id, commit=False)
+    if account.points < points_to_use:
+        raise AppError("INSUFFICIENT_POINTS", "Solde de points insuffisant", 422, "loyalty_points_to_use")
+
+    config = await get_or_create_loyalty_config(session)
+    rate = float(config.points_to_euro_rate)
+    discount = _money(points_to_use * rate)
+    eligible = _money(amount_eligible)
+    if discount > eligible:
+        max_points = int(eligible / rate) if rate > 0 else 0
+        raise AppError(
+            "LOYALTY_POINTS_EXCEED_TOTAL",
+            f"Too many points for this order. Maximum usable points: {max_points}",
+            422,
+            "loyalty_points_to_use",
+        )
+    return discount, points_to_use
 
 
 def _extras_from_snapshot(snapshot) -> list[dict]:
@@ -44,18 +83,44 @@ def _serialize_order_list(order: Order) -> dict:
     return {
         "id": order.id,
         "customer_email": order.customer_email,
+        "customer_name": getattr(order, "customer_name", None),
+        "customer_phone": getattr(order, "customer_phone", None),
         "order_type": getattr(order, "order_type", None) or "delivery",
         "status": order.status,
         "payment_status": getattr(order, "payment_status", "pending") or "pending",
+        "source": getattr(order, "source", None) or "customer",
+        "created_by_user_id": getattr(order, "created_by_user_id", None),
         "subtotal": _money(order.subtotal),
         "discount_total": _money(order.discount_total),
         "delivery_fee": _money(order.delivery_fee),
         "total": _money(order.total),
         "delivery_address": order.delivery_address,
         "delivery_zone_id": getattr(order, "delivery_zone_id", None),
+        "table_number": getattr(order, "table_number", None),
         "estimated_delivery_at": getattr(order, "estimated_delivery_at", None),
         "created_at": getattr(order, "created_at", None),
     }
+
+
+def _station_summary(items: list[dict]) -> list[dict]:
+    grouped: dict[str, dict[str, int]] = {}
+    for item in items:
+        station = item.get("preparation_station") or "none"
+        if station == "none":
+            continue
+        bucket = grouped.setdefault(station, {"total_items": 0, "ready_items": 0})
+        bucket["total_items"] += 1
+        if item.get("preparation_status") == "ready":
+            bucket["ready_items"] += 1
+    return [
+        {
+            "station": station,
+            "total_items": counts["total_items"],
+            "ready_items": counts["ready_items"],
+            "all_ready": counts["total_items"] > 0 and counts["total_items"] == counts["ready_items"],
+        }
+        for station, counts in sorted(grouped.items())
+    ]
 
 
 async def _serialize_order_detail(session: AsyncSession, order: Order) -> dict:
@@ -68,26 +133,33 @@ async def _serialize_order_detail(session: AsyncSession, order: Order) -> dict:
         .order_by(OrderStatusHistory.created_at, OrderStatusHistory.id)
     )
 
+    serialized_items = [
+        {
+            "id": item.id,
+            "product_id": item.product_id,
+            "variant_id": item.variant_id,
+            "product_name": getattr(item, "product_name_snapshot", None),
+            "variant_name": getattr(item, "variant_name_snapshot", None),
+            "quantity": item.quantity,
+            "unit_price": _money(item.unit_price),
+            "extras_total": _money(getattr(item, "extras_total", 0)),
+            "total": _money(item.total),
+            "extras": _extras_from_snapshot(getattr(item, "extras_snapshot", None)),
+            "preparation_status": getattr(item, "preparation_status", None) or "pending",
+            "preparation_station": getattr(item, "preparation_station", None) or "kitchen",
+            "prepared_at": getattr(item, "prepared_at", None),
+            "prepared_by_user_id": getattr(item, "prepared_by_user_id", None),
+        }
+        for item in items_result.scalars()
+    ]
+
     payload = _serialize_order_list(order)
     payload.update(
         {
             "user_id": order.user_id,
             "promo_code": getattr(order, "promo_code", None),
-            "items": [
-                {
-                    "id": item.id,
-                    "product_id": item.product_id,
-                    "variant_id": item.variant_id,
-                    "product_name": getattr(item, "product_name_snapshot", None),
-                    "variant_name": getattr(item, "variant_name_snapshot", None),
-                    "quantity": item.quantity,
-                    "unit_price": _money(item.unit_price),
-                    "extras_total": _money(getattr(item, "extras_total", 0)),
-                    "total": _money(item.total),
-                    "extras": _extras_from_snapshot(getattr(item, "extras_snapshot", None)),
-                }
-                for item in items_result.scalars()
-            ],
+            "items": serialized_items,
+            "station_summary": _station_summary(serialized_items),
             "status_history": [
                 {
                     "status": history.status,
@@ -129,12 +201,10 @@ async def _resolve_delivery(
 ) -> tuple[float, int, int | None]:
     """Calcule delivery_fee, delai de trajet additionnel, et delivery_zone_id effectif.
 
-    Pour order_type == "pickup" : pas de frais, pas de delai de trajet -- le delai
-    estime en aval (_estimate_delivery_at) ne comptera alors que le temps de
-    preparation. delivery_zone_id est ignore meme s'il est envoye par le client,
-    un retrait en boutique n'ayant pas de notion de zone de livraison.
+    Pour order_type == "pickup" ou "dine_in" : pas de frais, pas de delai de
+    trajet. delivery_zone_id est ignore meme s'il est envoye par le client.
     """
-    if order_type == "pickup":
+    if order_type in NON_DELIVERY_ORDER_TYPES:
         return 0.0, 0, None
 
     if delivery_zone_id is None:
@@ -189,12 +259,64 @@ async def _resolve_extras(session: AsyncSession, product_id: int, item_extras: l
     return snapshot, _money(extras_unit_total)
 
 
+async def _resolve_preparation_station(session: AsyncSession, product: Product) -> str:
+    station = getattr(product, "preparation_station", None)
+    if station:
+        return station
+    if product.category_id is None:
+        return "kitchen"
+    category = await session.get(Category, product.category_id)
+    return getattr(category, "preparation_station", None) or "kitchen"
+
+
+async def _find_idempotent_order(
+    session: AsyncSession,
+    user_id: int | None,
+    idempotency_key: str,
+) -> Order | None:
+    window_start = datetime.now(timezone.utc) - timedelta(hours=24)
+    return await session.scalar(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.idempotency_key == idempotency_key,
+            Order.created_at >= window_start,
+        )
+    )
+
+
+def _payment_payload(payment: Payment) -> dict:
+    return {
+        "id": payment.id,
+        "order_id": payment.order_id,
+        "provider": payment.provider,
+        "provider_payment_id": payment.provider_payment_id,
+        "external_reference": getattr(payment, "external_reference", None),
+        "amount": _money(payment.amount),
+        "amount_received": (
+            _money(payment.amount_received)
+            if getattr(payment, "amount_received", None) is not None
+            else None
+        ),
+        "currency": payment.currency,
+        "status": payment.status,
+        "created_by_user_id": getattr(payment, "created_by_user_id", None),
+        "receipt_url": None,
+    }
+
+
 async def create_order(
     session: AsyncSession,
     body,
     user_id: int | None = None,
     tenant_slug: str = "default",
     idempotency_key: str | None = None,
+    created_by_user_id: int | None = None,
+    source: str = "customer",
+    table_number: str | None = None,
+    customer_name: str | None = None,
+    customer_phone: str | None = None,
+    commit: bool = True,
+    skip_idempotency_lookup: bool = False,
 ) -> Order:
     """Cree une commande avec pricing et discount calcules exclusivement cote serveur.
 
@@ -221,16 +343,10 @@ async def create_order(
     if len(idempotency_key) > 128:
         raise AppError("IDEMPOTENCY_KEY_TOO_LONG", "Idempotency-Key must be 128 characters or fewer", 422)
 
-    window_start = datetime.now(timezone.utc) - timedelta(hours=24)
-    existing_order = await session.scalar(
-        select(Order).where(
-            Order.user_id == user_id,
-            Order.idempotency_key == idempotency_key,
-            Order.created_at >= window_start,
-        )
-    )
-    if existing_order is not None:
-        return existing_order
+    if not skip_idempotency_lookup:
+        existing_order = await _find_idempotent_order(session, user_id, idempotency_key)
+        if existing_order is not None:
+            return existing_order
 
     # [SECURITE] Resolution des prix depuis le catalogue -- unit_price client ignore.
     resolved_items: list[tuple] = []
@@ -266,8 +382,18 @@ async def create_order(
             session, item.product_id, getattr(item, "extras", [])
         )
         unit_price += extras_unit_total
+        preparation_station = await _resolve_preparation_station(session, product)
         resolved_items.append(
-            (item, unit_price, product.name, variant_name, extras_snapshot, extras_unit_total, product.category_id)
+            (
+                item,
+                unit_price,
+                product.name,
+                variant_name,
+                extras_snapshot,
+                extras_unit_total,
+                product.category_id,
+                preparation_station,
+            )
         )
 
     subtotal = _money(sum(item.quantity * price for item, price, *_ in resolved_items))
@@ -283,7 +409,16 @@ async def create_order(
                 unit_price=unit_price,
                 line_total=_money(item.quantity * unit_price),
             )
-            for item, unit_price, _product_name, _variant_name, _extras_snapshot, _extras_unit_total, category_id
+            for (
+                item,
+                unit_price,
+                _product_name,
+                _variant_name,
+                _extras_snapshot,
+                _extras_unit_total,
+                category_id,
+                _preparation_station,
+            )
             in resolved_items
         ]
         discount_total = await promotions_service.apply_promo(
@@ -295,6 +430,17 @@ async def create_order(
             items=promo_items,
         )
 
+    loyalty_points_to_use = int(getattr(body, "loyalty_points_to_use", 0) or 0)
+    loyalty_discount = 0.0
+    if loyalty_points_to_use:
+        loyalty_discount, loyalty_points_to_use = await _resolve_loyalty_discount(
+            session,
+            user_id,
+            loyalty_points_to_use,
+            max(0.0, subtotal - discount_total),
+        )
+        discount_total = _money(discount_total + loyalty_discount)
+
     order_type = getattr(body, "order_type", None) or "delivery"
     delivery_fee, delivery_minutes, effective_delivery_zone_id = await _resolve_delivery(
         session, order_type, getattr(body, "delivery_zone_id", None), subtotal
@@ -305,14 +451,17 @@ async def create_order(
     order = Order(
         user_id=user_id,
         customer_email=body.customer_email,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
         order_type=order_type,
-        # [pickup] delivery_address ignore meme si envoye par le client -- pas de
-        # notion d'adresse pour un retrait en boutique (cf. schemas.OrderCreate).
-        delivery_address=body.delivery_address if order_type != "pickup" else None,
+        source=source,
+        created_by_user_id=created_by_user_id,
+        delivery_address=body.delivery_address if order_type == "delivery" else None,
         subtotal=subtotal,
         discount_total=discount_total,
         delivery_fee=delivery_fee,
         delivery_zone_id=effective_delivery_zone_id,
+        table_number=table_number,
         estimated_delivery_at=estimated_delivery_at,
         total=total,
         promo_code=body.promo_code,
@@ -321,7 +470,33 @@ async def create_order(
     )
     session.add(order)
     await session.flush()
-    for item, unit_price, product_name, variant_name, extras_snapshot, extras_unit_total, _category_id in resolved_items:
+    if loyalty_points_to_use:
+        if user_id is None:
+            raise AppError("LOYALTY_USER_REQUIRED", "loyalty_user_id is required", 422, "loyalty_user_id")
+        account = await get_or_create_account(session, user_id, commit=False)
+        account.points -= loyalty_points_to_use
+        session.add(
+            LoyaltyTransaction(
+                account_id=account.id,
+                points_delta=-loyalty_points_to_use,
+                reason=f"manual_order_{order.id}",
+                transaction_type="redeem",
+                source="staff_checkout",
+                changed_by_user_id=created_by_user_id,
+                order_id=order.id,
+                metadata_json={"discount_amount": str(loyalty_discount)},
+            )
+        )
+    for (
+        item,
+        unit_price,
+        product_name,
+        variant_name,
+        extras_snapshot,
+        extras_unit_total,
+        _category_id,
+        preparation_station,
+    ) in resolved_items:
         session.add(
             OrderItem(
                 order_id=order.id,
@@ -334,14 +509,18 @@ async def create_order(
                 quantity=item.quantity,
                 unit_price=unit_price,
                 total=_money(item.quantity * unit_price),
+                preparation_status="pending",
+                preparation_station=preparation_station,
             )
         )
     session.add(OrderStatusHistory(order_id=order.id, status=order.status))
-    await session.commit()
-    await session.refresh(order)
+    await session.flush()
+    if commit:
+        await session.commit()
+        await session.refresh(order)
 
     # Enregistre l'utilisation du code promo apres creation de la commande.
-    if body.promo_code and user_id is not None:
+    if commit and body.promo_code and user_id is not None:
         try:
             await promotions_service.record_promo_usage(session, body.promo_code, user_id, order.id)
             await session.commit()
@@ -354,6 +533,150 @@ async def create_order(
             )
 
     return order
+
+
+async def create_manual_order(
+    session: AsyncSession,
+    body,
+    actor_user_id: int,
+    tenant_slug: str,
+    idempotency_key: str | None,
+    arq_pool: ArqRedis | None = None,
+) -> dict:
+    if not idempotency_key:
+        raise AppError("IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required", 400)
+    if len(idempotency_key) > 128:
+        raise AppError("IDEMPOTENCY_KEY_TOO_LONG", "Idempotency-Key must be 128 characters or fewer", 422)
+
+    existing_order = await _find_idempotent_order(session, None, idempotency_key)
+    if existing_order is not None:
+        payment = await session.scalar(
+            select(Payment)
+            .where(Payment.order_id == existing_order.id)
+            .order_by(Payment.created_at.desc(), Payment.id.desc())
+        )
+        if payment is None:
+            raise AppError("PAYMENT_NOT_FOUND", "Manual order payment not found", 409)
+        return {
+            "order": await _serialize_order_detail(session, existing_order),
+            "payment": _payment_payload(payment),
+            "receipt": await build_receipt(session, existing_order.id),
+        }
+
+    payment_body = body.payment
+    if payment_body.method not in MANUAL_PAYMENT_PROVIDERS:
+        raise AppError("INVALID_PAYMENT_METHOD", "Unsupported manual payment method", 422, "payment.method")
+
+    customer = body.customer
+    try:
+        order = await create_order(
+            session,
+            body,
+            user_id=getattr(body, "loyalty_user_id", None),
+            tenant_slug=tenant_slug,
+            idempotency_key=idempotency_key,
+            created_by_user_id=actor_user_id,
+            source="manual",
+            table_number=body.table_number,
+            customer_name=customer.full_name if customer else None,
+            customer_phone=customer.phone if customer else None,
+            commit=False,
+            skip_idempotency_lookup=True,
+        )
+        payment = Payment(
+            order_id=order.id,
+            provider=payment_body.method,
+            provider_payment_id=payment_body.external_reference,
+            external_reference=payment_body.external_reference,
+            amount=order.total,
+            amount_received=payment_body.amount_received,
+            currency="EUR",
+            status="paid",
+            created_by_user_id=actor_user_id,
+        )
+        session.add(payment)
+        order.payment_status = "paid"
+        await session.flush()
+        if order.status == "pending":
+            await update_status(
+                session,
+                order.id,
+                "confirmed",
+                body.note or f"Manual payment: {payment_body.method}",
+                tenant_slug=tenant_slug,
+                arq_pool=arq_pool,
+                actor_user_id=actor_user_id,
+                is_staff=True,
+            )
+        else:
+            await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    await session.refresh(order)
+    await session.refresh(payment)
+    return {
+        "order": await _serialize_order_detail(session, order),
+        "payment": _payment_payload(payment),
+        "receipt": await build_receipt(session, order.id),
+    }
+
+
+async def update_item_preparation(
+    session: AsyncSession,
+    order_id: int,
+    item_id: int,
+    status: str,
+    note: str | None,
+    actor_user_id: int,
+) -> dict:
+    if status not in PREPARATION_STATUSES:
+        raise AppError("INVALID_PREPARATION_STATUS", "Invalid preparation status", 422, "status")
+    order = await session.get(Order, order_id)
+    if order is None:
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if order.status not in ACTIVE_PREPARATION_ORDER_STATUSES:
+        raise AppError("ORDER_NOT_ACTIVE", "Cannot update preparation for a terminal order", 409)
+
+    item = await session.get(OrderItem, item_id)
+    if item is None or item.order_id != order_id:
+        raise AppError("ORDER_ITEM_NOT_FOUND", "Order item not found", 404)
+
+    item.preparation_status = status
+    if status == "ready":
+        item.prepared_at = datetime.now(timezone.utc)
+        item.prepared_by_user_id = actor_user_id
+    elif status == "pending":
+        item.prepared_at = None
+        item.prepared_by_user_id = None
+
+    if note:
+        session.add(
+            OrderStatusHistory(
+                order_id=order.id,
+                status=f"item_{status}",
+                note=f"Item #{item.id}: {note}",
+            )
+        )
+    await session.commit()
+    await session.refresh(item)
+    return {
+        "id": item.id,
+        "product_id": item.product_id,
+        "variant_id": item.variant_id,
+        "product_name": getattr(item, "product_name_snapshot", None),
+        "variant_name": getattr(item, "variant_name_snapshot", None),
+        "quantity": item.quantity,
+        "unit_price": _money(item.unit_price),
+        "extras_total": _money(getattr(item, "extras_total", 0)),
+        "total": _money(item.total),
+        "extras": _extras_from_snapshot(getattr(item, "extras_snapshot", None)),
+        "preparation_status": item.preparation_status,
+        "preparation_station": item.preparation_station,
+        "prepared_at": item.prepared_at,
+        "prepared_by_user_id": item.prepared_by_user_id,
+    }
 
 
 async def list_orders(
@@ -394,6 +717,63 @@ async def list_orders(
         .limit(pagination.page_size)
     )
     return [_serialize_order_list(order) for order in result.scalars()], total
+
+
+async def export_orders_csv(
+    session: AsyncSession,
+    status: str | None = None,
+    payment_status: str | None = None,
+    order_type: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> str:
+    filters = []
+    if status:
+        filters.append(Order.status.in_([part.strip() for part in status.split(",") if part.strip()]))
+    if payment_status:
+        filters.append(
+            Order.payment_status.in_([part.strip() for part in payment_status.split(",") if part.strip()])
+        )
+    if order_type:
+        filters.append(Order.order_type == order_type)
+    if date_from is not None:
+        filters.append(Order.created_at >= date_from)
+    if date_to is not None:
+        filters.append(Order.created_at <= date_to)
+
+    stmt = select(Order)
+    if filters:
+        stmt = stmt.where(*filters)
+    result = await session.execute(stmt.order_by(Order.created_at.desc(), Order.id.desc()))
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "id",
+            "created_at",
+            "customer_email",
+            "customer_name",
+            "customer_phone",
+            "order_type",
+            "status",
+            "payment_status",
+            "source",
+            "table_number",
+            "subtotal",
+            "discount_total",
+            "delivery_fee",
+            "total",
+        ],
+    )
+    writer.writeheader()
+    for order in result.scalars():
+        row = _serialize_order_list(order)
+        writer.writerow({
+            field: row.get(field)
+            for field in writer.fieldnames
+        })
+    return output.getvalue()
 
 
 async def list_my_orders(
@@ -532,7 +912,9 @@ async def build_receipt(
         "status": order.status,
         "payment_status": getattr(order, "payment_status", "pending") or "pending",
         "customer_email": order.customer_email,
+        "customer_name": getattr(order, "customer_name", None),
         "delivery_address": order.delivery_address,
+        "table_number": getattr(order, "table_number", None),
         "created_at": order.created_at,
         "estimated_delivery_at": getattr(order, "estimated_delivery_at", None),
         "items": receipt_items,
@@ -542,7 +924,11 @@ async def build_receipt(
             "delivery_fee": _money(order.delivery_fee),
             "total": _money(order.total),
         },
-        "meta": {"delivery_zone_id": getattr(order, "delivery_zone_id", None)},
+        "meta": {
+            "delivery_zone_id": getattr(order, "delivery_zone_id", None),
+            "order_type": getattr(order, "order_type", None) or "delivery",
+            "source": getattr(order, "source", None) or "customer",
+        },
     }
 
 

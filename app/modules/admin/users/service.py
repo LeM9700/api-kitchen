@@ -61,6 +61,7 @@ async def list_users(
                 "email": u.email,
                 "full_name": u.full_name,
                 "role": u.role,
+                "permissions": u.permissions,
                 "is_active": u.is_active,
                 "email_verified": u.email_verified_at is not None,
                 "created_at": u.created_at,
@@ -98,6 +99,7 @@ async def create_user(tenant_slug: str, body) -> dict:
             full_name=body.full_name,
             password_hash=get_password_hash(temp_password),
             role=body.role,
+            permissions=body.permissions,
             must_change_password=True,
             # [SECURITE] Admin-created accounts skip email verification.
             email_verified_at=datetime.now(timezone.utc),
@@ -111,6 +113,29 @@ async def create_user(tenant_slug: str, body) -> dict:
         "role": user.role,
         "temporary_password": temp_password,
     }
+
+
+async def update_user_permissions(user_id: int, tenant_slug: str, permissions: list[str]) -> dict:
+    async with get_tenant_session(tenant_slug) as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            raise AppError("NOT_FOUND", "User not found", 404)
+        if user.role not in {"staff", "admin"}:
+            raise AppError("INVALID_ROLE", "Permissions can only be assigned to staff/admin users", 422, "role")
+        user.permissions = permissions
+        await session.commit()
+        await session.refresh(user)
+        return {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "role": user.role,
+            "permissions": user.permissions,
+            "is_active": user.is_active,
+            "email_verified": user.email_verified_at is not None,
+            "created_at": user.created_at,
+            "must_change_password": user.must_change_password,
+        }
 
 
 async def deactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
@@ -145,7 +170,7 @@ async def deactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
 
     if redis is not None:
         from app.core.auth.token_revocation import flag_user_disabled
-        await flag_user_disabled(redis, user_id)
+        await flag_user_disabled(redis, user_id, tenant_slug)
 
 
 async def reactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
@@ -171,7 +196,7 @@ async def reactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
 
     if redis is not None:
         from app.core.auth.token_revocation import clear_user_disabled
-        await clear_user_disabled(redis, user_id)
+        await clear_user_disabled(redis, user_id, tenant_slug)
 
 
 async def admin_reset_password(user_id: int, tenant_slug: str, redis=None) -> dict:
@@ -211,6 +236,6 @@ async def admin_reset_password(user_id: int, tenant_slug: str, redis=None) -> di
 
     if redis is not None:
         from app.core.auth.token_revocation import flag_user_disabled
-        await flag_user_disabled(redis, user_id)
+        await flag_user_disabled(redis, user_id, tenant_slug)
 
     return {"temporary_password": temp_password}

@@ -13,6 +13,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.core.services.cloudinary import init_cloudinary
 from app.core.config import settings
@@ -46,6 +47,19 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONRespons
         status_code=429,
         content={"code": "RATE_LIMIT_EXCEEDED", "detail": str(exc.detail)},
         headers={"Retry-After": "60"},
+    )
+
+
+def _database_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return a stable 503 payload when database connectivity is degraded."""
+    logger.exception("database unavailable", extra={"path": request.url.path})
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": "DATABASE_UNAVAILABLE",
+            "detail": "Database temporarily unavailable. Please retry.",
+            "field": None,
+        },
     )
 
 
@@ -173,12 +187,20 @@ def create_app() -> FastAPI:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
     app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(TimeoutError, _database_unavailable_handler)
+    app.add_exception_handler(SQLAlchemyTimeoutError, _database_unavailable_handler)
 
     # Ordre d'enregistrement = ordre LIFO d'execution dans Starlette.
     # CORSMiddleware en premier (dernier dans la chaine) pour traiter les preflight avant tout.
+    local_cors_regex = (
+        r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$"
+        if not is_production
+        else None
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
+        allow_origin_regex=local_cors_regex,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[

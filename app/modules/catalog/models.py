@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -12,6 +12,7 @@ class Category(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     display_order: Mapped[int] = mapped_column(Integer, default=0)
+    preparation_station: Mapped[str] = mapped_column(String(16), nullable=False, default="kitchen")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -24,7 +25,23 @@ class Product(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     base_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    preparation_station: Mapped[str | None] = mapped_column(String(16), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_featured: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class ProductAvailabilityOverride(Base):
+    __tablename__ = "product_availability_overrides"
+    __table_args__ = (
+        Index("ix_product_availability_overrides_product_created", "product_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    available: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ProductVariant(Base):

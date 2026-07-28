@@ -24,6 +24,7 @@ from app.modules.catalog.models import (
     Category,
     Extra,
     Product,
+    ProductAvailabilityOverride,
     ProductExtra,
     ProductRecommendation,
     ProductVariant,
@@ -39,6 +40,7 @@ from app.modules.catalog.schemas import (
     MediaImagePublicOut,
     ProductAllergenPublicOut,
     ProductAvailabilityOut,
+    ProductAvailabilityOverrideOut,
     ProductDetailOut,
     ProductRecommendationOut,
     ProductSummaryOut,
@@ -121,6 +123,25 @@ async def list_categories(
     return list(result.scalars()), total
 
 
+async def create_category(session: AsyncSession, body) -> Category:
+    category = Category(**body.model_dump())
+    session.add(category)
+    await session.commit()
+    await session.refresh(category)
+    return category
+
+
+async def update_category(session: AsyncSession, category_id: int, body) -> Category:
+    category = await session.get(Category, category_id)
+    if category is None:
+        raise AppError("CATEGORY_NOT_FOUND", f"Category {category_id} not found", 404)
+    for key, value in body.model_dump(exclude_unset=True).items():
+        setattr(category, key, value)
+    await session.commit()
+    await session.refresh(category)
+    return category
+
+
 # ---------------------------------------------------------------------------
 # Products
 # ---------------------------------------------------------------------------
@@ -143,6 +164,32 @@ async def list_products(
         .limit(pagination.page_size)
     )
     return list(result.scalars()), total
+
+
+async def list_featured_products(session: AsyncSession, limit: int = 10) -> list[Product]:
+    stmt = (
+        select(Product)
+        .where(Product.is_active.is_(True), Product.is_featured.is_(True))
+        .order_by(Product.name)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars())
+
+
+async def list_products_by_category(
+    session: AsyncSession,
+    category_id: int,
+    limit: int = 200,
+) -> list[Product]:
+    stmt = (
+        select(Product)
+        .where(Product.is_active.is_(True), Product.category_id == category_id)
+        .order_by(Product.name)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars())
 
 
 async def create_product(
@@ -285,6 +332,31 @@ async def _dietary_map(session: AsyncSession, product_ids: list[int]) -> dict[in
     return tags_by_product
 
 
+async def _latest_availability_overrides(
+    session: AsyncSession,
+    product_ids: list[int],
+) -> dict[int, ProductAvailabilityOverride]:
+    if not product_ids or session is None:
+        return {}
+    result = await session.execute(
+        select(ProductAvailabilityOverride)
+        .where(ProductAvailabilityOverride.product_id.in_(product_ids))
+        .order_by(
+            ProductAvailabilityOverride.product_id,
+            ProductAvailabilityOverride.created_at.desc(),
+            ProductAvailabilityOverride.id.desc(),
+        )
+    )
+    latest: dict[int, ProductAvailabilityOverride] = {}
+    for override in result.scalars():
+        latest.setdefault(override.product_id, override)
+    return latest
+
+
+def _effective_preparation_station(product: Product, category: Category | None = None) -> str:
+    return product.preparation_station or (category.preparation_station if category else None) or "kitchen"
+
+
 async def _availability_map(session: AsyncSession, product_ids: list[int]) -> dict[int, ProductAvailabilityOut]:
     if not product_ids:
         return {}
@@ -296,11 +368,27 @@ async def _availability_map(session: AsyncSession, product_ids: list[int]) -> di
         raw_availability = {}
 
     availability: dict[int, ProductAvailabilityOut] = {}
+    latest_overrides = await _latest_availability_overrides(session, product_ids)
     for product_id in product_ids:
         data = raw_availability.get(
             product_id,
             {"product_id": product_id, "available": True, "limiting_ingredient": None},
         )
+        override = latest_overrides.get(product_id)
+        if override is not None and override.available is False:
+            data = {
+                "product_id": product_id,
+                "available": False,
+                "limiting_ingredient": data.get("limiting_ingredient"),
+                "reason": override.reason,
+                "is_overridden": True,
+            }
+        elif override is not None:
+            data = {
+                **data,
+                "reason": override.reason,
+                "is_overridden": True,
+            }
         availability[product_id] = ProductAvailabilityOut(**data)
     return availability
 
@@ -330,8 +418,10 @@ async def build_product_summaries(
                 description=product.description,
                 base_price=float(product.base_price),
                 image_url=product.image_url,
+                preparation_station=product.preparation_station,
                 is_active=product.is_active,
                 category=CategorySummaryOut.model_validate(category) if category else None,
+                effective_preparation_station=_effective_preparation_station(product, category),
                 primary_image=MediaImagePublicOut.model_validate(primary) if primary else None,
                 allergens=allergens.get(product.id, []),
                 dietary_tags=dietary_tags.get(product.id, []),
@@ -365,6 +455,45 @@ async def get_product_detail(
         gallery=[MediaImagePublicOut.model_validate(image) for image in gallery.get(product_id, [])],
         recommendations=recommended_products,
     )
+
+
+async def set_product_availability_override(
+    session: AsyncSession,
+    product_id: int,
+    body,
+    user_id: int,
+) -> ProductAvailabilityOverrideOut:
+    product = await session.get(Product, product_id)
+    if product is None:
+        raise AppError("PRODUCT_NOT_FOUND", f"Product {product_id} not found", 404)
+    reason = (body.reason or "").strip() or None
+    if body.available is False and reason is None:
+        raise AppError("AVAILABILITY_REASON_REQUIRED", "Reason is required when available=false", 422, "reason")
+    override = ProductAvailabilityOverride(
+        product_id=product_id,
+        available=body.available,
+        reason=reason,
+        changed_by_user_id=user_id,
+    )
+    session.add(override)
+    await session.commit()
+    await session.refresh(override)
+    return ProductAvailabilityOverrideOut.model_validate(override)
+
+
+async def list_product_availability_history(
+    session: AsyncSession,
+    product_id: int,
+) -> list[ProductAvailabilityOverrideOut]:
+    product = await session.get(Product, product_id)
+    if product is None:
+        raise AppError("PRODUCT_NOT_FOUND", f"Product {product_id} not found", 404)
+    result = await session.execute(
+        select(ProductAvailabilityOverride)
+        .where(ProductAvailabilityOverride.product_id == product_id)
+        .order_by(ProductAvailabilityOverride.created_at.desc(), ProductAvailabilityOverride.id.desc())
+    )
+    return [ProductAvailabilityOverrideOut.model_validate(item) for item in result.scalars()]
 
 
 # ---------------------------------------------------------------------------

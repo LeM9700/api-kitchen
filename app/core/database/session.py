@@ -14,6 +14,7 @@ engine = create_async_engine(
     echo=False,
     pool_size=10,
     max_overflow=20,
+    pool_timeout=30,
     pool_recycle=1800,  # evite les connexions fermees cote serveur managé (Railway/Render)
     pool_pre_ping=True,
 )

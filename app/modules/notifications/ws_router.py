@@ -26,7 +26,9 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketE
 from jwt.exceptions import ExpiredSignatureError, PyJWTError as JWTError
 
 from app.core.config import settings
+from app.core.auth.token_revocation import is_jti_revoked, is_user_disabled
 from app.core.auth.security import decode_token
+from app.core.database import get_public_session
 from app.core.http.deps import get_client_ip_ws
 
 logger = logging.getLogger(__name__)
@@ -496,7 +498,17 @@ async def notifications_ws(
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
-    user_id: int = int(payload.get("sub"))
+    try:
+        user_id: int = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        await websocket.send_json({
+            "type": "error",
+            "code": "unauthorized",
+            "reason": "Invalid subject",
+        })
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
     payload_tenant: str = str(payload.get("tenant_slug", ""))
 
     if payload_tenant != str(tenant_slug):
@@ -507,6 +519,46 @@ async def notifications_ws(
         })
         await websocket.close(code=4001, reason="Unauthorized")
         return
+
+    jti = payload.get("jti")
+    if jti and await is_jti_revoked(redis, str(jti)):
+        await websocket.send_json({
+            "type": "error",
+            "code": "unauthorized",
+            "reason": "Token revoked",
+        })
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
+    if await is_user_disabled(redis, user_id, payload_tenant):
+        await websocket.send_json({
+            "type": "error",
+            "code": "unauthorized",
+            "reason": "Account disabled",
+        })
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
+    if payload.get("role") != "super-admin" and payload_tenant:
+        from sqlalchemy import text as _text
+
+        async with get_public_session() as pub_session:
+            row = await pub_session.execute(
+                _text(
+                    "SELECT is_suspended, suspension_message "
+                    "FROM public.tenants WHERE slug = :slug"
+                ),
+                {"slug": payload_tenant},
+            )
+            tenant_row = row.fetchone()
+            if tenant_row and tenant_row.is_suspended:
+                await websocket.send_json({
+                    "type": "error",
+                    "code": "forbidden",
+                    "reason": tenant_row.suspension_message or "Tenant suspended",
+                })
+                await websocket.close(code=4003, reason="Tenant suspended")
+                return
 
     # -------------------------------------------------------------------------
     # [🔒 SÉCURITÉ] Signal 3 — Credential stuffing : enregistrer l'IP pour ce user

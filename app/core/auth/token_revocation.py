@@ -7,6 +7,12 @@ circular dependencies.
 from datetime import datetime, timezone
 
 
+def _user_disabled_key(user_id: int, tenant_slug: str | None = None) -> str:
+    if tenant_slug:
+        return f"user_disabled:{tenant_slug}:{user_id}"
+    return f"user_disabled:{user_id}"
+
+
 async def revoke_jti(redis, jti: str, expires_at: datetime) -> None:
     """Store a revoked JTI in Redis until the token would have expired.
 
@@ -33,7 +39,7 @@ async def is_jti_revoked(redis, jti: str) -> bool:
     return bool(await redis.exists(f"jti:{jti}"))
 
 
-async def flag_user_disabled(redis, user_id: int) -> None:
+async def flag_user_disabled(redis, user_id: int, tenant_slug: str | None = None) -> None:
     """Set a short-lived flag marking a user account as disabled.
 
     The key expires after 86400 seconds (24 h) so stale flags self-clean.
@@ -42,28 +48,31 @@ async def flag_user_disabled(redis, user_id: int) -> None:
     Args:
         redis: ArqRedis instance.
         user_id: Primary-key of the user to disable.
+        tenant_slug: Tenant slug for tenant-scoped user ids.
     """
-    await redis.set(f"user_disabled:{user_id}", "1", ex=86400)
+    await redis.set(_user_disabled_key(user_id, tenant_slug), "1", ex=86400)
 
 
-async def is_user_disabled(redis, user_id: int) -> bool:
+async def is_user_disabled(redis, user_id: int, tenant_slug: str | None = None) -> bool:
     """Return True if the user has an active disabled flag in Redis.
 
     Args:
         redis: ArqRedis instance.
         user_id: Primary-key of the user.
+        tenant_slug: Tenant slug for tenant-scoped user ids.
 
     Returns:
         True when disabled flag exists, False otherwise.
     """
-    return bool(await redis.exists(f"user_disabled:{user_id}"))
+    return bool(await redis.exists(_user_disabled_key(user_id, tenant_slug)))
 
 
-async def clear_user_disabled(redis, user_id: int) -> None:
+async def clear_user_disabled(redis, user_id: int, tenant_slug: str | None = None) -> None:
     """Remove the disabled flag from Redis, re-enabling the user.
 
     Args:
         redis: ArqRedis instance.
         user_id: Primary-key of the user.
+        tenant_slug: Tenant slug for tenant-scoped user ids.
     """
-    await redis.delete(f"user_disabled:{user_id}")
+    await redis.delete(_user_disabled_key(user_id, tenant_slug))

@@ -36,6 +36,7 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         full_name VARCHAR(255),
         phone VARCHAR(20),
         role VARCHAR(32) NOT NULL DEFAULT 'customer',
+        permissions JSON,
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         email_verification_token VARCHAR(64) UNIQUE,
@@ -78,6 +79,10 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         timezone VARCHAR(64) NOT NULL DEFAULT 'Europe/Paris',
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         scheduled_close_at TIMESTAMPTZ,
+        stock_alert_cooldown_hours INTEGER NOT NULL DEFAULT 4,
+        large_stock_adjustment_threshold NUMERIC(12,3) NOT NULL DEFAULT 10,
+        print_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        print_config JSON,
         display_name VARCHAR(120),
         logo_url TEXT,
         primary_color VARCHAR(7),
@@ -118,7 +123,9 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         id SERIAL PRIMARY KEY,
         name VARCHAR(128) NOT NULL,
         display_order INTEGER NOT NULL DEFAULT 0,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE
+        preparation_station VARCHAR(16) NOT NULL DEFAULT 'kitchen',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        CONSTRAINT ck_categories_preparation_station CHECK (preparation_station IN ('kitchen', 'counter', 'none'))
     )""",
     """CREATE TABLE IF NOT EXISTS products (
         id SERIAL PRIMARY KEY,
@@ -127,8 +134,20 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         description TEXT,
         base_price NUMERIC(10,2) NOT NULL,
         image_url VARCHAR(512),
-        is_active BOOLEAN NOT NULL DEFAULT TRUE
+        preparation_station VARCHAR(16),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        is_featured BOOLEAN NOT NULL DEFAULT FALSE,
+        CONSTRAINT ck_products_preparation_station CHECK (preparation_station IS NULL OR preparation_station IN ('kitchen', 'counter', 'none'))
     )""",
+    """CREATE TABLE IF NOT EXISTS product_availability_overrides (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        available BOOLEAN NOT NULL,
+        reason TEXT,
+        changed_by_user_id INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_product_availability_overrides_product_created ON product_availability_overrides (product_id, created_at)",
     """CREATE TABLE IF NOT EXISTS product_variants (
         id SERIAL PRIMARY KEY,
         product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
@@ -174,6 +193,14 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS ix_allergen_definitions_slug ON allergen_definitions (slug)",
+    """CREATE TABLE IF NOT EXISTS ingredients (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(128) NOT NULL,
+        unit VARCHAR(32) NOT NULL,
+        current_qty NUMERIC(12,3) NOT NULL,
+        alert_threshold NUMERIC(12,3) NOT NULL,
+        last_alert_sent_at TIMESTAMPTZ
+    )""",
     """CREATE TABLE IF NOT EXISTS ingredient_allergens (
         ingredient_id INTEGER NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,
         allergen_id INTEGER NOT NULL REFERENCES allergen_definitions(id) ON DELETE CASCADE,
@@ -261,24 +288,49 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         id SERIAL PRIMARY KEY,
         user_id INTEGER,
         customer_email VARCHAR(255),
+        customer_name VARCHAR(255),
+        customer_phone VARCHAR(32),
         order_type VARCHAR(16) NOT NULL DEFAULT 'delivery',
         status VARCHAR(32) NOT NULL DEFAULT 'pending',
+        payment_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+        source VARCHAR(16) NOT NULL DEFAULT 'customer',
+        created_by_user_id INTEGER,
         subtotal NUMERIC(10,2) NOT NULL,
         discount_total NUMERIC(10,2) NOT NULL,
         delivery_fee NUMERIC(10,2) NOT NULL,
         total NUMERIC(10,2) NOT NULL,
         delivery_address TEXT,
+        delivery_zone_id INTEGER,
+        table_number VARCHAR(32),
+        estimated_delivery_at TIMESTAMPTZ,
+        idempotency_key VARCHAR(128),
+        promo_code VARCHAR(64),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CONSTRAINT ck_orders_order_type CHECK (order_type IN ('delivery', 'pickup'))
+        CONSTRAINT ck_orders_order_type CHECK (order_type IN ('delivery', 'pickup', 'dine_in')),
+        CONSTRAINT ck_orders_source CHECK (source IN ('customer', 'manual', 'system')),
+        CONSTRAINT uq_orders_user_id_idempotency_key UNIQUE (user_id, idempotency_key)
     )""",
+    "CREATE INDEX IF NOT EXISTS ix_orders_user_id ON orders (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_orders_status ON orders (status)",
+    "CREATE INDEX IF NOT EXISTS ix_orders_created_at ON orders (created_at)",
     """CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
         product_id INTEGER NOT NULL,
         variant_id INTEGER,
+        product_name_snapshot VARCHAR(255),
+        variant_name_snapshot VARCHAR(128),
+        extras_snapshot JSON,
+        extras_total NUMERIC(10,2) NOT NULL DEFAULT 0,
         quantity INTEGER NOT NULL,
         unit_price NUMERIC(10,2) NOT NULL,
-        total NUMERIC(10,2) NOT NULL
+        total NUMERIC(10,2) NOT NULL,
+        preparation_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        preparation_station VARCHAR(16) NOT NULL DEFAULT 'kitchen',
+        prepared_at TIMESTAMPTZ,
+        prepared_by_user_id INTEGER,
+        CONSTRAINT ck_order_items_preparation_status CHECK (preparation_status IN ('pending', 'preparing', 'ready')),
+        CONSTRAINT ck_order_items_preparation_station CHECK (preparation_station IN ('kitchen', 'counter', 'none'))
     )""",
     """CREATE TABLE IF NOT EXISTS order_status_history (
         id SERIAL PRIMARY KEY,
@@ -293,10 +345,13 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         provider VARCHAR(32) NOT NULL,
         provider_payment_id VARCHAR(255),
         provider_account_id VARCHAR(255),
+        external_reference VARCHAR(255),
         amount NUMERIC(10,2) NOT NULL,
+        amount_received NUMERIC(10,2),
         currency VARCHAR(8) NOT NULL,
         status VARCHAR(32) NOT NULL,
         expires_at TIMESTAMPTZ,
+        created_by_user_id INTEGER,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS ix_payments_provider_payment_id ON payments (provider_payment_id)",
@@ -314,13 +369,6 @@ _TENANT_DDL_STATEMENTS: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_refunds_order_id ON refunds (order_id)",
     "CREATE INDEX IF NOT EXISTS ix_refunds_payment_id ON refunds (payment_id)",
-    """CREATE TABLE IF NOT EXISTS ingredients (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(128) NOT NULL,
-        unit VARCHAR(32) NOT NULL,
-        current_qty NUMERIC(12,3) NOT NULL,
-        alert_threshold NUMERIC(12,3) NOT NULL
-    )""",
     """CREATE TABLE IF NOT EXISTS product_ingredients (
         id SERIAL PRIMARY KEY,
         product_id INTEGER NOT NULL,
@@ -338,8 +386,39 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         ingredient_id INTEGER NOT NULL REFERENCES ingredients(id),
         quantity_delta NUMERIC(12,3) NOT NULL,
         reason VARCHAR(64) NOT NULL,
+        user_id INTEGER,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )""",
+    """CREATE TABLE IF NOT EXISTS ingredient_batches (
+        id SERIAL PRIMARY KEY,
+        ingredient_id INTEGER NOT NULL REFERENCES ingredients(id),
+        quantity NUMERIC(12,3) NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ,
+        opened_at TIMESTAMPTZ,
+        use_within_hours_after_opening INTEGER,
+        status VARCHAR(16) NOT NULL DEFAULT 'sealed',
+        created_by_user_id INTEGER,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT ck_ingredient_batches_status CHECK (status IN ('sealed', 'opened', 'expired', 'consumed', 'discarded'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_ingredient_batches_ingredient ON ingredient_batches (ingredient_id)",
+    "CREATE INDEX IF NOT EXISTS ix_ingredient_batches_expires_at ON ingredient_batches (expires_at)",
+    """CREATE TABLE IF NOT EXISTS stock_adjustment_requests (
+        id SERIAL PRIMARY KEY,
+        ingredient_id INTEGER NOT NULL REFERENCES ingredients(id),
+        quantity_delta NUMERIC(12,3) NOT NULL,
+        reason VARCHAR(64) NOT NULL,
+        note TEXT,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        requested_by_user_id INTEGER NOT NULL,
+        reviewed_by_user_id INTEGER,
+        reviewed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT ck_stock_adjustment_requests_status CHECK (status IN ('pending', 'approved', 'rejected'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_stock_adjustment_requests_status ON stock_adjustment_requests (status)",
+    "CREATE INDEX IF NOT EXISTS ix_stock_adjustment_requests_ingredient ON stock_adjustment_requests (ingredient_id)",
     """CREATE TABLE IF NOT EXISTS product_stock (
         id SERIAL PRIMARY KEY,
         product_id INTEGER NOT NULL,
@@ -768,6 +847,7 @@ async def issue_tokens(
         "sub": str(user.id),
         "email": user.email,
         "role": user.role,
+        "permissions": user.permissions,
         "tenant_id": tenant_id,
         "tenant_slug": tenant_slug,
         "must_change_password": user.must_change_password,
@@ -1081,7 +1161,7 @@ async def reset_password(body, redis=None) -> dict:
     # Force re-login via user_disabled flag Redis
     if redis is not None:
         from app.core.auth.token_revocation import flag_user_disabled
-        await flag_user_disabled(redis, user.id)
+        await flag_user_disabled(redis, user.id, body.tenant_slug)
 
     return {"message": "Password reset successfully"}
 

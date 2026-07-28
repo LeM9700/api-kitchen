@@ -19,7 +19,7 @@ from math import ceil
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_arq_pool, get_client_ip, require_role
+from app.core.http.deps import get_arq_pool, get_client_ip, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse
 from app.core.services.cache import get_cached_json, set_cached_json
@@ -35,6 +35,8 @@ from app.modules.admin.tenants.schemas import (
     TenantClosureToggle,
     TenantConfigAuditResponse,
     TenantConfigResponse,
+    TenantPrintConfigResponse,
+    TenantPrintConfigUpdate,
     TenantScheduledClosureRequest,
     TenantConfigUpdate,
     TenantStatusResponse,
@@ -256,6 +258,35 @@ async def patch_config(
         )
     await arq_pool.delete(_tenant_status_cache_key(current_user["tenant_slug"]))
     return result
+
+
+@router.get("/print-config", response_model=TenantPrintConfigResponse)
+async def get_print_config(
+    current_user: dict = Depends(require_permission("print:read", "staff", "admin")),
+) -> TenantPrintConfigResponse:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await tenant_service.get_print_config(session)
+
+
+@router.patch("/print-config", response_model=TenantPrintConfigResponse)
+@limiter.limit("30/minute")
+async def patch_print_config(
+    request: Request,
+    body: TenantPrintConfigUpdate,
+    current_user: dict = Depends(require_role("admin")),
+) -> TenantPrintConfigResponse:
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
+
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await tenant_service.update_print_config(
+            session,
+            body,
+            user_id=current_user["id"],
+            user_email=current_user.get("email"),
+            ip_address=ip,
+            user_agent=user_agent,
+        )
 
 
 @router.patch("/toggle-closure", response_model=TenantConfigResponse)

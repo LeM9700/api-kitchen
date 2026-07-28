@@ -56,12 +56,31 @@ async def test_flag_user_disabled_sets_key(mock_redis):
 
 
 @pytest.mark.asyncio
+async def test_flag_user_disabled_can_scope_key_by_tenant(mock_redis):
+    await flag_user_disabled(mock_redis, 42, "acme")
+    mock_redis.set.assert_called_once_with("user_disabled:acme:42", "1", ex=86400)
+
+
+@pytest.mark.asyncio
 async def test_is_user_disabled(mock_redis):
     mock_redis.exists.return_value = 1
     assert await is_user_disabled(mock_redis, 42) is True
 
 
 @pytest.mark.asyncio
+async def test_is_user_disabled_checks_tenant_scoped_key(mock_redis):
+    mock_redis.exists.return_value = 1
+    assert await is_user_disabled(mock_redis, 42, "acme") is True
+    mock_redis.exists.assert_called_once_with("user_disabled:acme:42")
+
+
+@pytest.mark.asyncio
 async def test_clear_user_disabled(mock_redis):
     await clear_user_disabled(mock_redis, 42)
     mock_redis.delete.assert_called_once_with("user_disabled:42")
+
+
+@pytest.mark.asyncio
+async def test_clear_user_disabled_can_scope_key_by_tenant(mock_redis):
+    await clear_user_disabled(mock_redis, 42, "acme")
+    mock_redis.delete.assert_called_once_with("user_disabled:acme:42")

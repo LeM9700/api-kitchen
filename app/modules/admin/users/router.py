@@ -9,6 +9,7 @@ from app.modules.admin.users.schemas import (
     AdminUserCreate,
     AdminUserCreateResponse,
     AdminUserOut,
+    AdminUserPermissionsUpdate,
 )
 
 router = APIRouter()
@@ -61,6 +62,19 @@ async def create_user(
         AdminUserCreateResponse avec le mot de passe temporaire.
     """
     return await users_service.create_user(current_user["tenant_slug"], body)
+
+
+@router.patch("/{user_id}/permissions", response_model=AdminUserOut)
+async def update_user_permissions(
+    user_id: int,
+    body: AdminUserPermissionsUpdate,
+    current_user: dict = Depends(require_role("admin")),
+) -> AdminUserOut:
+    return await users_service.update_user_permissions(
+        user_id,
+        current_user["tenant_slug"],
+        body.permissions,
+    )
 
 
 @router.patch("/{user_id}/deactivate", status_code=200)

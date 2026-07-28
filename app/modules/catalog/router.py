@@ -2,12 +2,11 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_arq_pool, get_pagination, require_role
+from app.core.http.deps import get_arq_pool, get_pagination, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
 from app.modules.catalog import service
-from app.modules.catalog.models import Category
 from app.modules.catalog.schemas import (
     CatalogCsvConfirmResponse,
     CatalogCsvDryRunResponse,
@@ -15,10 +14,13 @@ from app.modules.catalog.schemas import (
     CatalogPaginatedResponse,
     CategoryCreate,
     CategoryOut,
+    CategoryUpdate,
     ExtraCreate,
     ExtraOut,
     ExtraUpdate,
     PriceAuditOut,
+    ProductAvailabilityOverrideCreate,
+    ProductAvailabilityOverrideOut,
     ProductCreate,
     ProductDetailOut,
     ProductExtraLink,
@@ -60,13 +62,37 @@ async def categories(
 
 
 @router.post("/categories", response_model=CategoryOut, status_code=201)
-async def create_category(body: CategoryCreate, current_user=Depends(require_role("admin"))):
+async def create_category(
+    body: CategoryCreate,
+    current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
+):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        category = Category(**body.model_dump())
-        session.add(category)
-        await session.commit()
-        await session.refresh(category)
-        return category
+        category = await service.create_category(session, body)
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return category
+
+
+@router.put("/categories/{category_id}", response_model=CategoryOut)
+async def update_category(
+    category_id: int,
+    body: CategoryUpdate,
+    current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        category = await service.update_category(session, category_id, body)
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return category
+
+
+@router.get("/categories/{category_id}/products", response_model=list[ProductSummaryOut])
+@limiter.limit("60/minute")
+async def products_by_category(request: Request, category_id: int):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    async with get_tenant_session(slug) as session:
+        items = await service.list_products_by_category(session, category_id)
+        return await service.build_product_summaries(session, items, include_availability=True)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +176,18 @@ async def product_suggestions(
         return await service.suggest_products(session, q, limit)
 
 
+@router.get("/products/featured", response_model=list[ProductSummaryOut])
+@limiter.limit("60/minute")
+async def featured_products(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50),
+):
+    slug = request.headers.get("X-Tenant-Slug", "default")
+    async with get_tenant_session(slug) as session:
+        items = await service.list_featured_products(session, limit=limit)
+        return await service.build_product_summaries(session, items, include_availability=True)
+
+
 @router.get("/products/{product_id}", response_model=ProductDetailOut)
 @limiter.limit("60/minute")
 async def product_detail(request: Request, product_id: int):
@@ -221,6 +259,40 @@ async def delete_product(
     await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
 
 
+@router.post(
+    "/products/{product_id}/availability-override",
+    response_model=ProductAvailabilityOverrideOut,
+    status_code=201,
+)
+async def set_product_availability_override(
+    product_id: int,
+    body: ProductAvailabilityOverrideCreate,
+    current_user=Depends(require_permission("catalog:availability", "staff", "admin")),
+    redis=Depends(get_arq_pool),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        override = await service.set_product_availability_override(
+            session,
+            product_id,
+            body,
+            user_id=_user_id(current_user) or 0,
+        )
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return override
+
+
+@router.get(
+    "/products/{product_id}/availability-history",
+    response_model=list[ProductAvailabilityOverrideOut],
+)
+async def product_availability_history(
+    product_id: int,
+    current_user=Depends(require_permission("catalog:read", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.list_product_availability_history(session, product_id)
+
+
 # ---------------------------------------------------------------------------
 # Variants
 # ---------------------------------------------------------------------------
@@ -230,7 +302,7 @@ async def delete_product(
 async def create_variant(
     product_id: int,
     body: VariantCreate,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.create_variant(session, product_id, body, user_id=_user_id(current_user))
@@ -241,7 +313,7 @@ async def create_variant(
 async def list_variants(
     request: Request,
     product_id: int,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:read", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.list_variants(session, product_id)
@@ -252,7 +324,7 @@ async def update_variant(
     product_id: int,
     variant_id: int,
     body: VariantUpdate,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.update_variant(
@@ -268,7 +340,7 @@ async def update_variant(
 async def delete_variant(
     product_id: int,
     variant_id: int,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.delete_variant(session, product_id, variant_id)
@@ -287,7 +359,7 @@ async def delete_variant(
 async def link_extra(
     product_id: int,
     extra_id: int,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.link_extra_to_product(session, product_id, extra_id)
@@ -298,7 +370,7 @@ async def link_extra(
 async def unlink_extra(
     product_id: int,
     extra_id: int,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.unlink_extra_from_product(session, product_id, extra_id)
@@ -309,7 +381,7 @@ async def unlink_extra(
 async def list_product_extras(
     request: Request,
     product_id: int,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:read", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.list_product_extras(session, product_id)
@@ -366,7 +438,7 @@ async def delete_extra(
 @router.get("/products/{product_id}/recommendations", response_model=list[ProductRecommendationOut])
 async def list_recommendations(
     product_id: int,
-    current_user=Depends(require_role("staff", "admin")),
+    current_user=Depends(require_permission("catalog:read", "staff", "admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.list_product_recommendations(session, product_id)
@@ -455,7 +527,7 @@ async def export_csv(current_user=Depends(require_role("admin"))):
 
 
 @router.get("/admin/completeness")
-async def catalog_completeness(current_user=Depends(require_role("staff", "admin"))):
+async def catalog_completeness(current_user=Depends(require_permission("catalog:read", "staff", "admin"))):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.get_catalog_completeness(session)
 

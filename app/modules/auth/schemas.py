@@ -123,6 +123,7 @@ class UserOut(BaseModel):
     full_name: str | None
     phone: str | None
     role: str
+    permissions: list[str] | None = None
     is_active: bool
     email_verified: bool
     must_change_password: bool

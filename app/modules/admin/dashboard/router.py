@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Depends, Request
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, Query, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from sqlalchemy import func, select
 
 from app.core.config import settings
+from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
 from app.modules.admin.dashboard.schemas import (
     DailyStatsResponse,
@@ -9,7 +13,9 @@ from app.modules.admin.dashboard.schemas import (
     MonthlyStatsResponse,
     StatsSummaryResponse,
     StockSnapshotResponse,
+    TopProductResponse,
 )
+from app.modules.orders.models import Order, OrderItem
 
 router = APIRouter()
 
@@ -91,3 +97,38 @@ async def stats_summary(
     )
 
     return StatsSummaryResponse(live=live, last_day=last_day)
+
+
+@router.get("/stats/top-products", response_model=list[TopProductResponse])
+async def top_products(
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(10, ge=1, le=50),
+    current_user=Depends(require_role("admin")),
+) -> list[TopProductResponse]:
+    slug = current_user["tenant_slug"]
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    async with get_tenant_session(slug) as session:
+        result = await session.execute(
+            select(
+                OrderItem.product_id,
+                func.coalesce(func.max(OrderItem.product_name_snapshot), "").label("product_name"),
+                func.coalesce(func.sum(OrderItem.quantity), 0).label("quantity"),
+                func.coalesce(func.sum(OrderItem.total + OrderItem.extras_total), 0).label("revenue"),
+            )
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(Order.created_at >= since, Order.status != "cancelled")
+            .group_by(OrderItem.product_id)
+            .order_by(func.coalesce(func.sum(OrderItem.quantity), 0).desc())
+            .limit(limit)
+        )
+
+    return [
+        TopProductResponse(
+            product_id=int(row.product_id),
+            product_name=row.product_name or f"Produit #{row.product_id}",
+            quantity=int(row.quantity or 0),
+            revenue=float(row.revenue or 0),
+        )
+        for row in result
+    ]

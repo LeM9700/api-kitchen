@@ -113,3 +113,64 @@ def test_catalog_csv_validation_accepts_core_rows():
         "extra",
         "product_extra",
     ]
+
+
+def test_product_inherits_preparation_station_from_category():
+    from app.modules.catalog import service
+    from app.modules.catalog.models import Category, Product
+
+    category = Category(id=1, name="Boissons", display_order=0, preparation_station="counter")
+    product = Product(id=2, category_id=1, name="Cola", base_price=2.5, preparation_station=None)
+
+    assert service._effective_preparation_station(product, category) == "counter"
+
+
+def test_product_preparation_station_overrides_category():
+    from app.modules.catalog import service
+    from app.modules.catalog.models import Category, Product
+
+    category = Category(id=1, name="Boissons", display_order=0, preparation_station="counter")
+    product = Product(id=2, category_id=1, name="Pain", base_price=2.5, preparation_station="kitchen")
+
+    assert service._effective_preparation_station(product, category) == "kitchen"
+
+
+def test_availability_override_requires_reason_when_unavailable():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.modules.catalog.schemas import ProductAvailabilityOverrideCreate
+
+    with pytest.raises(ValidationError) as exc_info:
+        ProductAvailabilityOverrideCreate(available=False)
+
+    assert "reason" in str(exc_info.value)
+
+
+async def test_availability_map_applies_latest_unavailable_override(monkeypatch):
+    from app.modules.catalog import service
+    from app.modules.catalog.models import ProductAvailabilityOverride
+    from app.modules.stock import service as stock_service
+
+    async def fake_get_products_availability(session, product_ids):
+        return {1: {"product_id": 1, "available": True, "limiting_ingredient": None}}
+
+    async def fake_latest_overrides(session, product_ids):
+        return {
+            1: ProductAvailabilityOverride(
+                id=10,
+                product_id=1,
+                available=False,
+                reason="Rupture pate",
+                changed_by_user_id=7,
+            )
+        }
+
+    monkeypatch.setattr(stock_service, "get_products_availability", fake_get_products_availability)
+    monkeypatch.setattr(service, "_latest_availability_overrides", fake_latest_overrides)
+
+    availability = await service._availability_map(object(), [1])
+
+    assert availability[1].available is False
+    assert availability[1].reason == "Rupture pate"
+    assert availability[1].is_overridden is True

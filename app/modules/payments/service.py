@@ -1,6 +1,8 @@
+import csv
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from typing import Any
 
 import anyio
@@ -13,6 +15,8 @@ logger = logging.getLogger(__name__)
 from app.core.config import settings
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
+from app.modules.loyalty.account.models import LoyaltyPointReservation
+from app.modules.loyalty.account.service import confirm_checkout_reservation
 from app.modules.orders import service as orders_service
 from app.modules.orders.models import Order
 from app.modules.payments.models import Payment, Refund
@@ -29,6 +33,7 @@ from app.modules.payments.schemas import (
 stripe.api_key = settings.stripe_secret_key
 
 PAYMENT_STATUS_PAID = {"paid", "partially_refunded"}
+MANUAL_PAYMENT_PROVIDERS = {"cash", "external_terminal", "cash_register"}
 WEBHOOK_TOLERANCE_SECONDS = 300
 EXPIRED_PAYMENT_HOURS = 24
 
@@ -65,11 +70,145 @@ def _payment_out(payment: Payment, receipt_url: str | None = None) -> PaymentOut
         order_id=payment.order_id,
         provider=payment.provider,
         provider_payment_id=payment.provider_payment_id,
+        external_reference=getattr(payment, "external_reference", None),
         amount=float(payment.amount),
+        amount_received=(
+            float(payment.amount_received)
+            if getattr(payment, "amount_received", None) is not None
+            else None
+        ),
         currency=payment.currency,
         status=payment.status,
+        created_by_user_id=getattr(payment, "created_by_user_id", None),
         receipt_url=receipt_url,
     )
+
+
+def _stripe_object_to_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    to_dict = getattr(value, "to_dict_recursive", None)
+    if callable(to_dict):
+        return to_dict()
+    return dict(value) if hasattr(value, "items") else {"value": str(value)}
+
+
+def _require_customer_payment_owner(payment: Payment, order: Order, user_id: int | None, is_staff: bool) -> None:
+    if user_id is None or is_staff:
+        return
+    if order.user_id is None or int(order.user_id) != int(user_id):
+        raise AppError("PAYMENT_NOT_FOUND", "Payment not found", 404)
+    created_by_user_id = getattr(payment, "created_by_user_id", None)
+    if created_by_user_id is not None and int(created_by_user_id) != int(user_id):
+        raise AppError("PAYMENT_NOT_FOUND", "Payment not found", 404)
+
+
+def _validate_payment_intent_payload(
+    intent: dict,
+    payment: Payment,
+    order: Order,
+    tenant_slug: str,
+) -> None:
+    if str(intent.get("status") or "") != "succeeded":
+        raise AppError("PAYMENT_NOT_SUCCEEDED", "Stripe payment has not succeeded.", 409)
+
+    expected_amount = _money_to_cents(payment.amount)
+    if _money_to_cents(order.total) != expected_amount:
+        raise AppError("PAYMENT_ORDER_AMOUNT_MISMATCH", "Local payment amount does not match the order.", 409)
+
+    intent_amount = intent.get("amount")
+    if intent_amount is None or int(intent_amount) != expected_amount:
+        raise AppError("PAYMENT_AMOUNT_MISMATCH", "Stripe payment amount does not match the order.", 409)
+
+    amount_received = intent.get("amount_received")
+    if amount_received is not None and int(amount_received) < expected_amount:
+        raise AppError("PAYMENT_AMOUNT_NOT_RECEIVED", "Stripe payment amount has not been fully received.", 409)
+
+    expected_currency = str(payment.currency or "EUR").lower()
+    if str(intent.get("currency") or "").lower() != expected_currency:
+        raise AppError("PAYMENT_CURRENCY_MISMATCH", "Stripe payment currency does not match the order.", 409)
+
+    metadata = dict(intent.get("metadata") or {})
+    expected_metadata = {
+        "tenant_slug": tenant_slug,
+        "order_id": str(order.id),
+        "payment_id": str(payment.id),
+    }
+    for key, expected_value in expected_metadata.items():
+        if str(metadata.get(key) or "") != expected_value:
+            raise AppError("PAYMENT_METADATA_MISMATCH", "Stripe payment metadata does not match the order.", 409)
+
+
+async def _verify_payment_intent_with_stripe(
+    session: AsyncSession,
+    tenant_slug: str,
+    payment: Payment,
+    order: Order,
+) -> None:
+    provider_payment_id = payment.provider_payment_id or ""
+    if provider_payment_id.startswith("local_"):
+        if _local_fallback_allowed():
+            return
+        raise AppError("PAYMENT_CONFIRMATION_REQUIRED", "Stripe payment confirmation is required.", 409)
+
+    stripe_context = await get_stripe_context(session, tenant_slug)
+    try:
+        intent = await anyio.to_thread.run_sync(
+            lambda: stripe.PaymentIntent.retrieve(
+                provider_payment_id,
+                **stripe_context.options,
+            )
+        )
+    except Exception as exc:
+        raise AppError("STRIPE_PAYMENT_VERIFY_FAILED", _safe_stripe_message(exc), 502) from exc
+
+    _validate_payment_intent_payload(
+        _stripe_object_to_dict(intent),
+        payment,
+        order,
+        tenant_slug,
+    )
+
+
+def _is_active_pending_payment(payment: Payment, order: Order, now: datetime) -> bool:
+    if payment.provider_payment_id is None:
+        return False
+    if payment.status != "pending" or payment.provider != "stripe":
+        return False
+    if _money_to_cents(payment.amount) != _money_to_cents(order.total):
+        return False
+
+    expires_at = payment.expires_at
+    if expires_at is None:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > now
+
+
+async def _client_secret_for_existing_intent(payment: Payment, stripe_context: StripeContext) -> str:
+    provider_payment_id = payment.provider_payment_id
+    if provider_payment_id is None:
+        raise AppError("PAYMENT_INTENT_NOT_READY", "Payment intent is not ready.", 409)
+    if provider_payment_id.startswith("local_"):
+        return provider_payment_id
+
+    try:
+        intent = await anyio.to_thread.run_sync(
+            lambda: stripe.PaymentIntent.retrieve(
+                provider_payment_id,
+                **stripe_context.options,
+            )
+        )
+    except Exception as exc:
+        if not _local_fallback_allowed():
+            raise AppError("STRIPE_PAYMENT_REUSE_FAILED", _safe_stripe_message(exc), 502) from exc
+        return provider_payment_id
+
+    client_secret = intent.get("client_secret") if isinstance(intent, dict) else getattr(intent, "client_secret", None)
+    if not client_secret:
+        raise AppError("PAYMENT_INTENT_REUSE_FAILED", "Existing PaymentIntent has no client secret.", 502)
+    return str(client_secret)
 
 
 async def get_stripe_context(session: AsyncSession, tenant_slug: str) -> StripeContext:
@@ -105,19 +244,47 @@ async def create_intent(
     tenant_slug: str = "default",
     user_id: int | None = None,
 ) -> dict:
-    order = await session.get(Order, order_id)
+    order_result = await session.execute(
+        select(Order).where(Order.id == order_id).with_for_update()
+    )
+    order = order_result.scalar_one_or_none()
     if order is None:
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
-    if user_id is not None and order.user_id is not None and int(order.user_id) != int(user_id):
+    if user_id is not None and (order.user_id is None or int(order.user_id) != int(user_id)):
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if getattr(order, "payment_status", None) == "paid":
+        raise AppError("ORDER_ALREADY_PAID", "Order is already paid.", 409)
 
     stripe_context = await get_stripe_context(session, tenant_slug)
+    now = datetime.now(timezone.utc)
+    filters = [
+        Payment.order_id == order.id,
+        Payment.provider == "stripe",
+        Payment.status == "pending",
+    ]
+    if user_id is None:
+        filters.append(Payment.created_by_user_id.is_(None))
+    else:
+        filters.append(Payment.created_by_user_id == user_id)
+
+    existing_payment = await session.scalar(
+        select(Payment)
+        .where(*filters)
+        .order_by(Payment.created_at.desc(), Payment.id.desc())
+    )
+    if existing_payment is not None and _is_active_pending_payment(existing_payment, order, now):
+        client_secret = await _client_secret_for_existing_intent(existing_payment, stripe_context)
+        return {"payment": existing_payment, "client_secret": client_secret}
+
     payment = Payment(
         order_id=order.id,
+        provider="stripe",
         amount=order.total,
         currency="EUR",
         provider_account_id=stripe_context.account_id,
-        expires_at=datetime.now(timezone.utc) + timedelta(hours=EXPIRED_PAYMENT_HOURS),
+        created_by_user_id=user_id,
+        expires_at=now + timedelta(hours=EXPIRED_PAYMENT_HOURS),
+        status="pending",
     )
     session.add(payment)
     await session.flush()
@@ -149,8 +316,247 @@ async def create_intent(
     return {"payment": payment, "client_secret": client_secret}
 
 
-async def confirm(session: AsyncSession, provider_payment_id: str, tenant_slug: str = "default") -> Payment:
-    result = await finalize_payment(session, tenant_slug, provider_payment_id, source="confirm")
+async def create_terminal_connection_token(
+    session: AsyncSession,
+    tenant_slug: str,
+) -> dict:
+    stripe_context = await get_stripe_context(session, tenant_slug)
+    try:
+        token = await anyio.to_thread.run_sync(
+            lambda: stripe.terminal.ConnectionToken.create(**stripe_context.options)
+        )
+        return {"secret": token["secret"]}
+    except Exception as exc:
+        if not _local_fallback_allowed():
+            raise AppError("STRIPE_TERMINAL_FAILED", _safe_stripe_message(exc), 502) from exc
+        return {"secret": "local_terminal_connection_token"}
+
+
+async def create_terminal_intent(
+    session: AsyncSession,
+    order_id: int,
+    tenant_slug: str,
+    user_id: int | None,
+    reader_id: str | None = None,
+    process_on_reader: bool = False,
+) -> dict:
+    order = await session.get(Order, order_id)
+    if order is None:
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if process_on_reader and not reader_id:
+        raise AppError("TERMINAL_READER_REQUIRED", "reader_id is required to process on reader", 422, "reader_id")
+
+    stripe_context = await get_stripe_context(session, tenant_slug)
+    payment = Payment(
+        order_id=order.id,
+        provider="stripe_terminal",
+        amount=order.total,
+        currency="EUR",
+        provider_account_id=stripe_context.account_id,
+        created_by_user_id=user_id,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=EXPIRED_PAYMENT_HOURS),
+        status="pending",
+    )
+    session.add(payment)
+    await session.flush()
+
+    reader_action: dict | None = None
+    try:
+        intent = await anyio.to_thread.run_sync(
+            lambda: stripe.PaymentIntent.create(
+                amount=_money_to_cents(order.total),
+                currency="eur",
+                payment_method_types=["card_present"],
+                capture_method="automatic",
+                metadata={
+                    "tenant_slug": tenant_slug,
+                    "order_id": str(order.id),
+                    "payment_id": str(payment.id),
+                    "source": "stripe_terminal",
+                },
+                **stripe_context.options,
+            )
+        )
+        payment.provider_payment_id = intent["id"]
+        client_secret = intent.get("client_secret")
+        if process_on_reader and reader_id:
+            reader = await anyio.to_thread.run_sync(
+                lambda: stripe.terminal.Reader.process_payment_intent(
+                    reader_id,
+                    payment_intent=intent["id"],
+                    **stripe_context.options,
+                )
+            )
+            reader_action = _stripe_object_to_dict(reader)
+    except Exception as exc:
+        if not _local_fallback_allowed():
+            await session.rollback()
+            raise AppError("STRIPE_TERMINAL_FAILED", _safe_stripe_message(exc), 502) from exc
+        payment.provider_payment_id = f"local_terminal_{payment.id}"
+        client_secret = payment.provider_payment_id
+        if process_on_reader:
+            reader_action = {
+                "id": reader_id or "local_reader",
+                "action": {"type": "process_payment_intent", "status": "local"},
+            }
+
+    await session.commit()
+    await session.refresh(payment)
+    return {
+        "client_secret": client_secret,
+        "payment": _payment_out(payment),
+        "reader_action": reader_action,
+    }
+
+
+async def list_terminal_readers(
+    session: AsyncSession,
+    tenant_slug: str,
+    location_id: str | None = None,
+) -> dict:
+    stripe_context = await get_stripe_context(session, tenant_slug)
+    try:
+        readers = await anyio.to_thread.run_sync(
+            lambda: stripe.terminal.Reader.list(
+                **({"location": location_id} if location_id else {}),
+                **stripe_context.options,
+            )
+        )
+        data = readers.get("data", []) if isinstance(readers, dict) else getattr(readers, "data", [])
+        return {"readers": [_stripe_object_to_dict(reader) for reader in data]}
+    except Exception as exc:
+        if not _local_fallback_allowed():
+            raise AppError("STRIPE_TERMINAL_FAILED", _safe_stripe_message(exc), 502) from exc
+        return {"readers": []}
+
+
+async def process_terminal_reader(
+    session: AsyncSession,
+    tenant_slug: str,
+    reader_id: str,
+    provider_payment_id: str,
+) -> dict:
+    payment = await session.scalar(
+        select(Payment).where(Payment.provider_payment_id == provider_payment_id)
+    )
+    if payment is None:
+        raise AppError("PAYMENT_NOT_FOUND", "Payment not found", 404)
+
+    stripe_context = await get_stripe_context(session, tenant_slug)
+    try:
+        reader = await anyio.to_thread.run_sync(
+            lambda: stripe.terminal.Reader.process_payment_intent(
+                reader_id,
+                payment_intent=provider_payment_id,
+                **stripe_context.options,
+            )
+        )
+        return {"reader": _stripe_object_to_dict(reader)}
+    except Exception as exc:
+        if not _local_fallback_allowed():
+            raise AppError("STRIPE_TERMINAL_FAILED", _safe_stripe_message(exc), 502) from exc
+        return {
+            "reader": {
+                "id": reader_id,
+                "action": {"type": "process_payment_intent", "status": "local"},
+            }
+        }
+
+
+async def cancel_terminal_reader_action(
+    session: AsyncSession,
+    tenant_slug: str,
+    reader_id: str,
+) -> dict:
+    stripe_context = await get_stripe_context(session, tenant_slug)
+    try:
+        reader = await anyio.to_thread.run_sync(
+            lambda: stripe.terminal.Reader.cancel_action(reader_id, **stripe_context.options)
+        )
+        return {"reader": _stripe_object_to_dict(reader)}
+    except Exception as exc:
+        if not _local_fallback_allowed():
+            raise AppError("STRIPE_TERMINAL_FAILED", _safe_stripe_message(exc), 502) from exc
+        return {
+            "reader": {
+                "id": reader_id,
+                "action": {"type": "cancel_action", "status": "local"},
+            }
+        }
+
+
+async def confirm(
+    session: AsyncSession,
+    provider_payment_id: str,
+    tenant_slug: str = "default",
+    user_id: int | None = None,
+    is_staff: bool = False,
+) -> Payment:
+    result = await finalize_payment(
+        session,
+        tenant_slug,
+        provider_payment_id,
+        source="confirm",
+        user_id=user_id,
+        is_staff=is_staff,
+        verify_with_stripe=True,
+    )
+    return await session.get(Payment, result.payment.id)
+
+
+async def confirm_local_test_payment(
+    session: AsyncSession,
+    order_id: int,
+    tenant_slug: str,
+    user_id: int | None,
+    is_staff: bool = False,
+) -> Payment:
+    if not _local_fallback_allowed():
+        raise AppError(
+            "LOCAL_TEST_PAYMENT_DISABLED",
+            "Local test payments are only available outside production.",
+            403,
+        )
+
+    order = await session.get(Order, order_id)
+    if order is None:
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if user_id is not None and not is_staff and (
+        order.user_id is None or int(order.user_id) != int(user_id)
+    ):
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if getattr(order, "payment_status", None) == "paid":
+        existing = await session.scalar(
+            select(Payment)
+            .where(Payment.order_id == order.id, Payment.status == "paid")
+            .order_by(Payment.created_at.desc(), Payment.id.desc())
+        )
+        if existing is not None:
+            return existing
+        raise AppError("ORDER_ALREADY_PAID", "Order is already paid.", 409)
+
+    payment = Payment(
+        order_id=order.id,
+        provider="local_web_test",
+        amount=order.total,
+        currency="EUR",
+        status="pending",
+        created_by_user_id=user_id,
+    )
+    session.add(payment)
+    await session.flush()
+    payment.provider_payment_id = f"local_web_{payment.id}"
+    await session.commit()
+
+    result = await finalize_payment(
+        session,
+        tenant_slug,
+        payment.provider_payment_id,
+        source="local_web_test",
+        user_id=user_id,
+        is_staff=is_staff,
+        verify_with_stripe=False,
+    )
     return await session.get(Payment, result.payment.id)
 
 
@@ -159,12 +565,22 @@ async def finalize_payment(
     tenant_slug: str,
     provider_payment_id: str,
     source: str = "webhook",
+    user_id: int | None = None,
+    is_staff: bool = False,
+    verify_with_stripe: bool = False,
+    stripe_payment_intent: dict | None = None,
 ) -> PaymentFinalizeOut:
     payment = await session.scalar(
         select(Payment).where(Payment.provider_payment_id == provider_payment_id)
     )
     if payment is None:
         raise AppError("PAYMENT_NOT_FOUND", "Payment not found", 404)
+
+    order = await session.get(Order, payment.order_id)
+    if order is None:
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+
+    _require_customer_payment_owner(payment, order, user_id, is_staff)
 
     if payment.status in {"paid", "refunded", "partially_refunded"}:
         return PaymentFinalizeOut(
@@ -173,9 +589,15 @@ async def finalize_payment(
             user_message="Payment already finalized.",
         )
 
-    order = await session.get(Order, payment.order_id)
-    if order is None:
-        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if stripe_payment_intent is not None:
+        _validate_payment_intent_payload(
+            _stripe_object_to_dict(stripe_payment_intent),
+            payment,
+            order,
+            tenant_slug,
+        )
+    elif verify_with_stripe:
+        await _verify_payment_intent_with_stripe(session, tenant_slug, payment, order)
 
     payment.status = "paid"
     order.payment_status = "paid"
@@ -322,7 +744,13 @@ async def handle_webhook(session: AsyncSession, tenant_slug: str, payload: dict)
     if event_type in {"payment_intent.succeeded", ""}:
         pi_id = data_object.get("id")
         if pi_id:
-            await finalize_payment(session, tenant_slug, pi_id, source="webhook")
+            await finalize_payment(
+                session,
+                tenant_slug,
+                pi_id,
+                source="webhook",
+                stripe_payment_intent=data_object,
+            )
 
     elif event_type in {"payment_intent.payment_failed", "payment_intent.canceled"}:
         pi_id = data_object.get("id")
@@ -468,9 +896,6 @@ async def _auto_confirm_loyalty_reservation(
     if user_id is None:
         return  # Commande invité — pas de fidélité
 
-    from app.modules.loyalty.account.models import LoyaltyPointReservation
-    from app.modules.loyalty.account.service import confirm_checkout_reservation
-
     now = datetime.now(timezone.utc)
     reservation = await session.scalar(
         select(LoyaltyPointReservation).where(
@@ -571,6 +996,10 @@ async def create_refund(
     allow_unfulfilled_order: bool = False,
 ) -> RefundOut:
     """Emet un remboursement Stripe total ou partiel pour une commande."""
+    normalized_reason = (reason or "").strip()
+    if not normalized_reason:
+        raise AppError("REFUND_REASON_REQUIRED", "Refund reason is required.", 422, "reason")
+
     order = await session.get(Order, order_id)
     if order is None:
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
@@ -605,7 +1034,27 @@ async def create_refund(
             "amount",
         )
 
+    if payment.provider in MANUAL_PAYMENT_PROVIDERS:
+        now = datetime.now(timezone.utc)
+        refund = Refund(
+            order_id=order_id,
+            payment_id=payment.id,
+            stripe_refund_id=f"manual_{payment.id}_{int(now.timestamp())}",
+            amount=refund_amount,
+            reason=normalized_reason,
+            status="succeeded",
+            created_by_user_id=user_id,
+            created_at=now,
+        )
+        session.add(refund)
+        new_total = already_refunded + refund_amount
+        payment.status = "refunded" if new_total >= payment_amount_cents else "partially_refunded"
+        await session.commit()
+        await session.refresh(refund)
+        return RefundOut.model_validate(refund)
+
     try:
+        now = datetime.now(timezone.utc)
         stripe_refund = await anyio.to_thread.run_sync(
             lambda: stripe.Refund.create(
                 payment_intent=payment.provider_payment_id,
@@ -619,20 +1068,23 @@ async def create_refund(
             payment_id=payment.id,
             stripe_refund_id=stripe_refund["id"],
             amount=refund_amount,
-            reason=reason,
+            reason=normalized_reason,
             status="succeeded",
             created_by_user_id=user_id,
+            created_at=now,
         )
     except stripe.error.StripeError as exc:
+        now = datetime.now(timezone.utc)
         refund = Refund(
             order_id=order_id,
             payment_id=payment.id,
-            stripe_refund_id=f"failed_{payment.id}_{int(datetime.now(timezone.utc).timestamp())}",
+            stripe_refund_id=f"failed_{payment.id}_{int(now.timestamp())}",
             amount=refund_amount,
-            reason=reason,
+            reason=normalized_reason,
             status="failed",
             failure_reason=_safe_stripe_message(exc),
             created_by_user_id=user_id,
+            created_at=now,
         )
         session.add(refund)
         await session.commit()
@@ -758,14 +1210,98 @@ async def list_payments(
                 provider=payment.provider,
                 provider_payment_id=payment.provider_payment_id,
                 provider_account_id=payment.provider_account_id,
+                external_reference=getattr(payment, "external_reference", None),
                 amount=float(payment.amount),
+                amount_received=(
+                    float(payment.amount_received)
+                    if getattr(payment, "amount_received", None) is not None
+                    else None
+                ),
                 currency=payment.currency,
                 status=payment.status,
+                created_by_user_id=getattr(payment, "created_by_user_id", None),
                 created_at=payment.created_at,
                 refunded_amount_cents=await _refunded_amount_cents(session, payment.id),
             )
         )
     return items, int(total)
+
+
+async def export_payments_csv(
+    session: AsyncSession,
+    status: str | None = None,
+    provider: str | None = None,
+    payment_status: str | None = None,
+    order_type: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> str:
+    filters = []
+    if status:
+        filters.append(Payment.status.in_([part.strip() for part in status.split(",") if part.strip()]))
+    if provider:
+        filters.append(Payment.provider == provider)
+    if payment_status:
+        filters.append(
+            Order.payment_status.in_([part.strip() for part in payment_status.split(",") if part.strip()])
+        )
+    if order_type:
+        filters.append(Order.order_type == order_type)
+    if date_from:
+        filters.append(Payment.created_at >= date_from)
+    if date_to:
+        filters.append(Payment.created_at <= date_to)
+
+    stmt = select(Payment, Order).join(Order, Payment.order_id == Order.id)
+    if filters:
+        stmt = stmt.where(*filters)
+    result = await session.execute(stmt.order_by(Payment.created_at.desc(), Payment.id.desc()))
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "id",
+            "order_id",
+            "created_at",
+            "provider",
+            "provider_payment_id",
+            "external_reference",
+            "amount",
+            "amount_received",
+            "currency",
+            "status",
+            "created_by_user_id",
+            "order_type",
+            "order_status",
+            "order_payment_status",
+        ],
+    )
+    writer.writeheader()
+    for payment, order in result.all():
+        writer.writerow(
+            {
+                "id": payment.id,
+                "order_id": payment.order_id,
+                "created_at": payment.created_at,
+                "provider": payment.provider,
+                "provider_payment_id": payment.provider_payment_id,
+                "external_reference": getattr(payment, "external_reference", None),
+                "amount": float(payment.amount),
+                "amount_received": (
+                    float(payment.amount_received)
+                    if getattr(payment, "amount_received", None) is not None
+                    else None
+                ),
+                "currency": payment.currency,
+                "status": payment.status,
+                "created_by_user_id": getattr(payment, "created_by_user_id", None),
+                "order_type": getattr(order, "order_type", None),
+                "order_status": order.status,
+                "order_payment_status": getattr(order, "payment_status", None),
+            }
+        )
+    return output.getvalue()
 
 
 async def get_payment_summary(

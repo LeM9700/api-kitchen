@@ -272,4 +272,4 @@ async def delete_account(
     # — same pattern as auth/service.py::reset_password. flag_user_disabled() uses .set(), which
     # is fully compatible with ArqRedis.
     if redis is not None:
-        await flag_user_disabled(redis, user_id)
+        await flag_user_disabled(redis, user_id, tenant_slug)

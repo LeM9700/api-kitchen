@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from arq import ArqRedis
 from sqlalchemy import func, or_, select
@@ -6,9 +6,71 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
+from app.modules.admin.tenants.models import TenantConfig
 from app.modules.catalog.models import ExtraIngredient, Product
 from app.modules.orders.models import OrderItem
-from app.modules.stock.models import Ingredient, ProductIngredient, StockMovement, VariantIngredient
+from app.modules.stock.models import (
+    Ingredient,
+    IngredientBatch,
+    ProductIngredient,
+    StockAdjustmentRequest,
+    StockMovement,
+    VariantIngredient,
+)
+
+
+def _effective_batch_expires_at(batch: IngredientBatch) -> datetime | None:
+    opened_at = getattr(batch, "opened_at", None)
+    use_within = getattr(batch, "use_within_hours_after_opening", None)
+    after_open = opened_at + timedelta(hours=int(use_within)) if opened_at and use_within else None
+    expires_at = getattr(batch, "expires_at", None)
+    if after_open and expires_at:
+        return min(after_open, expires_at)
+    return after_open or expires_at
+
+
+def _batch_payload(batch: IngredientBatch) -> dict:
+    return {
+        "id": batch.id,
+        "ingredient_id": batch.ingredient_id,
+        "quantity": float(batch.quantity),
+        "received_at": batch.received_at,
+        "expires_at": batch.expires_at,
+        "opened_at": batch.opened_at,
+        "use_within_hours_after_opening": batch.use_within_hours_after_opening,
+        "effective_expires_at": _effective_batch_expires_at(batch),
+        "status": batch.status,
+        "created_by_user_id": batch.created_by_user_id,
+        "created_at": batch.created_at,
+    }
+
+
+def _adjustment_request_payload(request: StockAdjustmentRequest, is_large_adjustment: bool) -> dict:
+    return {
+        "id": request.id,
+        "ingredient_id": request.ingredient_id,
+        "quantity_delta": float(request.quantity_delta),
+        "reason": request.reason,
+        "note": request.note,
+        "status": request.status,
+        "requested_by_user_id": request.requested_by_user_id,
+        "reviewed_by_user_id": request.reviewed_by_user_id,
+        "reviewed_at": request.reviewed_at,
+        "is_large_adjustment": is_large_adjustment,
+        "created_at": request.created_at,
+    }
+
+
+async def _large_adjustment_threshold(session: AsyncSession) -> float:
+    config = await session.scalar(select(TenantConfig))
+    if config is None:
+        return 10.0
+    return float(getattr(config, "large_stock_adjustment_threshold", 10) or 0)
+
+
+async def _is_large_adjustment(session: AsyncSession, quantity_delta: float) -> bool:
+    threshold = await _large_adjustment_threshold(session)
+    return threshold > 0 and abs(float(quantity_delta)) >= threshold
 
 
 async def list_ingredients(
@@ -130,6 +192,268 @@ async def supply(
     await session.commit()
     await session.refresh(ingredient)
     return ingredient
+
+
+async def list_batches(
+    session: AsyncSession,
+    ingredient_id: int,
+) -> list[dict]:
+    ingredient = await session.get(Ingredient, ingredient_id)
+    if ingredient is None:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+    result = await session.execute(
+        select(IngredientBatch)
+        .where(IngredientBatch.ingredient_id == ingredient_id)
+        .order_by(IngredientBatch.received_at.desc(), IngredientBatch.id.desc())
+    )
+    return [_batch_payload(batch) for batch in result.scalars()]
+
+
+async def create_batch(
+    session: AsyncSession,
+    ingredient_id: int,
+    body,
+    user_id: int | None,
+) -> dict:
+    ingredient = await session.get(Ingredient, ingredient_id)
+    if ingredient is None:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+
+    received_at = body.received_at or datetime.now(timezone.utc)
+    batch = IngredientBatch(
+        ingredient_id=ingredient_id,
+        quantity=body.quantity,
+        received_at=received_at,
+        expires_at=body.expires_at,
+        use_within_hours_after_opening=body.use_within_hours_after_opening,
+        status="sealed",
+        created_by_user_id=user_id,
+    )
+    session.add(batch)
+    await session.flush()
+    ingredient.current_qty = float(ingredient.current_qty) + float(body.quantity)
+    session.add(
+        StockMovement(
+            ingredient_id=ingredient_id,
+            quantity_delta=float(body.quantity),
+            reason=f"batch:{batch.id}",
+            user_id=user_id,
+        )
+    )
+    await session.commit()
+    await session.refresh(batch)
+    return _batch_payload(batch)
+
+
+async def patch_batch(session: AsyncSession, batch_id: int, body) -> dict:
+    batch = await session.get(IngredientBatch, batch_id)
+    if batch is None:
+        raise AppError("BATCH_NOT_FOUND", "Ingredient batch not found", 404)
+    updates = body.model_dump(exclude_unset=True)
+    if "quantity" in updates and float(updates["quantity"]) != float(batch.quantity):
+        ingredient = await session.get(Ingredient, batch.ingredient_id)
+        if ingredient is None:
+            raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+        delta = float(updates["quantity"]) - float(batch.quantity)
+        new_qty = float(ingredient.current_qty) + delta
+        if new_qty < 0:
+            raise AppError("INSUFFICIENT_STOCK", "Ingredient stock cannot become negative", 409)
+        ingredient.current_qty = new_qty
+        session.add(
+            StockMovement(
+                ingredient_id=batch.ingredient_id,
+                quantity_delta=delta,
+                reason=f"batch_adjust:{batch.id}",
+                user_id=None,
+            )
+        )
+    for key, value in updates.items():
+        setattr(batch, key, value)
+    await session.commit()
+    await session.refresh(batch)
+    return _batch_payload(batch)
+
+
+async def open_batch(
+    session: AsyncSession,
+    batch_id: int,
+    user_id: int | None,
+) -> dict:
+    batch = await session.get(IngredientBatch, batch_id)
+    if batch is None:
+        raise AppError("BATCH_NOT_FOUND", "Ingredient batch not found", 404)
+    if batch.status in {"discarded", "consumed"}:
+        raise AppError("BATCH_CLOSED", "Batch cannot be opened from its current status", 409)
+    if batch.opened_at is None:
+        batch.opened_at = datetime.now(timezone.utc)
+    batch.status = "opened"
+    await session.commit()
+    await session.refresh(batch)
+    return _batch_payload(batch)
+
+
+async def discard_batch(
+    session: AsyncSession,
+    batch_id: int,
+    reason: str,
+    user_id: int | None,
+) -> dict:
+    batch = await session.get(IngredientBatch, batch_id)
+    if batch is None:
+        raise AppError("BATCH_NOT_FOUND", "Ingredient batch not found", 404)
+    if batch.status == "discarded":
+        return _batch_payload(batch)
+    ingredient = await session.get(Ingredient, batch.ingredient_id)
+    if ingredient is None:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+    new_qty = float(ingredient.current_qty) - float(batch.quantity)
+    if new_qty < 0:
+        raise AppError("INSUFFICIENT_STOCK", "Ingredient stock cannot become negative", 409)
+    ingredient.current_qty = new_qty
+    batch.status = "discarded"
+    session.add(
+        StockMovement(
+            ingredient_id=batch.ingredient_id,
+            quantity_delta=-float(batch.quantity),
+            reason=reason,
+            user_id=user_id,
+        )
+    )
+    await session.commit()
+    await session.refresh(batch)
+    return _batch_payload(batch)
+
+
+async def create_adjustment_request(
+    session: AsyncSession,
+    body,
+    user_id: int,
+) -> dict:
+    ingredient = await session.get(Ingredient, body.ingredient_id)
+    if ingredient is None:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+
+    request = StockAdjustmentRequest(
+        ingredient_id=body.ingredient_id,
+        quantity_delta=float(body.quantity_delta),
+        reason=body.reason,
+        note=body.note,
+        status="pending",
+        requested_by_user_id=user_id,
+    )
+    session.add(request)
+    await session.commit()
+    await session.refresh(request)
+    return _adjustment_request_payload(
+        request,
+        await _is_large_adjustment(session, float(request.quantity_delta)),
+    )
+
+
+async def list_adjustment_requests(
+    session: AsyncSession,
+    pagination: PaginationParams,
+    status: str | None = None,
+    ingredient_id: int | None = None,
+) -> tuple[list[dict], int]:
+    filters = []
+    if status:
+        filters.append(StockAdjustmentRequest.status == status)
+    if ingredient_id is not None:
+        filters.append(StockAdjustmentRequest.ingredient_id == ingredient_id)
+
+    stmt = select(StockAdjustmentRequest)
+    count_stmt = select(func.count()).select_from(StockAdjustmentRequest)
+    if filters:
+        stmt = stmt.where(*filters)
+        count_stmt = count_stmt.where(*filters)
+
+    total = await session.scalar(count_stmt) or 0
+    result = await session.execute(
+        stmt
+        .order_by(StockAdjustmentRequest.created_at.desc(), StockAdjustmentRequest.id.desc())
+        .offset((pagination.page - 1) * pagination.page_size)
+        .limit(pagination.page_size)
+    )
+    requests = list(result.scalars())
+    payloads = [
+        _adjustment_request_payload(
+            request,
+            await _is_large_adjustment(session, float(request.quantity_delta)),
+        )
+        for request in requests
+    ]
+    return payloads, total
+
+
+async def approve_adjustment_request(
+    session: AsyncSession,
+    request_id: int,
+    user_id: int,
+    note: str | None = None,
+) -> dict:
+    request = await session.get(StockAdjustmentRequest, request_id)
+    if request is None:
+        raise AppError("ADJUSTMENT_REQUEST_NOT_FOUND", "Stock adjustment request not found", 404)
+    if request.status != "pending":
+        raise AppError("ADJUSTMENT_REQUEST_CLOSED", "Stock adjustment request has already been reviewed", 409)
+
+    ingredient = await session.get(Ingredient, request.ingredient_id)
+    if ingredient is None:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+
+    delta = float(request.quantity_delta)
+    new_qty = float(ingredient.current_qty) + delta
+    if new_qty < 0:
+        raise AppError("INSUFFICIENT_STOCK", "Ingredient stock cannot become negative", 409)
+
+    ingredient.current_qty = new_qty
+    request.status = "approved"
+    request.reviewed_by_user_id = user_id
+    request.reviewed_at = datetime.now(timezone.utc)
+    if note:
+        request.note = f"{request.note}\nAdmin: {note}" if request.note else f"Admin: {note}"
+    session.add(
+        StockMovement(
+            ingredient_id=request.ingredient_id,
+            quantity_delta=delta,
+            reason=f"request:{request.reason}",
+            user_id=user_id,
+        )
+    )
+
+    await session.commit()
+    await session.refresh(request)
+    return _adjustment_request_payload(
+        request,
+        await _is_large_adjustment(session, float(request.quantity_delta)),
+    )
+
+
+async def reject_adjustment_request(
+    session: AsyncSession,
+    request_id: int,
+    user_id: int,
+    note: str | None = None,
+) -> dict:
+    request = await session.get(StockAdjustmentRequest, request_id)
+    if request is None:
+        raise AppError("ADJUSTMENT_REQUEST_NOT_FOUND", "Stock adjustment request not found", 404)
+    if request.status != "pending":
+        raise AppError("ADJUSTMENT_REQUEST_CLOSED", "Stock adjustment request has already been reviewed", 409)
+
+    request.status = "rejected"
+    request.reviewed_by_user_id = user_id
+    request.reviewed_at = datetime.now(timezone.utc)
+    if note:
+        request.note = f"{request.note}\nAdmin: {note}" if request.note else f"Admin: {note}"
+
+    await session.commit()
+    await session.refresh(request)
+    return _adjustment_request_payload(
+        request,
+        await _is_large_adjustment(session, float(request.quantity_delta)),
+    )
 
 
 async def _item_recipe_deltas(

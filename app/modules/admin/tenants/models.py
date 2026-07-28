@@ -8,6 +8,8 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
+    JSON,
+    Numeric,
     String,
     Text,
     Time,
@@ -77,6 +79,16 @@ class TenantConfig(Base):
         default=4,
         server_default="4",
     )
+    large_stock_adjustment_threshold: Mapped[float] = mapped_column(
+        Numeric(12, 3),
+        nullable=False,
+        default=10,
+        server_default="10",
+    )
+
+    # Shared printer config consumed by admin/staff apps.
+    print_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    print_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # ── Branding public (Plan 02) ─────────────────────────────────────────────
     # Ces champs sont exposés sans auth via GET /tenant/branding.

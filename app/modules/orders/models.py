@@ -18,18 +18,23 @@ class Order(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # 'delivery' | 'pickup' -- contrainte CHECK en base (cf. migration 0034 et
+    customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    customer_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 'delivery' | 'pickup' | 'dine_in' -- contrainte CHECK en base (cf. migrations et
     # _TENANT_DDL_STATEMENTS). String plutot qu'un type ENUM Postgres natif, pour
     # rester coherent avec status/payment_status/role deja en place dans ce module.
     order_type: Mapped[str] = mapped_column(String(16), nullable=False, default="delivery")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     payment_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="customer")
+    created_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     subtotal: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     discount_total: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     delivery_fee: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     total: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     delivery_zone_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    table_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     estimated_delivery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Stocké pour permettre la désactivation du code promo à la confirmation de paiement.
@@ -52,6 +57,10 @@ class OrderItem(Base):
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     total: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    preparation_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    preparation_station: Mapped[str] = mapped_column(String(16), nullable=False, default="kitchen")
+    prepared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    prepared_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class OrderStatusHistory(Base):

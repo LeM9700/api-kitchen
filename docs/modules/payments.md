@@ -6,7 +6,8 @@ Module de paiement Stripe pour :
 - la finalisation canonique par webhook Stripe ;
 - la confirmation client idempotente ;
 - la confirmation automatique de commande via le service commandes ;
-- le remboursement manuel ou automatique ;
+- le remboursement admin manuel ou automatique ;
+- les paiements caisse simples (`cash`, `external_terminal`, `cash_register`) crees par `/orders/manual` ;
 - les remboursements partiels cumulés ;
 - la lecture client, staff et admin des paiements ;
 - les agrégats financiers staff/admin ;
@@ -21,11 +22,17 @@ Le code applicatif principal se trouve dans `app/modules/payments`.
 | POST | `/api/v1/payments/intent` | Bearer JWT | tous | Crée un PaymentIntent Stripe pour une commande |
 | POST | `/api/v1/payments/confirm` | Bearer JWT | tous | Synchronise le client avec la finalisation idempotente |
 | POST | `/api/v1/payments/webhook` | Public Stripe | Stripe uniquement | Reçoit les événements Stripe signés |
-| POST | `/api/v1/payments/{order_id}/refund` | Bearer JWT | staff, admin | Crée un remboursement total ou partiel |
+| POST | `/api/v1/payments/{order_id}/refund` | Bearer JWT | admin | Cree un remboursement total ou partiel |
 | GET | `/api/v1/payments/{order_id}` | Bearer JWT | client propriétaire, staff, admin | Détail paiement, remboursements et reçu |
 | GET | `/api/v1/payments/{order_id}/refunds` | Bearer JWT | client propriétaire, staff, admin | Historique des remboursements |
 | GET | `/api/v1/payments` | Bearer JWT | staff, admin | Liste paginée des paiements du tenant |
 | GET | `/api/v1/payments/summary` | Bearer JWT | staff, admin | Totaux encaissés, remboursés et nets |
+| GET | `/api/v1/payments/export/csv` | Bearer JWT | admin | Export CSV des paiements |
+| POST | `/api/v1/payments/terminal/connection-token` | Bearer JWT | staff, admin | Token Stripe Terminal |
+| POST | `/api/v1/payments/terminal/intent` | Bearer JWT | staff, admin | PaymentIntent `card_present` |
+| GET | `/api/v1/payments/terminal/readers` | Bearer JWT | staff, admin | Liste lecteurs Terminal |
+| POST | `/api/v1/payments/terminal/readers/{reader_id}/process` | Bearer JWT | staff, admin | Lance l'action lecteur |
+| POST | `/api/v1/payments/terminal/readers/{reader_id}/cancel` | Bearer JWT | staff, admin | Annule l'action lecteur |
 
 Limites de débit :
 
@@ -86,6 +93,7 @@ Requête :
 ```
 
 `amount` est exprimé en centimes. Si `amount` est omis ou vaut `null`, l’API rembourse le montant encore remboursable.
+`reason` est obligatoire.
 
 Réponse : `RefundOut`.
 
@@ -136,16 +144,27 @@ Champs :
 - `provider` ;
 - `provider_payment_id` ;
 - `provider_account_id` ;
+- `external_reference` ;
 - `amount` en euros ;
+- `amount_received` en euros, utile pour l'espece ;
 - `currency` ;
 - `status` ;
 - `expires_at` ;
+- `created_by_user_id` ;
 - `created_at`.
+
+Providers supportes :
+
+- `stripe`
+- `stripe_terminal`
+- `cash`
+- `external_terminal`
+- `cash_register`
 
 Statuts :
 
 - `pending` : PaymentIntent créé, paiement non finalisé.
-- `paid` : paiement Stripe réussi.
+- `paid` : paiement Stripe reussi ou paiement caisse valide.
 - `partially_refunded` : au moins un remboursement a réussi, mais il reste un solde remboursable.
 - `refunded` : montant payé intégralement remboursé.
 - `failed` : paiement échoué.
@@ -208,6 +227,18 @@ Le webhook et `/confirm` appellent le même chemin de finalisation :
 
 L’appel à `orders.service.update_status` est essentiel : il déclenche la déduction du stock via le workflow de commande existant.
 
+### Paiements caisse
+
+Les paiements `cash`, `external_terminal` et `cash_register` sont crees depuis `POST /api/v1/orders/manual`.
+
+Regles :
+
+- aucun PaymentIntent Stripe n'est cree ;
+- le paiement est insere avec `status = paid` ;
+- `created_by_user_id` audite le staff/admin qui encaisse ;
+- `external_reference` est obligatoire pour `external_terminal` et `cash_register` ;
+- la commande est marquee `payment_status = paid`, puis confirmee via `orders.service.update_status`.
+
 ### Compensation en cas de stock insuffisant
 
 Si la confirmation de commande échoue après paiement réussi :
@@ -251,10 +282,12 @@ Métadonnées Stripe attendues :
 
 Remboursements manuels :
 
-- réservés aux rôles staff/admin ;
+- reserves au role admin ;
+- `reason` obligatoire ;
 - la commande doit être `cancelled` ou `delivered` ;
 - le montant est exprimé en centimes ;
 - `amount = null` signifie : rembourser le solde restant.
+- pour `cash`, `external_terminal` et `cash_register`, aucun appel Stripe n'est fait ; une entree `refunds` locale est creee et le paiement passe `refunded` ou `partially_refunded`.
 
 Remboursements automatiques :
 
@@ -303,8 +336,11 @@ Interfaces staff/admin :
 - `GET /payments` pour la réconciliation ;
 - `GET /payments/{order_id}` ;
 - `GET /payments/{order_id}/refunds` ;
-- `POST /payments/{order_id}/refund` ;
 - `GET /payments/summary` pour les totaux encaissés, remboursés et nets.
+
+Interface admin :
+
+- `POST /payments/{order_id}/refund`.
 
 ## Cleanup opérationnel
 
@@ -322,6 +358,7 @@ La fonction est prête pour une intégration future worker/cron. Le scheduling n
 Migration :
 
 - `alembic/versions/0027_payments_improvements.py`
+- `alembic/versions/0035_admin_staff_api_contracts.py`
 
 Elle ajoute :
 
@@ -329,6 +366,12 @@ Elle ajoute :
 - `payments.expires_at` ;
 - `refunds.failure_reason` ;
 - `refunds.created_by_user_id`.
+
+La migration `0035` ajoute :
+
+- `payments.external_reference`
+- `payments.amount_received`
+- `payments.created_by_user_id`
 
 Elle crée aussi `refunds` si la table manque pour des tenants provisionnés avant l’ajout de cette table au bootstrap manuel.
 
@@ -339,18 +382,19 @@ Le bootstrap des nouveaux tenants dans `app/modules/auth/service.py` crée aussi
 Commandes ciblées :
 
 ```powershell
-pytest tests\test_payments.py tests\test_payments_interfaces.py -q
-python -m py_compile app\modules\payments\service.py app\modules\payments\router.py app\modules\payments\schemas.py app\modules\payments\models.py alembic\versions\0027_payments_improvements.py
+$env:PYTHONPATH='C:\Users\melbo\workspace\pizza\api-pizza'
+uv run pytest tests/test_payments_interfaces.py -q
+uv run python -m compileall app/modules/payments alembic/versions/0035_admin_staff_api_contracts.py
 ```
 
 Dernier résultat ciblé :
 
-- 14 tests payments/interface passés.
+- `tests/test_payments_interfaces.py` passe dans le paquet P0 cible.
 - Les modules payments compilent.
 
 Note sur la suite complète :
 
-- `pytest tests -q` nécessite une base PostgreSQL locale accessible. Lors du dernier run, les tests dépendants de la DB ont échoué avec `ConnectionRefusedError [WinError 1225]`, tandis que les tests ciblés payments passaient.
+- `pytest tests -q` necessite une base PostgreSQL locale migree. Les modeles ORM P0 attendent la migration `0035`.
 
 ## Limites connues
 

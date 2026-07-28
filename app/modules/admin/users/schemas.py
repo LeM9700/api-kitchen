@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class AdminUserCreate(BaseModel):
@@ -18,6 +18,7 @@ class AdminUserCreate(BaseModel):
     email: EmailStr
     full_name: str | None = None
     role: Literal["staff", "admin"]
+    permissions: list[str] | None = None
 
 
 class AdminUserOut(BaseModel):
@@ -40,6 +41,7 @@ class AdminUserOut(BaseModel):
     email: str
     full_name: str | None
     role: str
+    permissions: list[str] | None = None
     is_active: bool
     email_verified: bool
     created_at: datetime
@@ -60,3 +62,7 @@ class AdminUserCreateResponse(BaseModel):
     email: str
     role: str
     temporary_password: str
+
+
+class AdminUserPermissionsUpdate(BaseModel):
+    permissions: list[str] = Field(default_factory=list)

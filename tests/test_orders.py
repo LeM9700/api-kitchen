@@ -160,3 +160,61 @@ async def test_create_order_prices_allowed_extras_server_side():
     added_item = session.add.call_args_list[1].args[0]
     assert float(added_item.extras_total) == 10
     assert added_item.extras_snapshot[0]["name"] == "Mozzarella"
+
+
+async def test_update_item_preparation_marks_ready_with_audit_fields():
+    from app.modules.orders import service
+    from app.modules.orders.models import Order, OrderItem
+
+    order = Order(id=1, status="preparing", payment_status="paid", total=10)
+    item = OrderItem(
+        id=5,
+        order_id=1,
+        product_id=2,
+        quantity=1,
+        unit_price=10,
+        total=10,
+        preparation_status="pending",
+        preparation_station="kitchen",
+    )
+    session = AsyncMock()
+    session.get = AsyncMock(side_effect=[order, item])
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+
+    payload = await service.update_item_preparation(
+        session,
+        order_id=1,
+        item_id=5,
+        status="ready",
+        note="Pret cuisine",
+        actor_user_id=9,
+    )
+
+    assert item.preparation_status == "ready"
+    assert item.prepared_by_user_id == 9
+    assert item.prepared_at is not None
+    assert payload["preparation_station"] == "kitchen"
+    session.commit.assert_awaited_once()
+
+
+async def test_update_item_preparation_rejects_terminal_order():
+    from app.core.http.errors import AppError
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=Order(id=1, status="delivered", total=10))
+
+    with pytest.raises(AppError) as exc_info:
+        await service.update_item_preparation(
+            session,
+            order_id=1,
+            item_id=5,
+            status="ready",
+            note=None,
+            actor_user_id=9,
+        )
+
+    assert exc_info.value.code == "ORDER_NOT_ACTIVE"

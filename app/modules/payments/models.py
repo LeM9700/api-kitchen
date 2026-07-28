@@ -14,10 +14,13 @@ class Payment(Base):
     provider: Mapped[str] = mapped_column(String(32), default="stripe")
     provider_payment_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     provider_account_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    amount_received: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="EUR")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

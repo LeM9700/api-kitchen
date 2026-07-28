@@ -66,14 +66,16 @@ async def get_current_user(
 
     # [SECURITE] User-disabled flag — rejects tokens belonging to disabled accounts.
     user_id_str = payload.get("sub")
-    if redis and user_id_str and await is_user_disabled(redis, int(user_id_str)):
+    tenant_slug = payload.get("tenant_slug")
+    if redis and user_id_str and await is_user_disabled(redis, int(user_id_str), tenant_slug):
         raise AppError("UNAUTHORIZED", "Account is disabled", 401)
 
     user = {
         "id": payload.get("sub"),
         "tenant_id": payload.get("tenant_id"),
-        "tenant_slug": payload.get("tenant_slug"),
+        "tenant_slug": tenant_slug,
         "role": payload.get("role"),
+        "permissions": payload.get("permissions"),
         "email": payload.get("email"),
         "must_change_password": payload.get("must_change_password", False),
         "jti": jti,
@@ -157,6 +159,35 @@ def require_role(*roles: str) -> Callable:
     async def dependency(current_user: dict = Depends(get_current_user)) -> dict:
         if current_user.get("role") not in roles:
             raise AppError("FORBIDDEN", "Insufficient permissions", 403)
+        return current_user
+
+    return dependency
+
+
+def has_permission(current_user: dict, permission: str) -> bool:
+    """Return True when a user has a fine-grained staff permission.
+
+    Admin and super-admin keep full access. Staff accounts with permissions=None
+    are treated as legacy unrestricted staff during rollout; once an admin stores
+    an explicit list, it becomes authoritative.
+    """
+    role = current_user.get("role")
+    if role in {"admin", "super-admin"}:
+        return True
+    permissions = current_user.get("permissions")
+    if permissions is None:
+        return role == "staff"
+    return "*" in permissions or permission in permissions
+
+
+def require_permission(permission: str, *roles: str) -> Callable:
+    allowed_roles = roles or ("staff", "admin")
+
+    async def dependency(current_user: dict = Depends(get_current_user)) -> dict:
+        if current_user.get("role") not in allowed_roles and current_user.get("role") not in {"admin", "super-admin"}:
+            raise AppError("FORBIDDEN", "Insufficient permissions", 403)
+        if not has_permission(current_user, permission):
+            raise AppError("FORBIDDEN", f"Missing permission: {permission}", 403)
         return current_user
 
     return dependency

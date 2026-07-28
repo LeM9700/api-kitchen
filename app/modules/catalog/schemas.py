@@ -2,9 +2,10 @@ from datetime import datetime
 from math import ceil
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 T = TypeVar("T")
+PreparationStation = Literal["kitchen", "counter", "none"]
 
 
 class CatalogPaginatedResponse(BaseModel, Generic[T]):
@@ -31,6 +32,14 @@ class CatalogPaginatedResponse(BaseModel, Generic[T]):
 class CategoryCreate(BaseModel):
     name: str
     display_order: int = 0
+    preparation_station: PreparationStation = "kitchen"
+
+
+class CategoryUpdate(BaseModel):
+    name: str | None = None
+    display_order: int | None = None
+    preparation_station: PreparationStation | None = None
+    is_active: bool | None = None
 
 
 class CategoryOut(CategoryCreate):
@@ -46,6 +55,7 @@ class CategorySummaryOut(BaseModel):
     id: int
     name: str
     display_order: int
+    preparation_station: PreparationStation = "kitchen"
 
 
 class ProductCreate(BaseModel):
@@ -54,6 +64,7 @@ class ProductCreate(BaseModel):
     description: str | None = None
     base_price: float
     image_url: str | None = None
+    preparation_station: PreparationStation | None = None
     is_active: bool = True
 
 
@@ -63,6 +74,7 @@ class ProductUpdate(BaseModel):
     description: str | None = None
     base_price: float | None = None
     image_url: str | None = None
+    preparation_station: PreparationStation | None = None
     is_active: bool | None = None
     price_change_reason: str | None = None
 
@@ -76,6 +88,7 @@ class ProductOut(BaseModel):
     description: str | None = None
     base_price: float
     image_url: str | None = None
+    preparation_station: PreparationStation | None = None
     is_active: bool
 
 
@@ -170,10 +183,13 @@ class ProductAvailabilityOut(BaseModel):
     product_id: int
     available: bool
     limiting_ingredient: str | None = None
+    reason: str | None = None
+    is_overridden: bool = False
 
 
 class ProductSummaryOut(ProductOut):
     category: CategorySummaryOut | None = None
+    effective_preparation_station: PreparationStation = "kitchen"
     primary_image: MediaImagePublicOut | None = None
     allergens: list[ProductAllergenPublicOut] = Field(default_factory=list)
     dietary_tags: list[DietaryTagPublicOut] = Field(default_factory=list)
@@ -280,3 +296,25 @@ class CatalogSelectionValidationResponse(BaseModel):
     extra_ids: list[int] = Field(default_factory=list)
     regulatory_complete: bool
     allergens: list[ProductAllergenPublicOut] = Field(default_factory=list)
+
+
+class ProductAvailabilityOverrideCreate(BaseModel):
+    available: bool
+    reason: str | None = Field(None, max_length=512)
+
+    @model_validator(mode="after")
+    def _validate_reason(self) -> "ProductAvailabilityOverrideCreate":
+        if self.available is False and not (self.reason or "").strip():
+            raise ValueError("reason est requis quand available=false")
+        return self
+
+
+class ProductAvailabilityOverrideOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    product_id: int
+    available: bool
+    reason: str | None = None
+    changed_by_user_id: int
+    created_at: datetime

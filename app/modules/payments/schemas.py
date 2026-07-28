@@ -7,6 +7,10 @@ class PaymentIntentRequest(BaseModel):
     order_id: int
 
 
+class LocalTestPaymentRequest(BaseModel):
+    order_id: int
+
+
 class PaymentConfirmRequest(BaseModel):
     provider_payment_id: str
 
@@ -18,10 +22,37 @@ class PaymentOut(BaseModel):
     order_id: int
     provider: str
     provider_payment_id: str | None
+    external_reference: str | None = None
     amount: float
+    amount_received: float | None = None
     currency: str
     status: str
+    created_by_user_id: int | None = None
     receipt_url: str | None = None
+
+
+class TerminalConnectionTokenOut(BaseModel):
+    secret: str
+
+
+class TerminalPaymentIntentRequest(BaseModel):
+    order_id: int
+    reader_id: str | None = None
+    process_on_reader: bool = False
+
+
+class TerminalPaymentIntentOut(BaseModel):
+    client_secret: str | None = None
+    payment: PaymentOut
+    reader_action: dict | None = None
+
+
+class TerminalReaderListOut(BaseModel):
+    readers: list[dict]
+
+
+class TerminalReaderActionOut(BaseModel):
+    reader: dict
 
 
 class RefundCreate(BaseModel):
@@ -33,7 +64,7 @@ class RefundCreate(BaseModel):
     """
 
     amount: int | None = Field(None, gt=0)
-    reason: str | None = Field(None, max_length=256)
+    reason: str = Field(..., min_length=1, max_length=256)
 
 
 class RefundOut(BaseModel):
@@ -89,9 +120,12 @@ class PaymentListItemOut(BaseModel):
     provider: str
     provider_payment_id: str | None
     provider_account_id: str | None = None
+    external_reference: str | None = None
     amount: float
+    amount_received: float | None = None
     currency: str
     status: str
+    created_by_user_id: int | None = None
     created_at: datetime | None = None
     refunded_amount_cents: int = 0
 

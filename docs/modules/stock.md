@@ -13,6 +13,15 @@ Gestion des ingrédients, approvisionnements, recettes produit, mouvements de st
 | PATCH | `/api/v1/stock/ingredients/{id}` | Bearer JWT | admin |
 | POST | `/api/v1/stock/ingredients/{id}/adjust` | Bearer JWT | admin |
 | POST | `/api/v1/stock/supply` | Bearer JWT | staff, admin |
+| GET | `/api/v1/stock/ingredients/{id}/batches` | Bearer JWT | staff, admin |
+| POST | `/api/v1/stock/ingredients/{id}/batches` | Bearer JWT | staff, admin |
+| PATCH | `/api/v1/stock/batches/{batch_id}` | Bearer JWT | admin |
+| POST | `/api/v1/stock/batches/{batch_id}/open` | Bearer JWT | staff, admin |
+| POST | `/api/v1/stock/batches/{batch_id}/discard` | Bearer JWT | staff, admin |
+| POST | `/api/v1/stock/adjustment-requests` | Bearer JWT | staff, admin |
+| GET | `/api/v1/stock/adjustment-requests` | Bearer JWT | admin |
+| POST | `/api/v1/stock/adjustment-requests/{id}/approve` | Bearer JWT | admin |
+| POST | `/api/v1/stock/adjustment-requests/{id}/reject` | Bearer JWT | admin |
 | POST | `/api/v1/stock/recipes` | Bearer JWT | admin |
 | POST | `/api/v1/stock/recipes/variant` | Bearer JWT | admin |
 | POST | `/api/v1/stock/recipes/extra` | Bearer JWT | admin |
