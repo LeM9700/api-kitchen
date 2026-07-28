@@ -10,6 +10,7 @@ from app.core.http.errors import AppError
 from app.modules.hr.models import (
     EmployeeProfile,
     EstablishmentHrConfig,
+    HrAlert,
     Shift,
     TimeClockCorrection,
     TimeClockEntry,
@@ -361,3 +362,30 @@ async def detect_shift_overrun(
         "shift_id": shift.id,
         "minutes_over": int(delta_minutes - tolerance),
     }
+
+
+async def list_alerts(
+    session: AsyncSession,
+    resolved: bool | None = None,
+) -> list[HrAlert]:
+    stmt = select(HrAlert)
+    if resolved is not None:
+        stmt = stmt.where(
+            HrAlert.resolved_at.is_not(None)
+            if resolved
+            else HrAlert.resolved_at.is_(None)
+        )
+
+    result = await session.execute(stmt.order_by(HrAlert.triggered_at.desc()))
+    return list(result.scalars())
+
+
+async def resolve_alert(session: AsyncSession, alert_id: int) -> HrAlert:
+    alert = await session.get(HrAlert, alert_id)
+    if alert is None:
+        raise AppError("NOT_FOUND", "Alert not found", 404)
+
+    alert.resolved_at = _datetime.now(_timezone.utc)
+    await session.commit()
+    await session.refresh(alert)
+    return alert

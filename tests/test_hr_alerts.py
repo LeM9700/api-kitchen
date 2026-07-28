@@ -135,3 +135,42 @@ async def test_detect_shift_overrun_past_end_plus_tolerance(
     result = await detect_shift_overrun(db_session, entry)
     assert result is not None
     assert result["minutes_over"] >= 15
+
+
+async def test_list_alerts_requires_admin(client):
+    resp = await client.get(
+        "/api/v1/hr/alerts",
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+    assert resp.status_code in (401, 403)
+
+
+async def test_resolve_alert_requires_admin(client):
+    resp = await client.patch("/api/v1/hr/alerts/1/resolve")
+    assert resp.status_code in (401, 403)
+
+
+async def test_list_and_resolve_alert(db_session, employee_with_shift):
+    from app.modules.hr.models import HrAlert
+    from app.modules.hr.service import list_alerts, resolve_alert
+
+    employee, _shift = employee_with_shift
+    db_session.add(
+        HrAlert(
+            employee_id=employee.id,
+            establishment_id=employee.establishment_id,
+            type="late",
+            payload={"minutes_late": 12},
+        )
+    )
+    await db_session.commit()
+
+    alerts = await list_alerts(db_session, resolved=False)
+    assert len(alerts) == 1
+    assert alerts[0].employee_id == employee.id
+
+    resolved = await resolve_alert(db_session, alerts[0].id)
+    assert resolved.resolved_at is not None
+
+    still_open = await list_alerts(db_session, resolved=False)
+    assert len(still_open) == 0

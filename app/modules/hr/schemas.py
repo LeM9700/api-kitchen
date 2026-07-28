@@ -103,3 +103,16 @@ class TimeClockCorrectionRequest(BaseModel):
     new_clock_in_at: datetime | None = None
     new_clock_out_at: datetime | None = None
     reason: str = Field(min_length=1)
+
+
+class HrAlertOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    employee_id: int | None
+    establishment_id: int | None
+    type: str
+    severity: str
+    payload: dict
+    triggered_at: datetime
+    resolved_at: datetime | None

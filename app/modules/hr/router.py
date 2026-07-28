@@ -13,6 +13,7 @@ from app.modules.hr.schemas import (
     EmployeeProfileOut,
     EmployeeProfileSelfOut,
     EmployeeProfileUpdate,
+    HrAlertOut,
     ShiftCreate,
     ShiftOut,
     ShiftUpdate,
@@ -136,6 +137,26 @@ async def clock_in_endpoint(
             tenant_slug=current_user["tenant_slug"],
         )
         return TimeClockEntryOut.model_validate(entry)
+
+
+@router.get("/alerts", response_model=list[HrAlertOut])
+async def list_alerts_endpoint(
+    resolved: bool | None = Query(None),
+    current_user: dict = Depends(require_role("admin")),
+) -> list[HrAlertOut]:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        alerts = await hr_service.list_alerts(session, resolved)
+        return [HrAlertOut.model_validate(alert) for alert in alerts]
+
+
+@router.patch("/alerts/{alert_id}/resolve", response_model=HrAlertOut)
+async def resolve_alert_endpoint(
+    alert_id: int,
+    current_user: dict = Depends(require_role("admin")),
+) -> HrAlertOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        alert = await hr_service.resolve_alert(session, alert_id)
+        return HrAlertOut.model_validate(alert)
 
 
 @router.post("/timeclock/clock-out", response_model=TimeClockEntryOut)
