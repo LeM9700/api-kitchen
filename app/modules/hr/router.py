@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
@@ -120,6 +120,7 @@ async def list_my_shifts_endpoint(
 @router.post("/timeclock/clock-in", response_model=TimeClockEntryOut, status_code=201)
 async def clock_in_endpoint(
     body: ClockInRequest,
+    request: Request,
     current_user: dict = Depends(require_role("staff", "admin")),
 ) -> TimeClockEntryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -127,12 +128,19 @@ async def clock_in_endpoint(
             session,
             user_id=int(current_user["id"]),
         )
-        entry = await hr_service.clock_in(session, profile.id, body)
+        entry = await hr_service.clock_in(
+            session,
+            profile.id,
+            body,
+            arq_pool=getattr(request.app.state, "arq_pool", None),
+            tenant_slug=current_user["tenant_slug"],
+        )
         return TimeClockEntryOut.model_validate(entry)
 
 
 @router.post("/timeclock/clock-out", response_model=TimeClockEntryOut)
 async def clock_out_endpoint(
+    request: Request,
     current_user: dict = Depends(require_role("staff", "admin")),
 ) -> TimeClockEntryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -140,7 +148,12 @@ async def clock_out_endpoint(
             session,
             user_id=int(current_user["id"]),
         )
-        entry = await hr_service.clock_out(session, profile.id)
+        entry = await hr_service.clock_out(
+            session,
+            profile.id,
+            arq_pool=getattr(request.app.state, "arq_pool", None),
+            tenant_slug=current_user["tenant_slug"],
+        )
         return TimeClockEntryOut.model_validate(entry)
 
 

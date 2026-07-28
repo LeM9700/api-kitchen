@@ -7,7 +7,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
-from app.modules.hr.models import EmployeeProfile, Shift, TimeClockCorrection, TimeClockEntry
+from app.modules.hr.models import (
+    EmployeeProfile,
+    EstablishmentHrConfig,
+    Shift,
+    TimeClockCorrection,
+    TimeClockEntry,
+)
 from app.modules.hr.schemas import (
     ClockInRequest,
     EmployeeProfileCreate,
@@ -142,6 +148,8 @@ async def clock_in(
     session: AsyncSession,
     employee_id: int,
     body: ClockInRequest,
+    arq_pool=None,
+    tenant_slug: str | None = None,
 ) -> TimeClockEntry:
     existing = await session.execute(
         select(TimeClockEntry).where(
@@ -167,12 +175,28 @@ async def clock_in(
     session.add(entry)
     await session.commit()
     await session.refresh(entry)
+
+    late = await detect_late_arrival(session, entry)
+    if arq_pool is not None and late is not None:
+        try:
+            await arq_pool.enqueue_job(
+                "send_hr_late_alert",
+                tenant_slug=tenant_slug,
+                employee_id=late["employee_id"],
+                shift_id=late["shift_id"],
+                minutes_late=late["minutes_late"],
+            )
+        except Exception:
+            pass
+
     return entry
 
 
 async def clock_out(
     session: AsyncSession,
     employee_id: int,
+    arq_pool=None,
+    tenant_slug: str | None = None,
 ) -> TimeClockEntry:
     result = await session.execute(
         select(TimeClockEntry).where(
@@ -188,6 +212,20 @@ async def clock_out(
     entry.status = "closed"
     await session.commit()
     await session.refresh(entry)
+
+    overrun = await detect_shift_overrun(session, entry)
+    if arq_pool is not None and overrun is not None:
+        try:
+            await arq_pool.enqueue_job(
+                "send_hr_overrun_alert",
+                tenant_slug=tenant_slug,
+                employee_id=overrun["employee_id"],
+                shift_id=overrun["shift_id"],
+                minutes_over=overrun["minutes_over"],
+            )
+        except Exception:
+            pass
+
     return entry
 
 
@@ -256,3 +294,70 @@ async def correct_time_clock_entry(
     await session.commit()
     await session.refresh(entry)
     return entry
+
+
+async def _get_hr_config(
+    session: AsyncSession,
+    establishment_id: int,
+) -> EstablishmentHrConfig:
+    result = await session.execute(
+        select(EstablishmentHrConfig).where(
+            EstablishmentHrConfig.establishment_id == establishment_id
+        )
+    )
+    config = result.scalar_one_or_none()
+    result.close()
+    if config is None:
+        config = EstablishmentHrConfig(establishment_id=establishment_id)
+    return config
+
+
+async def _late_tolerance_minutes(session: AsyncSession, establishment_id: int) -> int:
+    config = await _get_hr_config(session, establishment_id)
+    return int(getattr(config, "late_tolerance_minutes", None) or 10)
+
+
+async def detect_late_arrival(
+    session: AsyncSession,
+    entry: TimeClockEntry,
+) -> dict | None:
+    if entry.shift_id is None:
+        return None
+
+    shift = await session.get(Shift, entry.shift_id)
+    if shift is None:
+        return None
+
+    tolerance = await _late_tolerance_minutes(session, entry.establishment_id)
+    delta_minutes = (entry.clock_in_at - shift.starts_at).total_seconds() / 60
+    if delta_minutes <= tolerance:
+        return None
+
+    return {
+        "employee_id": entry.employee_id,
+        "shift_id": shift.id,
+        "minutes_late": int(delta_minutes - tolerance),
+    }
+
+
+async def detect_shift_overrun(
+    session: AsyncSession,
+    entry: TimeClockEntry,
+) -> dict | None:
+    if entry.shift_id is None or entry.clock_out_at is None:
+        return None
+
+    shift = await session.get(Shift, entry.shift_id)
+    if shift is None:
+        return None
+
+    tolerance = await _late_tolerance_minutes(session, entry.establishment_id)
+    delta_minutes = (entry.clock_out_at - shift.ends_at).total_seconds() / 60
+    if delta_minutes <= tolerance:
+        return None
+
+    return {
+        "employee_id": entry.employee_id,
+        "shift_id": shift.id,
+        "minutes_over": int(delta_minutes - tolerance),
+    }
