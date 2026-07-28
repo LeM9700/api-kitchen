@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EmployeeProfileCreate(BaseModel):
@@ -97,3 +97,9 @@ class TimeClockEntryOut(BaseModel):
     clock_out_at: datetime | None
     method: str
     status: str
+
+
+class TimeClockCorrectionRequest(BaseModel):
+    new_clock_in_at: datetime | None = None
+    new_clock_out_at: datetime | None = None
+    reason: str = Field(min_length=1)

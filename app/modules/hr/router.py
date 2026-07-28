@@ -16,6 +16,7 @@ from app.modules.hr.schemas import (
     ShiftCreate,
     ShiftOut,
     ShiftUpdate,
+    TimeClockCorrectionRequest,
     TimeClockEntryOut,
 )
 
@@ -140,4 +141,59 @@ async def clock_out_endpoint(
             user_id=int(current_user["id"]),
         )
         entry = await hr_service.clock_out(session, profile.id)
+        return TimeClockEntryOut.model_validate(entry)
+
+
+@router.get("/timeclock/entries", response_model=list[TimeClockEntryOut])
+async def list_time_clock_entries_endpoint(
+    employee_id: int | None = Query(None),
+    status: str | None = Query(None),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    current_user: dict = Depends(require_role("admin")),
+) -> list[TimeClockEntryOut]:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        entries = await hr_service.list_time_clock_entries(
+            session,
+            employee_id,
+            date_from,
+            date_to,
+            status,
+        )
+        return [TimeClockEntryOut.model_validate(entry) for entry in entries]
+
+
+@router.get("/timeclock/entries/me", response_model=list[TimeClockEntryOut])
+async def list_my_time_clock_entries_endpoint(
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> list[TimeClockEntryOut]:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        profile = await hr_service.get_employee_profile_by_user_id(
+            session,
+            user_id=int(current_user["id"]),
+        )
+        entries = await hr_service.list_my_time_clock_entries(
+            session,
+            profile.id,
+            date_from,
+            date_to,
+        )
+        return [TimeClockEntryOut.model_validate(entry) for entry in entries]
+
+
+@router.patch("/timeclock/entries/{entry_id}", response_model=TimeClockEntryOut)
+async def correct_time_clock_entry_endpoint(
+    entry_id: int,
+    body: TimeClockCorrectionRequest,
+    current_user: dict = Depends(require_role("admin")),
+) -> TimeClockEntryOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        entry = await hr_service.correct_time_clock_entry(
+            session,
+            entry_id,
+            body,
+            corrected_by_user_id=int(current_user["id"]),
+        )
         return TimeClockEntryOut.model_validate(entry)

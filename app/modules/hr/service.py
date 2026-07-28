@@ -7,13 +7,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
-from app.modules.hr.models import EmployeeProfile, Shift, TimeClockEntry
+from app.modules.hr.models import EmployeeProfile, Shift, TimeClockCorrection, TimeClockEntry
 from app.modules.hr.schemas import (
     ClockInRequest,
     EmployeeProfileCreate,
     EmployeeProfileUpdate,
     ShiftCreate,
     ShiftUpdate,
+    TimeClockCorrectionRequest,
 )
 
 
@@ -185,6 +186,73 @@ async def clock_out(
 
     entry.clock_out_at = _datetime.now(_timezone.utc)
     entry.status = "closed"
+    await session.commit()
+    await session.refresh(entry)
+    return entry
+
+
+async def list_time_clock_entries(
+    session: AsyncSession,
+    employee_id: int | None = None,
+    date_from: _datetime | None = None,
+    date_to: _datetime | None = None,
+    status: str | None = None,
+) -> list[TimeClockEntry]:
+    stmt = select(TimeClockEntry)
+    if employee_id is not None:
+        stmt = stmt.where(TimeClockEntry.employee_id == employee_id)
+    if date_from is not None:
+        stmt = stmt.where(TimeClockEntry.clock_in_at >= date_from)
+    if date_to is not None:
+        stmt = stmt.where(TimeClockEntry.clock_in_at <= date_to)
+    if status is not None:
+        stmt = stmt.where(TimeClockEntry.status == status)
+
+    result = await session.execute(stmt.order_by(TimeClockEntry.clock_in_at.desc()))
+    return list(result.scalars())
+
+
+async def list_my_time_clock_entries(
+    session: AsyncSession,
+    employee_id: int,
+    date_from: _datetime | None = None,
+    date_to: _datetime | None = None,
+) -> list[TimeClockEntry]:
+    return await list_time_clock_entries(
+        session,
+        employee_id=employee_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+async def correct_time_clock_entry(
+    session: AsyncSession,
+    entry_id: int,
+    body: TimeClockCorrectionRequest,
+    corrected_by_user_id: int,
+) -> TimeClockEntry:
+    entry = await session.get(TimeClockEntry, entry_id)
+    if entry is None:
+        raise AppError("NOT_FOUND", "Time clock entry not found", 404)
+
+    correction = TimeClockCorrection(
+        entry_id=entry.id,
+        corrected_by_user_id=corrected_by_user_id,
+        old_clock_in_at=entry.clock_in_at,
+        old_clock_out_at=entry.clock_out_at,
+        new_clock_in_at=body.new_clock_in_at,
+        new_clock_out_at=body.new_clock_out_at,
+        reason=body.reason,
+    )
+    session.add(correction)
+
+    if body.new_clock_in_at is not None:
+        entry.clock_in_at = body.new_clock_in_at
+    if body.new_clock_out_at is not None:
+        entry.clock_out_at = body.new_clock_out_at
+    entry.status = "corrected"
+
     await session.commit()
     await session.refresh(entry)
     return entry
