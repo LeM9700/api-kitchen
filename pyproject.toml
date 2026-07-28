@@ -45,3 +45,4 @@ exclude = ["alembic*", "docs*", "tests*", "Microsoft*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
