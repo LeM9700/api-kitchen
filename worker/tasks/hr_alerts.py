@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import settings
 from app.core.database import tenant_schema_name
-from app.modules.hr.models import EmployeeProfile, EstablishmentHrConfig, HrAlert
+from app.modules.hr.models import (
+    EmployeeProfile,
+    EstablishmentHrConfig,
+    HrAlert,
+    TimeClockEntry,
+)
+from worker.tasks.stats import _get_all_tenant_slugs
 
 try:
     from app.modules.notifications.notification_service import notify_staff
@@ -186,3 +192,111 @@ async def send_hr_overrun_alert(
                 employee_id,
                 exc,
             )
+
+
+async def _get_config_for_employee(
+    session,
+    employee: EmployeeProfile,
+) -> EstablishmentHrConfig:
+    result = await session.execute(
+        select(EstablishmentHrConfig).where(
+            EstablishmentHrConfig.establishment_id == employee.establishment_id
+        )
+    )
+    config = result.scalar_one_or_none()
+    result.close()
+    if config is None:
+        return EstablishmentHrConfig(establishment_id=employee.establishment_id)
+    return config
+
+
+async def _weekly_hours_worked(session, employee_id: int, as_of: datetime) -> float:
+    monday = (as_of - timedelta(days=as_of.weekday())).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    result = await session.execute(
+        select(TimeClockEntry).where(
+            TimeClockEntry.employee_id == employee_id,
+            TimeClockEntry.status == "closed",
+            TimeClockEntry.clock_in_at >= monday,
+        )
+    )
+
+    total_minutes = 0.0
+    for entry in result.scalars():
+        if entry.clock_out_at is None:
+            continue
+        worked = (entry.clock_out_at - entry.clock_in_at).total_seconds() / 60
+        total_minutes += worked
+    result.close()
+    return round(total_minutes / 60, 2)
+
+
+async def check_weekly_overtime(ctx) -> None:
+    """Cron ARQ quotidien: alerte si un employe depasse le seuil hebdomadaire."""
+    engine = create_async_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+
+    try:
+        tenant_slugs = await _get_all_tenant_slugs(engine)
+        for slug in tenant_slugs:
+            schema = tenant_schema_name(slug)
+            async with session_factory() as session:
+                await session.execute(text(f'SET search_path TO "{schema}", public'))
+                result = await session.execute(
+                    select(EmployeeProfile).where(EmployeeProfile.is_active.is_(True))
+                )
+                employees = list(result.scalars())
+                result.close()
+
+                for employee in employees:
+                    hours = await _weekly_hours_worked(session, employee.id, now)
+                    config = await _get_config_for_employee(session, employee)
+                    threshold = int(config.weekly_hours_legal_threshold)
+                    if hours <= threshold:
+                        continue
+
+                    alert = await _record_alert_if_not_in_cooldown(
+                        session,
+                        employee.id,
+                        "weekly_overtime",
+                        "warning",
+                        {
+                            "hours_worked": hours,
+                            "threshold": threshold,
+                            "establishment_id": employee.establishment_id,
+                        },
+                    )
+                    if alert is None:
+                        continue
+
+                    try:
+                        if notify_staff is not None:
+                            await notify_staff(
+                                session=session,
+                                tenant_slug=slug,
+                                event="hr.weekly_overtime",
+                                title="Depassement des 35h",
+                                body=(
+                                    f"Employe #{employee.id} : {hours}h cette semaine "
+                                    f"(seuil {threshold}h)."
+                                ),
+                                data={
+                                    "employee_id": employee.id,
+                                    "hours_worked": hours,
+                                    "threshold": threshold,
+                                },
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "notify_staff failed for hr.weekly_overtime tenant=%s employee=%s: %s",
+                            slug,
+                            employee.id,
+                            exc,
+                        )
+    finally:
+        await engine.dispose()

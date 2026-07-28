@@ -1,7 +1,7 @@
 """Tests for HR alert worker tasks: cooldown + HrAlert row creation."""
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -100,3 +100,54 @@ async def test_send_hr_late_alert_respects_cooldown(db_session, employee, monkey
     )
     assert result.scalar_one() == 1
     result.close()
+
+
+async def test_weekly_hours_worked_sums_closed_entries_this_week(
+    db_session,
+    employee,
+    default_establishment_id,
+):
+    from app.modules.hr.models import TimeClockEntry
+    from worker.tasks.hr_alerts import _weekly_hours_worked
+
+    now = datetime.now(timezone.utc)
+    monday = now - timedelta(days=now.weekday())
+    db_session.add(
+        TimeClockEntry(
+            employee_id=employee.id,
+            establishment_id=default_establishment_id,
+            clock_in_at=monday,
+            clock_out_at=monday + timedelta(hours=10),
+            method="web",
+            status="closed",
+        )
+    )
+    await db_session.commit()
+
+    hours = await _weekly_hours_worked(db_session, employee.id, now)
+    assert hours == pytest.approx(10.0, abs=0.01)
+
+
+async def test_weekly_hours_worked_ignores_open_entries(
+    db_session,
+    employee,
+    default_establishment_id,
+):
+    from app.modules.hr.models import TimeClockEntry
+    from worker.tasks.hr_alerts import _weekly_hours_worked
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        TimeClockEntry(
+            employee_id=employee.id,
+            establishment_id=default_establishment_id,
+            clock_in_at=now,
+            clock_out_at=None,
+            method="web",
+            status="open",
+        )
+    )
+    await db_session.commit()
+
+    hours = await _weekly_hours_worked(db_session, employee.id, now)
+    assert hours == 0.0
