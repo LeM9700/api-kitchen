@@ -78,3 +78,22 @@ class ShiftOut(BaseModel):
     ends_at: datetime
     break_minutes: int
     status: str
+
+
+class ClockInRequest(BaseModel):
+    method: Literal["web", "mobile", "qrcode"]
+    establishment_id: int
+    shift_id: int | None = None
+
+
+class TimeClockEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    employee_id: int
+    shift_id: int | None
+    establishment_id: int
+    clock_in_at: datetime
+    clock_out_at: datetime | None
+    method: str
+    status: str

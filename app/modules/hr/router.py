@@ -8,6 +8,7 @@ from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
 from app.modules.hr import service as hr_service
 from app.modules.hr.schemas import (
+    ClockInRequest,
     EmployeeProfileCreate,
     EmployeeProfileOut,
     EmployeeProfileSelfOut,
@@ -15,6 +16,7 @@ from app.modules.hr.schemas import (
     ShiftCreate,
     ShiftOut,
     ShiftUpdate,
+    TimeClockEntryOut,
 )
 
 router = APIRouter()
@@ -112,3 +114,30 @@ async def list_my_shifts_endpoint(
         )
         shifts = await hr_service.list_my_shifts(session, profile.id, date_from, date_to)
         return [ShiftOut.model_validate(shift) for shift in shifts]
+
+
+@router.post("/timeclock/clock-in", response_model=TimeClockEntryOut, status_code=201)
+async def clock_in_endpoint(
+    body: ClockInRequest,
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> TimeClockEntryOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        profile = await hr_service.get_employee_profile_by_user_id(
+            session,
+            user_id=int(current_user["id"]),
+        )
+        entry = await hr_service.clock_in(session, profile.id, body)
+        return TimeClockEntryOut.model_validate(entry)
+
+
+@router.post("/timeclock/clock-out", response_model=TimeClockEntryOut)
+async def clock_out_endpoint(
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> TimeClockEntryOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        profile = await hr_service.get_employee_profile_by_user_id(
+            session,
+            user_id=int(current_user["id"]),
+        )
+        entry = await hr_service.clock_out(session, profile.id)
+        return TimeClockEntryOut.model_validate(entry)
