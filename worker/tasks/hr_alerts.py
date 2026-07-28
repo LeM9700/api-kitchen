@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import settings
@@ -15,6 +15,7 @@ from app.modules.hr.models import (
     HrAlert,
     TimeClockEntry,
 )
+from app.modules.orders.models import Order
 from worker.tasks.stats import _get_all_tenant_slugs
 
 try:
@@ -51,10 +52,10 @@ async def _establishment_id_for_employee(session, employee_id: int) -> int | Non
 
 async def _cooldown_hours(
     session,
-    employee_id: int,
+    employee_id: int | None,
     establishment_id: int | None = None,
 ) -> int:
-    if establishment_id is None:
+    if establishment_id is None and employee_id is not None:
         establishment_id = await _establishment_id_for_employee(session, employee_id)
     if establishment_id is None:
         return _DEFAULT_COOLDOWN_HOURS
@@ -71,15 +72,29 @@ async def _cooldown_hours(
 
 async def _record_alert_if_not_in_cooldown(
     session,
-    employee_id: int,
+    employee_id: int | None,
     alert_type: str,
     severity: str,
     payload: dict,
+    establishment_id: int | None = None,
 ) -> HrAlert | None:
     now = datetime.now(timezone.utc)
+    if establishment_id is None:
+        establishment_id = payload.get("establishment_id")
+    if establishment_id is None and employee_id is not None:
+        establishment_id = await _establishment_id_for_employee(session, employee_id)
+
+    filters = [HrAlert.type == alert_type]
+    if employee_id is not None:
+        filters.append(HrAlert.employee_id == employee_id)
+    elif establishment_id is not None:
+        filters.append(HrAlert.establishment_id == establishment_id)
+    else:
+        filters.append(HrAlert.employee_id.is_(None))
+
     result = await session.execute(
         select(HrAlert)
-        .where(HrAlert.employee_id == employee_id, HrAlert.type == alert_type)
+        .where(*filters)
         .order_by(HrAlert.id.desc())
         .limit(1)
     )
@@ -89,7 +104,7 @@ async def _record_alert_if_not_in_cooldown(
     cooldown_hours = await _cooldown_hours(
         session,
         employee_id,
-        payload.get("establishment_id"),
+        establishment_id,
     )
     if last_alert and last_alert.last_alert_sent_at:
         cooldown_until = last_alert.last_alert_sent_at + timedelta(hours=cooldown_hours)
@@ -104,6 +119,7 @@ async def _record_alert_if_not_in_cooldown(
 
     alert = HrAlert(
         employee_id=employee_id,
+        establishment_id=establishment_id,
         type=alert_type,
         severity=severity,
         payload=payload,
@@ -270,6 +286,7 @@ async def check_weekly_overtime(ctx) -> None:
                             "threshold": threshold,
                             "establishment_id": employee.establishment_id,
                         },
+                        establishment_id=employee.establishment_id,
                     )
                     if alert is None:
                         continue
@@ -296,6 +313,106 @@ async def check_weekly_overtime(ctx) -> None:
                             "notify_staff failed for hr.weekly_overtime tenant=%s employee=%s: %s",
                             slug,
                             employee.id,
+                            exc,
+                        )
+    finally:
+        await engine.dispose()
+
+
+async def _labor_cost_ratio(session, establishment_id: int, since: datetime) -> float:
+    until = since + timedelta(days=7)
+    employees_result = await session.execute(
+        select(EmployeeProfile).where(
+            EmployeeProfile.establishment_id == establishment_id,
+            EmployeeProfile.is_active.is_(True),
+        )
+    )
+
+    total_cost_cents = 0.0
+    for employee in employees_result.scalars():
+        if employee.hourly_rate_cents is None:
+            continue
+        hours = await _weekly_hours_worked(session, employee.id, since + timedelta(days=6))
+        total_cost_cents += hours * employee.hourly_rate_cents
+    employees_result.close()
+
+    revenue = await session.scalar(
+        select(func.coalesce(func.sum(Order.total), 0)).where(
+            Order.created_at >= since,
+            Order.created_at < until,
+        )
+    )
+    revenue_cents = float(revenue) * 100
+    if revenue_cents <= 0:
+        return 0.0 if total_cost_cents == 0 else float("inf")
+    return round(total_cost_cents / revenue_cents, 4)
+
+
+async def check_labor_cost_risk(ctx) -> None:
+    """Cron ARQ quotidien: compare le cout main-d'oeuvre au CA hebdomadaire."""
+    engine = create_async_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    try:
+        tenant_slugs = await _get_all_tenant_slugs(engine)
+        for slug in tenant_slugs:
+            schema = tenant_schema_name(slug)
+            async with session_factory() as session:
+                await session.execute(text(f'SET search_path TO "{schema}", public'))
+                result = await session.execute(select(EstablishmentHrConfig))
+                configs = list(result.scalars())
+                result.close()
+
+                for config in configs:
+                    ratio = await _labor_cost_ratio(session, config.establishment_id, monday)
+                    target_ratio = float(config.labor_cost_target_ratio)
+                    if ratio <= target_ratio:
+                        continue
+
+                    alert = await _record_alert_if_not_in_cooldown(
+                        session,
+                        employee_id=None,
+                        alert_type="labor_cost_risk",
+                        severity="critical",
+                        payload={
+                            "establishment_id": config.establishment_id,
+                            "ratio": ratio,
+                            "target_ratio": target_ratio,
+                        },
+                        establishment_id=config.establishment_id,
+                    )
+                    if alert is None:
+                        continue
+
+                    try:
+                        if notify_staff is not None:
+                            await notify_staff(
+                                session=session,
+                                tenant_slug=slug,
+                                event="hr.labor_cost_risk",
+                                title="Cout main d'oeuvre eleve",
+                                body=(
+                                    f"Etablissement #{config.establishment_id} : ratio cout/CA "
+                                    f"{ratio:.0%} (cible {target_ratio:.0%})."
+                                ),
+                                data={
+                                    "establishment_id": config.establishment_id,
+                                    "ratio": ratio,
+                                    "target_ratio": target_ratio,
+                                },
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "notify_staff failed for hr.labor_cost_risk tenant=%s establishment=%s: %s",
+                            slug,
+                            config.establishment_id,
                             exc,
                         )
     finally:

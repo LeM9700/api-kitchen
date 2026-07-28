@@ -42,7 +42,15 @@ def test_time_clock_correction_tablename():
 def test_hr_alert_tablename_and_columns():
     assert HrAlert.__tablename__ == "hr_alerts"
     cols = HrAlert.__table__.columns
-    assert {"employee_id", "type", "severity", "payload", "last_alert_sent_at"} <= set(cols.keys())
+    assert {
+        "employee_id",
+        "establishment_id",
+        "type",
+        "severity",
+        "payload",
+        "last_alert_sent_at",
+    } <= set(cols.keys())
+    assert cols["employee_id"].nullable is True
 
 
 def test_establishment_hr_config_defaults():

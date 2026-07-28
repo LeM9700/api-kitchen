@@ -109,10 +109,12 @@ class HrAlert(Base):
     __tablename__ = "hr_alerts"
     __table_args__ = (
         Index("ix_hr_alerts_employee_type", "employee_id", "type"),
+        Index("ix_hr_alerts_establishment_type", "establishment_id", "type"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    employee_id: Mapped[int] = mapped_column(ForeignKey("employee_profiles.id"), nullable=False)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employee_profiles.id"), nullable=True)
+    establishment_id: Mapped[int | None] = mapped_column(ForeignKey("establishments.id"), nullable=True)
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning")
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)

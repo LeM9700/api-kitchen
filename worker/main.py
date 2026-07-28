@@ -3,7 +3,7 @@ from arq.connections import RedisSettings
 
 from app.core.config import settings
 from worker.tasks.emails import notify_config_change
-from worker.tasks.hr_alerts import check_weekly_overtime
+from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
 from worker.tasks.scheduled_closures import process_scheduled_closures
 from worker.tasks.stats import aggregate_live_stats, aggregate_monthly_stats
@@ -42,6 +42,7 @@ class WorkerSettings:
         cron(expire_loyalty_points, hour=3, minute=0, timeout=600),
         cron(aggregate_stock_snapshot, hour=set(range(24)), minute={0}),
         cron(check_weekly_overtime, hour=2, minute=0),
+        cron(check_labor_cost_risk, hour=3, minute=0),
         cron(
             process_scheduled_closures,
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},

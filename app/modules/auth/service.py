@@ -572,7 +572,8 @@ _TENANT_DDL_STATEMENTS: list[str] = [
     )""",
     """CREATE TABLE IF NOT EXISTS hr_alerts (
         id SERIAL PRIMARY KEY,
-        employee_id INTEGER NOT NULL REFERENCES employee_profiles(id),
+        employee_id INTEGER REFERENCES employee_profiles(id),
+        establishment_id INTEGER REFERENCES establishments(id),
         type VARCHAR(32) NOT NULL,
         severity VARCHAR(16) NOT NULL DEFAULT 'warning',
         payload JSON NOT NULL DEFAULT '{}',
@@ -580,7 +581,10 @@ _TENANT_DDL_STATEMENTS: list[str] = [
         resolved_at TIMESTAMPTZ,
         last_alert_sent_at TIMESTAMPTZ
     )""",
+    "ALTER TABLE hr_alerts ALTER COLUMN employee_id DROP NOT NULL",
+    "ALTER TABLE hr_alerts ADD COLUMN IF NOT EXISTS establishment_id INTEGER REFERENCES establishments(id)",
     "CREATE INDEX IF NOT EXISTS ix_hr_alerts_employee_type ON hr_alerts (employee_id, type)",
+    "CREATE INDEX IF NOT EXISTS ix_hr_alerts_establishment_type ON hr_alerts (establishment_id, type)",
     """CREATE TABLE IF NOT EXISTS establishment_hr_config (
         id SERIAL PRIMARY KEY,
         establishment_id INTEGER NOT NULL UNIQUE REFERENCES establishments(id),

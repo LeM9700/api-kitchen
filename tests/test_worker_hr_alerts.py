@@ -151,3 +151,69 @@ async def test_weekly_hours_worked_ignores_open_entries(
 
     hours = await _weekly_hours_worked(db_session, employee.id, now)
     assert hours == 0.0
+
+
+async def test_labor_cost_ratio_computed_from_hourly_rate_and_orders(
+    db_session,
+    default_establishment_id,
+):
+    from app.modules.hr.models import TimeClockEntry
+    from app.modules.hr.schemas import EmployeeProfileCreate
+    from app.modules.hr.service import create_employee_profile
+    from app.modules.orders.models import Order
+    from worker.tasks.hr_alerts import _labor_cost_ratio
+
+    employee = await create_employee_profile(
+        db_session,
+        EmployeeProfileCreate(
+            user_id=99007,
+            establishment_id=default_establishment_id,
+            hourly_rate_cents=1500,
+        ),
+    )
+    monday = datetime(2099, 1, 5, tzinfo=timezone.utc)
+
+    db_session.add(
+        TimeClockEntry(
+            employee_id=employee.id,
+            establishment_id=default_establishment_id,
+            clock_in_at=monday,
+            clock_out_at=monday + timedelta(hours=10),
+            method="web",
+            status="closed",
+        )
+    )
+    db_session.add(
+        Order(
+            status="completed",
+            payment_status="paid",
+            total=100.00,
+            created_at=monday,
+        )
+    )
+    await db_session.commit()
+
+    ratio = await _labor_cost_ratio(db_session, default_establishment_id, monday)
+    assert ratio == pytest.approx(1.5, abs=0.01)
+
+
+async def test_record_alert_allows_establishment_scope(
+    db_session,
+    default_establishment_id,
+):
+    from app.modules.hr.models import HrAlert
+    from worker.tasks.hr_alerts import _record_alert_if_not_in_cooldown
+
+    alert = await _record_alert_if_not_in_cooldown(
+        db_session,
+        employee_id=None,
+        alert_type="labor_cost_risk",
+        severity="critical",
+        payload={"establishment_id": default_establishment_id, "ratio": 0.42},
+        establishment_id=default_establishment_id,
+    )
+
+    assert isinstance(alert, HrAlert)
+    assert alert.employee_id is None
+    assert alert.establishment_id == default_establishment_id
+    assert alert.type == "labor_cost_risk"
