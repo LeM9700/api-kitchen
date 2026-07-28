@@ -1,7 +1,7 @@
 """Tests for HR alert worker tasks: cooldown + HrAlert row creation."""
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -78,7 +78,7 @@ async def test_send_hr_late_alert_respects_cooldown(db_session, employee, monkey
             type="late",
             severity="warning",
             payload={},
-            last_alert_sent_at=datetime.now(timezone.utc),
+            last_alert_sent_at=datetime.now(UTC),
         )
     )
     await db_session.commit()
@@ -110,7 +110,7 @@ async def test_weekly_hours_worked_sums_closed_entries_this_week(
     from app.modules.hr.models import TimeClockEntry
     from worker.tasks.hr_alerts import _weekly_hours_worked
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     monday = now - timedelta(days=now.weekday())
     db_session.add(
         TimeClockEntry(
@@ -136,7 +136,7 @@ async def test_weekly_hours_worked_ignores_open_entries(
     from app.modules.hr.models import TimeClockEntry
     from worker.tasks.hr_alerts import _weekly_hours_worked
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     db_session.add(
         TimeClockEntry(
             employee_id=employee.id,
@@ -171,7 +171,7 @@ async def test_labor_cost_ratio_computed_from_hourly_rate_and_orders(
             hourly_rate_cents=1500,
         ),
     )
-    monday = datetime(2099, 1, 5, tzinfo=timezone.utc)
+    monday = datetime(2099, 1, 5, tzinfo=UTC)
 
     db_session.add(
         TimeClockEntry(

@@ -1,6 +1,6 @@
 """Router FastAPI pour la gestion des allergènes réglementaires et des dietary tags."""
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Request
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_pagination, require_role

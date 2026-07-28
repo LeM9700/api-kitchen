@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
 from app.modules.loyalty.account.models import LoyaltyAccount, LoyaltyPointReservation, LoyaltyTransaction
-from app.modules.loyalty.account.schemas import ExpiringPointsBucket, ExpiringPointsResponse, LoyaltyTransactionPage
+from app.modules.loyalty.account.schemas import ExpiringPointsResponse, LoyaltyTransactionPage
 
 
 def _as_utc(dt: datetime) -> datetime:

@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -20,7 +20,7 @@ from worker.tasks.stats import _get_all_tenant_slugs
 
 try:
     from app.modules.notifications.notification_service import notify_staff
-except Exception:  # pragma: no cover - defensive import for worker bootstrap/tests
+except Exception:  # noqa: BLE001  # pragma: no cover - defensive import for worker bootstrap/tests
     notify_staff = None
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ async def _record_alert_if_not_in_cooldown(
     payload: dict,
     establishment_id: int | None = None,
 ) -> HrAlert | None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if establishment_id is None:
         establishment_id = payload.get("establishment_id")
     if establishment_id is None and employee_id is not None:
@@ -162,7 +162,7 @@ async def send_hr_late_alert(
                         "minutes_late": minutes_late,
                     },
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error(
                 "notify_staff failed for hr.late_arrival employee=%s: %s",
                 employee_id,
@@ -202,7 +202,7 @@ async def send_hr_overrun_alert(
                         "minutes_over": minutes_over,
                     },
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error(
                 "notify_staff failed for hr.shift_overrun employee=%s: %s",
                 employee_id,
@@ -255,7 +255,7 @@ async def check_weekly_overtime(ctx) -> None:
     """Cron ARQ quotidien: alerte si un employe depasse le seuil hebdomadaire."""
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     try:
         tenant_slugs = await _get_all_tenant_slugs(engine)
@@ -308,7 +308,7 @@ async def check_weekly_overtime(ctx) -> None:
                                     "threshold": threshold,
                                 },
                             )
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error(
                             "notify_staff failed for hr.weekly_overtime tenant=%s employee=%s: %s",
                             slug,
@@ -352,7 +352,7 @@ async def check_labor_cost_risk(ctx) -> None:
     """Cron ARQ quotidien: compare le cout main-d'oeuvre au CA hebdomadaire."""
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     monday = (now - timedelta(days=now.weekday())).replace(
         hour=0,
         minute=0,
@@ -408,7 +408,7 @@ async def check_labor_cost_risk(ctx) -> None:
                                     "target_ratio": target_ratio,
                                 },
                             )
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error(
                             "notify_staff failed for hr.labor_cost_risk tenant=%s establishment=%s: %s",
                             slug,

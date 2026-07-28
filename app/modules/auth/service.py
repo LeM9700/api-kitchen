@@ -1,5 +1,4 @@
 import base64
-import hmac as _hmac_module
 from io import BytesIO
 import secrets
 import uuid

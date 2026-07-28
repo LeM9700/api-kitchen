@@ -12,7 +12,6 @@ import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
-import pytest
 
 from app.core.http.deps import get_current_user
 from app.core.http.errors import AppError

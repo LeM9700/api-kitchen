@@ -12,7 +12,7 @@ from app.core.database import get_tenant_session
 from app.core.http.deps import get_current_user, require_role
 from app.core.http.errors import AppError
 from app.modules.loyalty.config import service as config_service
-from app.modules.loyalty.config.models import LoyaltyConfig, LoyaltyReward, LoyaltyRule
+from app.modules.loyalty.config.models import LoyaltyReward, LoyaltyRule
 from app.modules.loyalty.config.schemas import (
     LoyaltyConfigResponse,
     LoyaltyConfigUpdate,

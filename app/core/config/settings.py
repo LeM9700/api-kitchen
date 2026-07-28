@@ -1,6 +1,6 @@
 import pathlib
 
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to this file so the path works regardless of cwd.
@@ -56,32 +56,32 @@ class Settings(BaseSettings):
 
     # CORS — origines autorisées (JSON array dans le .env).
     # Ex : CORS_ORIGINS=["https://app.monsite.com","https://admin.monsite.com"]
-    cors_origins: list[str] = Field(default=["http://localhost:3000"], env="CORS_ORIGINS")
+    cors_origins: list[str] = ["http://localhost:3000"]
 
     # Cloudinary — stockage médias multi-tenant.
-    cloudinary_cloud_name: str = Field(..., env="CLOUDINARY_CLOUD_NAME")
-    cloudinary_api_key: str = Field(..., env="CLOUDINARY_API_KEY")
-    cloudinary_api_secret: str = Field(..., env="CLOUDINARY_API_SECRET")
+    cloudinary_cloud_name: str
+    cloudinary_api_key: str
+    cloudinary_api_secret: str
 
     # Redis URL pour le pub/sub inter-instances (connexion dédiée, distincte du pool arq).
     # Railway expose automatiquement REDIS_URL lorsqu'un service Redis est attaché.
-    redis_url: str = Field(..., env="REDIS_URL")
+    redis_url: str
 
     # APNs (iOS push notifications).
     # Option A (prod Railway) : chemin vers le Secret File monté (APNS_PRIVATE_KEY_PATH).
     # Option B (dev local)    : contenu PEM complet en env var (APNS_PRIVATE_KEY).
     # Voir .env.example pour les deux variantes.
-    apns_key_id: str | None = Field(None, env="APNS_KEY_ID")
-    apns_team_id: str | None = Field(None, env="APNS_TEAM_ID")
-    apns_bundle_id: str | None = Field(None, env="APNS_BUNDLE_ID")
-    apns_private_key: str | None = Field(None, env="APNS_PRIVATE_KEY")
-    apns_private_key_path: str | None = Field(None, env="APNS_PRIVATE_KEY_PATH")
+    apns_key_id: str | None = None
+    apns_team_id: str | None = None
+    apns_bundle_id: str | None = None
+    apns_private_key: str | None = None
+    apns_private_key_path: str | None = None
 
     # FCM v1 (Android push notifications).
     # fcm_service_account_json : JSON string complet du service account Google
     # téléchargé depuis Firebase Console → Project Settings → Service Accounts.
-    fcm_project_id: str | None = Field(None, env="FCM_PROJECT_ID")
-    fcm_service_account_json: str | None = Field(None, env="FCM_SERVICE_ACCOUNT_JSON")
+    fcm_project_id: str | None = None
+    fcm_service_account_json: str | None = None
 
 
 settings = Settings()

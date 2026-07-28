@@ -1,8 +1,9 @@
+from typing import ClassVar
+
 from arq import cron
 from arq.connections import RedisSettings
 
 from app.core.config import settings
-from worker.tasks.emails import notify_config_change
 from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
 from worker.tasks.scheduled_closures import process_scheduled_closures
@@ -15,7 +16,7 @@ def get_redis_settings() -> RedisSettings:
 
 
 class WorkerSettings:
-    functions = [
+    functions: ClassVar[list] = [
         "worker.tasks.stock_alerts.send_stock_alert",
         "worker.tasks.hr_alerts.send_hr_late_alert",
         "worker.tasks.hr_alerts.send_hr_overrun_alert",
@@ -30,7 +31,7 @@ class WorkerSettings:
         aggregate_stock_snapshot,
     ]
     # Cron jobs ARQ : les fonctions recoivent uniquement ctx (pas de parametres dynamiques).
-    cron_jobs = [
+    cron_jobs: ClassVar[list] = [
         cron(aggregate_monthly_stats, hour=0, minute=0),
         cron(
             aggregate_live_stats,

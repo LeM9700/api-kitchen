@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from arq import ArqRedis
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError

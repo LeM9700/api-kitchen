@@ -26,7 +26,7 @@ import logging
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
-from app.core.http.deps import get_current_user, require_role
+from app.core.http.deps import require_role
 from app.core.http.limiter import limiter
 from app.modules.payments import connect_service
 

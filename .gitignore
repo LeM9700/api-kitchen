@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 /.agents
@@ -18,6 +19,8 @@ htmlcov/
 /docs/superpowers
 /Microsoft
 /audit
+/seed-images/
+/scripts/_tmp_*.py
 
 # OS / editor cruft
 .DS_Store

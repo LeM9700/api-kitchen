@@ -10,9 +10,8 @@ Tous les tests sont des tests unitaires (AsyncMock session) sans DB réelle.
 """
 
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-import pytest
 
 from app.modules.orders.models import Order
 from app.modules.payments import service

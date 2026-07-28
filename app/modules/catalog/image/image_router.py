@@ -1,12 +1,11 @@
 """Router FastAPI pour la gestion des images de catalogue (galerie multi-entités)."""
 
-from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_current_user, require_role
+from app.core.http.deps import require_role
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.modules.catalog.image import image_service

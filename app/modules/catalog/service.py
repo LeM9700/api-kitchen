@@ -3,7 +3,7 @@ import secrets
 from io import StringIO
 
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 

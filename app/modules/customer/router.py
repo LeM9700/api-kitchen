@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Header, Request
 
-from app.core.http.deps import get_current_user, require_role
+from app.core.http.deps import require_role
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.modules.auth.schemas import TokenResponse
