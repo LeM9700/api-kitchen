@@ -41,12 +41,23 @@ class Refund(Base):
     __tablename__ = "refunds"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"))
-    payment_id: Mapped[int] = mapped_column(ForeignKey("payments.id"))
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("payments.id"), index=True)
     stripe_refund_id: Mapped[str] = mapped_column(String(128), unique=True)
     amount: Mapped[int] = mapped_column(Integer)  # en centimes
     reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), default="pending")
+    status: Mapped[str] = mapped_column(String(32), default="pending", server_default="pending")
     failure_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProcessedWebhookEvent(Base):
+    __tablename__ = "processed_webhook_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    stripe_event_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

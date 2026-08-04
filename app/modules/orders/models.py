@@ -1,6 +1,19 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -12,7 +25,10 @@ class Order(Base):
         Index("ix_orders_user_id", "user_id"),
         Index("ix_orders_status", "status"),
         Index("ix_orders_created_at", "created_at"),
+        Index("ix_orders_status_created_at", "status", "created_at"),
         UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_id_idempotency_key"),
+        CheckConstraint("order_type IN ('delivery', 'pickup', 'dine_in')", name="ck_orders_order_type"),
+        CheckConstraint("source IN ('customer', 'manual', 'system')", name="ck_orders_source"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -23,10 +39,12 @@ class Order(Base):
     # 'delivery' | 'pickup' | 'dine_in' -- contrainte CHECK en base (cf. migrations et
     # _TENANT_DDL_STATEMENTS). String plutot qu'un type ENUM Postgres natif, pour
     # rester coherent avec status/payment_status/role deja en place dans ce module.
-    order_type: Mapped[str] = mapped_column(String(16), nullable=False, default="delivery")
-    status: Mapped[str] = mapped_column(String(32), default="pending")
-    payment_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
-    source: Mapped[str] = mapped_column(String(16), nullable=False, default="customer")
+    order_type: Mapped[str] = mapped_column(String(16), nullable=False, default="delivery", server_default="delivery")
+    status: Mapped[str] = mapped_column(String(32), default="pending", server_default="pending")
+    payment_status: Mapped[str] = mapped_column(
+        String(32), default="pending", server_default="pending", nullable=False
+    )
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="customer", server_default="customer")
     created_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     subtotal: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     discount_total: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
@@ -45,6 +63,16 @@ class Order(Base):
 
 class OrderItem(Base):
     __tablename__ = "order_items"
+    __table_args__ = (
+        CheckConstraint(
+            "preparation_status IN ('pending', 'preparing', 'ready')",
+            name="ck_order_items_preparation_status",
+        ),
+        CheckConstraint(
+            "preparation_station IN ('kitchen', 'counter', 'none')",
+            name="ck_order_items_preparation_station",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
@@ -53,12 +81,18 @@ class OrderItem(Base):
     product_name_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     variant_name_snapshot: Mapped[str | None] = mapped_column(String(128), nullable=True)
     extras_snapshot: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    extras_total: Mapped[float] = mapped_column(Numeric(10, 2), default=0, nullable=False)
+    extras_total: Mapped[float] = mapped_column(
+        Numeric(10, 2), default=0, nullable=False, server_default=text("0")
+    )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     total: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
-    preparation_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
-    preparation_station: Mapped[str] = mapped_column(String(16), nullable=False, default="kitchen")
+    preparation_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    preparation_station: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="kitchen", server_default="kitchen"
+    )
     prepared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     prepared_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 

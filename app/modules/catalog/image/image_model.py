@@ -77,8 +77,8 @@ class MediaImage(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     width: Mapped[int] = mapped_column(Integer, nullable=False)
     height: Mapped[int] = mapped_column(Integer, nullable=False)
-    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     alt_text: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

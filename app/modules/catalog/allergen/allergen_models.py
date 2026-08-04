@@ -73,7 +73,7 @@ class AllergenDefinition(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     slug: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    is_regulatory: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_regulatory: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -132,7 +132,7 @@ class ProductAllergen(Base):
         primary_key=True,
     )
     level: Mapped[str] = mapped_column(String(10), nullable=False)
-    source: Mapped[str] = mapped_column(String(10), nullable=False, default="ingredient")
+    source: Mapped[str] = mapped_column(String(10), nullable=False, default="ingredient", server_default="ingredient")
 
 
 class DietaryTag(Base):

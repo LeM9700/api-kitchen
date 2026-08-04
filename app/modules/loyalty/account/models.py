@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, Numeric, String, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -11,7 +12,7 @@ class LoyaltyAccount(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
-    points: Mapped[int] = mapped_column(Integer, default=0)
+    points: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -28,15 +29,16 @@ class LoyaltyTransaction(Base):
     order_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reward_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reservation_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    metadata_json: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    metadata_json: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class LoyaltyPointReservation(Base):
     __tablename__ = "loyalty_point_reservations"
+    __table_args__ = (Index("ix_loyalty_reservations_user_status", "user_id", "status"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
     order_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     points_reserved: Mapped[int] = mapped_column(Integer, nullable=False)
     discount_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)

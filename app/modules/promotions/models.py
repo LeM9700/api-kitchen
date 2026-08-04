@@ -22,7 +22,7 @@ class Promotion(Base):
     min_order_amount: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
     # --- Limites d'usage (migration 0009) ---
     max_uses: Mapped[int | None] = mapped_column(
@@ -85,7 +85,9 @@ class PromotionTargetCategory(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     promotion_id: Mapped[int] = mapped_column(ForeignKey("promotions.id", ondelete="CASCADE"), nullable=False)
-    category_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    category_id: Mapped[int] = mapped_column(
+        ForeignKey("categories.id", ondelete="CASCADE"), nullable=False
+    )
 
 
 class PromotionTargetProduct(Base):
@@ -98,7 +100,9 @@ class PromotionTargetProduct(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     promotion_id: Mapped[int] = mapped_column(ForeignKey("promotions.id", ondelete="CASCADE"), nullable=False)
-    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
 
 
 class PromoCodeUsage(Base):

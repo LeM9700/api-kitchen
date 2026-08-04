@@ -30,8 +30,10 @@ class Establishment(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Europe/Paris")
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="Europe/Paris", server_default="Europe/Paris"
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -45,9 +47,9 @@ class EmployeeProfile(Base):
     user_id: Mapped[int] = mapped_column(Integer, nullable=False)
     establishment_id: Mapped[int] = mapped_column(ForeignKey("establishments.id"), nullable=False)
     hourly_rate_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    weekly_hours_contract: Mapped[int] = mapped_column(Integer, nullable=False, default=35)
+    weekly_hours_contract: Mapped[int] = mapped_column(Integer, nullable=False, default=35, server_default="35")
     hire_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -65,8 +67,8 @@ class Shift(Base):
     establishment_id: Mapped[int] = mapped_column(ForeignKey("establishments.id"), nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    break_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled")
+    break_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled", server_default="scheduled")
     created_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -87,7 +89,7 @@ class TimeClockEntry(Base):
     clock_in_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     clock_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     method: Mapped[str] = mapped_column(String(16), nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -116,8 +118,8 @@ class HrAlert(Base):
     employee_id: Mapped[int | None] = mapped_column(ForeignKey("employee_profiles.id"), nullable=True)
     establishment_id: Mapped[int | None] = mapped_column(ForeignKey("establishments.id"), nullable=True)
     type: Mapped[str] = mapped_column(String(32), nullable=False)
-    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning")
-    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning", server_default="warning")
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default="{}")
     triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_alert_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -130,7 +132,11 @@ class EstablishmentHrConfig(Base):
     establishment_id: Mapped[int] = mapped_column(
         ForeignKey("establishments.id"), nullable=False, unique=True
     )
-    weekly_hours_legal_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=35)
-    late_tolerance_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
-    alert_cooldown_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
-    labor_cost_target_ratio: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False, default=0.30)
+    weekly_hours_legal_threshold: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=35, server_default="35"
+    )
+    late_tolerance_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=10, server_default="10")
+    alert_cooldown_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=4, server_default="4")
+    labor_cost_target_ratio: Mapped[float] = mapped_column(
+        Numeric(4, 3), nullable=False, default=0.30, server_default="0.30"
+    )

@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     Time,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,7 +33,9 @@ class TenantConfig(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     # Fermeture manuelle temporaire.
-    is_temporarily_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_temporarily_closed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     temporary_closure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     default_closure_message: Mapped[str] = mapped_column(
         Text,
@@ -42,13 +45,15 @@ class TenantConfig(Base):
     )
 
     # Calcul du temps de preparation.
-    prep_time_normal_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=25)
-    prep_time_peak_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=45)
+    prep_time_normal_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=25, server_default="25")
+    prep_time_peak_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=45, server_default="45")
     # Nombre de commandes actives declenchant le mode "heure de pointe".
-    peak_orders_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
-    auto_calc_prep_time: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    peak_orders_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    auto_calc_prep_time: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     # Overhead ajoute par commande active au-dessus du seuil de pointe.
-    overhead_per_order_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    overhead_per_order_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3, server_default="3"
+    )
 
     # Timezone configurable par tenant (IANA, ex: "Europe/Paris", "America/New_York").
     timezone: Mapped[str] = mapped_column(
@@ -83,7 +88,7 @@ class TenantConfig(Base):
         Numeric(12, 3),
         nullable=False,
         default=10,
-        server_default="10",
+        server_default=text("10"),
     )
 
     # Shared printer config consumed by admin/staff apps.
@@ -122,7 +127,7 @@ class BusinessHours(Base):
     slot_index: Mapped[int] = mapped_column(Integer, nullable=False)
     opens_at: Mapped[time] = mapped_column(Time(), nullable=False)
     closes_at: Mapped[time] = mapped_column(Time(), nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
 
 class ExceptionalClosure(Base):
@@ -138,7 +143,9 @@ class ExceptionalClosure(Base):
     closure_date: Mapped[date] = mapped_column(Date(), nullable=False, unique=True)
     custom_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Si True, on affiche le default_closure_message du TenantConfig.
-    use_default_message: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    use_default_message: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
