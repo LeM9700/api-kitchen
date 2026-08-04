@@ -36,15 +36,25 @@ def upgrade() -> None:
             schema=schema,
         )
 
-        op.add_column("orders", sa.Column("customer_name", sa.String(255), nullable=True), schema=schema)
-        op.add_column("orders", sa.Column("customer_phone", sa.String(32), nullable=True), schema=schema)
-        op.add_column(
-            "orders",
-            sa.Column("source", sa.String(16), nullable=False, server_default="customer"),
-            schema=schema,
+        # ADD COLUMN IF NOT EXISTS (au lieu de op.add_column) : les tenants crees via
+        # _TENANT_DDL_STATEMENTS (app/modules/auth/service.py) depuis l'ajout de ces
+        # colonnes au provisioning ont deja ce schema au moment de leur signup, avant
+        # meme que cette migration ne tourne sur les tenants existants. Sans le IF NOT
+        # EXISTS, la migration echoue avec DuplicateColumnError des qu'un tel tenant
+        # existe (cf. incident prod 2026-08-04).
+        bind.execute(sa.text(f"ALTER TABLE {quoted}.orders ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255)"))
+        bind.execute(sa.text(f"ALTER TABLE {quoted}.orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(32)"))
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.orders ADD COLUMN IF NOT EXISTS source VARCHAR(16) "
+                "NOT NULL DEFAULT 'customer'"
+            )
         )
-        op.add_column("orders", sa.Column("created_by_user_id", sa.Integer(), nullable=True), schema=schema)
-        op.add_column("orders", sa.Column("table_number", sa.String(32), nullable=True), schema=schema)
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.orders ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER")
+        )
+        bind.execute(sa.text(f"ALTER TABLE {quoted}.orders ADD COLUMN IF NOT EXISTS table_number VARCHAR(32)"))
+        bind.execute(sa.text(f"ALTER TABLE {quoted}.orders DROP CONSTRAINT IF EXISTS ck_orders_source_{slug}"))
         op.create_check_constraint(
             f"ck_orders_source_{slug}",
             "orders",
@@ -52,27 +62,41 @@ def upgrade() -> None:
             schema=schema,
         )
 
-        op.add_column(
-            "order_items",
-            sa.Column("preparation_status", sa.String(16), nullable=False, server_default="pending"),
-            schema=schema,
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.order_items ADD COLUMN IF NOT EXISTS preparation_status VARCHAR(16) "
+                "NOT NULL DEFAULT 'pending'"
+            )
         )
-        op.add_column(
-            "order_items",
-            sa.Column("preparation_station", sa.String(16), nullable=False, server_default="kitchen"),
-            schema=schema,
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.order_items ADD COLUMN IF NOT EXISTS preparation_station VARCHAR(16) "
+                "NOT NULL DEFAULT 'kitchen'"
+            )
         )
-        op.add_column(
-            "order_items",
-            sa.Column("prepared_at", sa.DateTime(timezone=True), nullable=True),
-            schema=schema,
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.order_items ADD COLUMN IF NOT EXISTS prepared_at TIMESTAMPTZ")
         )
-        op.add_column("order_items", sa.Column("prepared_by_user_id", sa.Integer(), nullable=True), schema=schema)
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.order_items ADD COLUMN IF NOT EXISTS prepared_by_user_id INTEGER")
+        )
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.order_items DROP CONSTRAINT IF EXISTS "
+                f"ck_order_items_preparation_status_{slug}"
+            )
+        )
         op.create_check_constraint(
             f"ck_order_items_preparation_status_{slug}",
             "order_items",
             "preparation_status IN ('pending', 'preparing', 'ready')",
             schema=schema,
+        )
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.order_items DROP CONSTRAINT IF EXISTS "
+                f"ck_order_items_preparation_station_{slug}"
+            )
         )
         op.create_check_constraint(
             f"ck_order_items_preparation_station_{slug}",
@@ -81,10 +105,17 @@ def upgrade() -> None:
             schema=schema,
         )
 
-        op.add_column(
-            "categories",
-            sa.Column("preparation_station", sa.String(16), nullable=False, server_default="kitchen"),
-            schema=schema,
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.categories ADD COLUMN IF NOT EXISTS preparation_station VARCHAR(16) "
+                "NOT NULL DEFAULT 'kitchen'"
+            )
+        )
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.categories DROP CONSTRAINT IF EXISTS "
+                f"ck_categories_preparation_station_{slug}"
+            )
         )
         op.create_check_constraint(
             f"ck_categories_preparation_station_{slug}",
@@ -92,7 +123,14 @@ def upgrade() -> None:
             "preparation_station IN ('kitchen', 'counter', 'none')",
             schema=schema,
         )
-        op.add_column("products", sa.Column("preparation_station", sa.String(16), nullable=True), schema=schema)
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.products ADD COLUMN IF NOT EXISTS preparation_station VARCHAR(16)")
+        )
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.products DROP CONSTRAINT IF EXISTS ck_products_preparation_station_{slug}"
+            )
+        )
         op.create_check_constraint(
             f"ck_products_preparation_station_{slug}",
             "products",
@@ -100,9 +138,15 @@ def upgrade() -> None:
             schema=schema,
         )
 
-        op.add_column("payments", sa.Column("external_reference", sa.String(255), nullable=True), schema=schema)
-        op.add_column("payments", sa.Column("amount_received", sa.Numeric(10, 2), nullable=True), schema=schema)
-        op.add_column("payments", sa.Column("created_by_user_id", sa.Integer(), nullable=True), schema=schema)
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.payments ADD COLUMN IF NOT EXISTS external_reference VARCHAR(255)")
+        )
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.payments ADD COLUMN IF NOT EXISTS amount_received NUMERIC(10, 2)")
+        )
+        bind.execute(
+            sa.text(f"ALTER TABLE {quoted}.payments ADD COLUMN IF NOT EXISTS created_by_user_id INTEGER")
+        )
 
         bind.execute(
             sa.text(
