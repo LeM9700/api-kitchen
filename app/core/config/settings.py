@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     arq_redis_url: str
     stripe_secret_key: str
     stripe_webhook_secret: str
+    # Secret de signature dedie aux webhooks Stripe Connect (comptes connectes, direct charges).
+    # Vide = Connect non configure — seul stripe_webhook_secret (plateforme) est tente.
+    stripe_webhook_connect_secret: str = ""
     jwt_secret: str
     # Cle dediee pour le HMAC de lookup des refresh tokens (compute_token_lookup).
     # Vide = fallback sur jwt_secret (comportement historique) — définir une valeur

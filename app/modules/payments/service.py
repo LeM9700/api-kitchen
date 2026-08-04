@@ -1,5 +1,6 @@
 import csv
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -13,8 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger(__name__)
 
 from app.core.config import settings
+from app.core.database import get_public_session
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
+from app.core.services.cache import get_cached_json, set_cached_json
 from app.modules.loyalty.account.models import LoyaltyPointReservation
 from app.modules.loyalty.account.service import confirm_checkout_reservation
 from app.modules.orders import service as orders_service
@@ -58,10 +61,60 @@ def _local_fallback_allowed() -> bool:
 def _safe_stripe_message(exc: Exception) -> str:
     user_message = getattr(exc, "user_message", None)
     message = user_message or "Stripe request failed"
-    for secret in (settings.stripe_secret_key, settings.stripe_webhook_secret):
+    for secret in (settings.stripe_secret_key, settings.stripe_webhook_secret, settings.stripe_webhook_connect_secret):
         if secret and secret in message:
             message = message.replace(secret, "[redacted]")
     return message
+
+
+def verify_stripe_webhook_event(
+    payload: bytes,
+    sig_header: str,
+    secrets: Sequence[tuple[str, str]],
+    tolerance: int = WEBHOOK_TOLERANCE_SECONDS,
+) -> stripe.Event:
+    """Vérifie un payload de webhook Stripe brut contre plusieurs secrets de signature.
+
+    Essaie chaque secret fourni, dans l'ordre, et retourne l'événement dès que l'un
+    d'eux valide la signature HMAC. Permet à un seul endpoint webhook d'accepter des
+    événements provenant à la fois du compte plateforme et des comptes connectés
+    (Stripe Connect, direct charges), chacun signé avec son propre secret. La
+    vérification cryptographique (``stripe.Webhook.construct_event``) a toujours lieu
+    avant tout accès aux champs métier de l'événement — l'appelant ne doit parser le
+    corps de la requête qu'après un retour réussi de cette fonction.
+
+    Args:
+        payload: Corps brut de la requête, tel que reçu (non parsé).
+        sig_header: Valeur du header ``Stripe-Signature``.
+        secrets: Paires ``(catégorie, secret)`` ordonnées à essayer, par exemple
+            ``[("platform", settings.stripe_webhook_secret), ("connect", settings.stripe_webhook_connect_secret)]``.
+            Les entrées dont le secret est vide/absent sont ignorées (ex. Connect
+            non configuré pour ce déploiement).
+        tolerance: Décalage d'horloge maximal toléré (secondes), transmis à
+            ``stripe.Webhook.construct_event``.
+
+    Returns:
+        L'``stripe.Event`` vérifié, produit par le secret qui a validé la signature.
+
+    Raises:
+        stripe.error.SignatureVerificationError: Si aucun secret utilisable ne
+            valide la signature (y compris si aucun secret n'est configuré).
+    """
+    usable_secrets = [(category, secret) for category, secret in secrets if secret]
+    last_error: stripe.error.SignatureVerificationError | None = None
+
+    for category, secret in usable_secrets:
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, secret, tolerance=tolerance)
+        except stripe.error.SignatureVerificationError as exc:
+            last_error = exc
+            continue
+        logger.info("Stripe webhook signature verified using %s secret", category)
+        return event
+
+    raise last_error or stripe.error.SignatureVerificationError(
+        "No webhook secret configured to verify this signature", sig_header
+    )
 
 
 def _payment_out(payment: Payment, receipt_url: str | None = None) -> PaymentOut:
@@ -930,26 +983,87 @@ async def _auto_confirm_loyalty_reservation(
         )
 
 
-async def extract_tenant_slug_from_event(event: dict) -> str:
-    """Extrait le tenant_slug depuis les métadonnées d'un event Stripe.
+async def _resolve_tenant_slug_by_stripe_account(
+    account_id: str,
+    arq_pool: Any | None = None,
+) -> str | None:
+    """Résout un tenant_slug depuis un id de compte Stripe Connect.
 
-    Pour les PaymentIntent events (payment_intent.*), les métadonnées sont dans
-    ``data.object.metadata``. Pour les Charge et Dispute events (charge.*), la
-    fonction récupère le PaymentIntent associé via l'API Stripe pour obtenir les
-    métadonnées d'origine.
+    Interroge ``public.tenant_configs.stripe_account_id`` — le mapping compte
+    connecté -> tenant ne change qu'à l'onboarding Connect, donc il est mis en
+    cache 5 minutes via ``app.core.services.cache`` (même convention que les
+    autres lectures tenant à faible fréquence de changement).
+
+    Args:
+        account_id: Identifiant du compte Stripe connecté (acct_xxx), tel que
+            porté par ``event["account"]``.
+        arq_pool: Pool Redis partagé (``app.state.arq_pool``). Si ``None``,
+            la résolution saute le cache et interroge directement la base.
+
+    Returns:
+        Le slug du tenant si un ``tenant_configs`` correspond, sinon ``None``.
+    """
+    cache_key = f"stripe_connect_tenant:{account_id}"
+    if arq_pool is not None:
+        cached = await get_cached_json(arq_pool, cache_key)
+        if cached:
+            return cached
+
+    async with get_public_session() as session:
+        row = await session.execute(
+            text(
+                "SELECT t.slug FROM public.tenant_configs tc "
+                "JOIN public.tenants t ON t.id = tc.tenant_id "
+                "WHERE tc.stripe_account_id = :account_id"
+            ),
+            {"account_id": account_id},
+        )
+        tenant_slug = row.scalar_one_or_none()
+
+    if tenant_slug and arq_pool is not None:
+        await set_cached_json(arq_pool, cache_key, tenant_slug, ttl_seconds=300)
+    return tenant_slug
+
+
+async def extract_tenant_slug_from_event(event: dict, arq_pool: Any | None = None) -> str:
+    """Résout le tenant_slug d'un event Stripe webhook, par fiabilité décroissante.
+
+    En direct charge, les objets ``payment_intent``/``charge``/``dispute`` sont
+    créés sur le compte Stripe connecté (voir ``StripeContext.options`` dans ce
+    module) — ils n'existent donc pas dans le contexte plateforme, et un
+    ``stripe.PaymentIntent.retrieve`` sans ``stripe_account`` échoue toujours
+    pour eux. La stratégie ci-dessous compense ça avec 3 sources, dans l'ordre :
+
+    1. ``event["account"]`` : lookup direct via ``tenant_configs.stripe_account_id``
+       (caché). Seule source qui ne dépend d'aucune métadonnée posée à la
+       création du PaymentIntent — fonctionne même pour les events ``charge.*``
+       qui ne portent pas de metadata propre.
+    2. ``data.object.metadata.tenant_slug`` : présent sur les events
+       ``payment_intent.*`` (posé explicitement dans ``create_intent``).
+    3. ``stripe.PaymentIntent.retrieve(pi_id, stripe_account=...)`` : dernier
+       recours pour ``charge.*``/``dispute.*`` sans metadata et sans champ
+       ``account`` exploitable (ex. event émis côté plateforme).
 
     Args:
         event: Payload Stripe complet (event dict).
+        arq_pool: Pool Redis partagé (``app.state.arq_pool``), optionnel.
 
     Returns:
-        Le slug du tenant extrait des métadonnées.
+        Le slug du tenant résolu.
 
     Raises:
-        AppError: WEBHOOK_TENANT_REQUIRED si le tenant_slug est introuvable.
+        AppError: WEBHOOK_TENANT_REQUIRED si aucune des 3 stratégies n'aboutit.
     """
     data = event.get("data", {}).get("object", {})
-    metadata = data.get("metadata") or {}
-    tenant_slug = metadata.get("tenant_slug")
+    account_id: str | None = event.get("account")
+    tenant_slug: str | None = None
+
+    if account_id:
+        tenant_slug = await _resolve_tenant_slug_by_stripe_account(account_id, arq_pool)
+
+    if not tenant_slug:
+        metadata = data.get("metadata") or {}
+        tenant_slug = metadata.get("tenant_slug")
 
     if not tenant_slug:
         # Pour charge.* et charge.dispute.*, récupérer les métadonnées depuis le PaymentIntent.
@@ -957,12 +1071,20 @@ async def extract_tenant_slug_from_event(event: dict) -> str:
         if pi_id and not str(pi_id).startswith("local_"):
             try:
                 pi = await anyio.to_thread.run_sync(
-                    lambda: stripe.PaymentIntent.retrieve(pi_id)
+                    lambda: stripe.PaymentIntent.retrieve(
+                        pi_id,
+                        **({"stripe_account": account_id} if account_id else {}),
+                    )
                 )
                 pi_metadata = pi.get("metadata") if isinstance(pi, dict) else getattr(pi, "metadata", None)
                 tenant_slug = (pi_metadata or {}).get("tenant_slug")
             except Exception as exc:
-                logger.warning("Failed to retrieve PI metadata for tenant resolution: pi=%s error=%s", pi_id, exc)
+                logger.error(
+                    "Failed to retrieve PI metadata for tenant resolution: pi=%s account=%s error=%s",
+                    pi_id,
+                    account_id,
+                    exc,
+                )
 
     if not tenant_slug:
         raise AppError("WEBHOOK_TENANT_REQUIRED", "Missing tenant metadata", 400, "tenant_slug")

@@ -50,6 +50,13 @@ API (webhook manqué — Stripe down, erreur 500 transitoire, etc.).
 4. Si le rejeu ne suffit pas (ex. commande déjà annulée entre-temps) : vérifier manuellement l'état
    dans `payments`/`orders` et corriger via l'admin (remboursement, statut) plutôt que de forcer un
    rejeu qui ne changera rien à un état déjà divergent.
+5. **Deux origines, deux secrets** : l'endpoint `/api/v1/payments/webhook` accepte à la fois les
+   events du compte plateforme (`STRIPE_WEBHOOK_SECRET`) et les events des comptes connectés Stripe
+   Connect / direct charges (`STRIPE_WEBHOOK_CONNECT_SECRET`) — voir
+   `service.verify_stripe_webhook_event`. Si un 400 `Invalid Stripe signature` apparaît uniquement
+   pour les events Connect, vérifier que `STRIPE_WEBHOOK_CONNECT_SECRET` est bien défini sur Railway
+   et correspond au signing secret de l'endpoint webhook Connect du Dashboard Stripe (distinct de
+   celui de l'endpoint plateforme, même si les deux endpoints pointent vers la même URL).
 
 ---
 

@@ -1,3 +1,7 @@
+import contextlib
+import hashlib
+import hmac
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.core.config import settings
 from app.core.http.errors import AppError
 from app.modules.orders.models import Order
+from app.modules.payments import router as payments_router
 from app.modules.payments import service
 from app.modules.payments.models import Payment
 
@@ -18,6 +23,49 @@ class _ScalarOneResult:
 
     def scalar_one_or_none(self):
         return self.value
+
+
+class _FakePublicSession:
+    """Simule get_public_session() pour tester _resolve_tenant_slug_by_stripe_account
+    sans base de donnees reelle."""
+
+    def __init__(self, tenant_slug):
+        self.tenant_slug = tenant_slug
+        self.execute_calls = 0
+
+    async def execute(self, *args, **kwargs):
+        self.execute_calls += 1
+        return _ScalarOneResult(self.tenant_slug)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _patch_public_session(monkeypatch, tenant_slug):
+    fake_session = _FakePublicSession(tenant_slug)
+
+    @contextlib.asynccontextmanager
+    async def fake_get_public_session():
+        yield fake_session
+
+    monkeypatch.setattr(service, "get_public_session", fake_get_public_session)
+    return fake_session
+
+
+class _FakeRedis:
+    """Simule l'interface get/setex utilisee par app.core.services.cache."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def setex(self, key, ttl, value):
+        self.store[key] = value
 
 
 async def test_create_payment_intent_requires_auth(client):
@@ -63,6 +111,108 @@ async def test_webhook_invalid_signature_returns_400(client):
     assert response.status_code == 400
 
 
+def _stripe_signed_header(payload: bytes, secret: str, timestamp: int | None = None) -> str:
+    """Construit un header ``Stripe-Signature`` valide (memes calculs que WebhookSignature)."""
+    timestamp = timestamp if timestamp is not None else int(time.time())
+    signed_payload = f"{timestamp}.{payload.decode('utf-8')}"
+    signature = hmac.new(secret.encode("utf-8"), signed_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"t={timestamp},v1={signature}"
+
+
+_PLATFORM_SECRET = "whsec_platform_test"
+_CONNECT_SECRET = "whsec_connect_test"
+_MULTI_SECRETS = [("platform", _PLATFORM_SECRET), ("connect", _CONNECT_SECRET)]
+
+
+def test_verify_stripe_webhook_event_valid_platform_secret():
+    payload = b'{"id": "evt_platform", "object": "event", "type": "payment_intent.succeeded", "data": {"object": {}}}'
+    header = _stripe_signed_header(payload, _PLATFORM_SECRET)
+
+    event = service.verify_stripe_webhook_event(payload, header, secrets=_MULTI_SECRETS)
+
+    assert event["id"] == "evt_platform"
+
+
+def test_verify_stripe_webhook_event_valid_connect_secret():
+    payload = b'{"id": "evt_connect", "object": "event", "type": "payment_intent.succeeded", "data": {"object": {}}}'
+    header = _stripe_signed_header(payload, _CONNECT_SECRET)
+
+    event = service.verify_stripe_webhook_event(payload, header, secrets=_MULTI_SECRETS)
+
+    assert event["id"] == "evt_connect"
+
+
+def test_verify_stripe_webhook_event_invalid_signature_with_both_secrets_raises():
+    payload = b'{"id": "evt_forged", "object": "event", "type": "payment_intent.succeeded", "data": {"object": {}}}'
+    header = _stripe_signed_header(payload, "whsec_attacker_forged")
+
+    with pytest.raises(stripe.error.SignatureVerificationError):
+        service.verify_stripe_webhook_event(payload, header, secrets=_MULTI_SECRETS)
+
+
+def test_verify_stripe_webhook_event_logs_category_never_secret_value(caplog):
+    payload = b'{"id": "evt_log", "object": "event", "type": "payment_intent.succeeded", "data": {"object": {}}}'
+    header = _stripe_signed_header(payload, _CONNECT_SECRET)
+
+    with caplog.at_level("INFO", logger="app.modules.payments.service"):
+        service.verify_stripe_webhook_event(payload, header, secrets=_MULTI_SECRETS)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("connect" in message for message in messages)
+    assert all(_CONNECT_SECRET not in message for message in messages)
+    assert all(_PLATFORM_SECRET not in message for message in messages)
+
+
+def test_verify_stripe_webhook_event_failure_is_explicit_and_stable():
+    payload = b'{"id": "evt_stable", "object": "event", "type": "payment_intent.succeeded", "data": {"object": {}}}'
+    header = _stripe_signed_header(payload, "whsec_attacker_forged")
+
+    with pytest.raises(stripe.error.SignatureVerificationError) as first:
+        service.verify_stripe_webhook_event(payload, header, secrets=_MULTI_SECRETS)
+    with pytest.raises(stripe.error.SignatureVerificationError) as second:
+        service.verify_stripe_webhook_event(payload, header, secrets=_MULTI_SECRETS)
+
+    assert str(first.value) == str(second.value)
+    assert _PLATFORM_SECRET not in str(first.value)
+    assert _CONNECT_SECRET not in str(first.value)
+
+
+async def test_webhook_route_accepts_connect_secret_signature(client, monkeypatch):
+    """Le endpoint HTTP /webhook accepte une signature valide avec le secret Connect.
+
+    Isole de la DB reelle (get_tenant_session/extract_tenant_slug_from_event/handle_webhook
+    mockes) : verifie uniquement le wiring router -> verify_stripe_webhook_event, pas la
+    logique metier deja couverte par test_webhook_duplicate_event_no_double_finalize.
+    """
+    connect_secret = "whsec_connect_router_test"
+    monkeypatch.setattr(service.settings, "stripe_webhook_connect_secret", connect_secret)
+
+    payload = (
+        b'{"id": "evt_router_connect", "object": "event", '
+        b'"type": "payment_intent.succeeded", "data": {"object": {}}}'
+    )
+    header = _stripe_signed_header(payload, connect_secret)
+
+    handle_webhook_mock = AsyncMock()
+    monkeypatch.setattr(service, "handle_webhook", handle_webhook_mock)
+    monkeypatch.setattr(service, "extract_tenant_slug_from_event", AsyncMock(return_value="default"))
+
+    @contextlib.asynccontextmanager
+    async def fake_get_tenant_session(tenant_slug):
+        yield None
+
+    monkeypatch.setattr(payments_router, "get_tenant_session", fake_get_tenant_session)
+
+    response = await client.post(
+        "/api/v1/payments/webhook",
+        content=payload,
+        headers={"Content-Type": "application/json", "stripe-signature": header},
+    )
+
+    assert response.status_code == 204
+    handle_webhook_mock.assert_awaited_once()
+
+
 async def test_extract_tenant_slug_from_event_requires_metadata():
     with pytest.raises(AppError) as exc:
         await service.extract_tenant_slug_from_event({"data": {"object": {"metadata": {}}}})
@@ -82,6 +232,88 @@ async def test_extract_tenant_slug_from_event_reads_payment_intent_metadata():
         }
     }
     assert await service.extract_tenant_slug_from_event(event) == "pizza-test"
+
+
+async def test_extract_tenant_slug_from_event_resolves_via_account_field(monkeypatch):
+    """En direct charge, charge.dispute.created ne porte aucune metadata propre --
+    seul event["account"] permet de router l'event vers le bon tenant."""
+    fake_session = _patch_public_session(monkeypatch, "pizza-test")
+
+    event = {
+        "type": "charge.dispute.created",
+        "account": "acct_123",
+        "data": {
+            "object": {
+                "id": "dp_1",
+                "payment_intent": "pi_1",
+                "amount": 500,
+                "currency": "eur",
+                "reason": "fraudulent",
+            }
+        },
+    }
+    assert await service.extract_tenant_slug_from_event(event) == "pizza-test"
+    assert fake_session.execute_calls == 1
+
+
+async def test_extract_tenant_slug_from_event_account_field_takes_priority_over_metadata(monkeypatch):
+    _patch_public_session(monkeypatch, "account-tenant")
+
+    event = {
+        "account": "acct_123",
+        "data": {"object": {"metadata": {"tenant_slug": "metadata-tenant"}}},
+    }
+    assert await service.extract_tenant_slug_from_event(event) == "account-tenant"
+
+
+async def test_extract_tenant_slug_from_event_caches_account_resolution(monkeypatch):
+    fake_session = _patch_public_session(monkeypatch, "pizza-test")
+    fake_redis = _FakeRedis()
+
+    event = {"account": "acct_123", "data": {"object": {"metadata": {}}}}
+    assert await service.extract_tenant_slug_from_event(event, arq_pool=fake_redis) == "pizza-test"
+    assert await service.extract_tenant_slug_from_event(event, arq_pool=fake_redis) == "pizza-test"
+    assert fake_session.execute_calls == 1  # 2e appel servi depuis le cache Redis
+
+
+async def test_extract_tenant_slug_from_event_falls_back_to_retrieve_with_stripe_account(monkeypatch):
+    """Sans account resolvable ni metadata, le fallback retrieve doit propager
+    stripe_account -- sinon il interroge le compte plateforme et echoue toujours
+    pour un PaymentIntent cree en direct charge."""
+    _patch_public_session(monkeypatch, None)
+    retrieve_calls = {}
+
+    def fake_retrieve(pi_id, **kwargs):
+        retrieve_calls["pi_id"] = pi_id
+        retrieve_calls["kwargs"] = kwargs
+        return {"metadata": {"tenant_slug": "pizza-test"}}
+
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", fake_retrieve)
+
+    event = {
+        "type": "charge.refunded",
+        "account": "acct_123",
+        "data": {"object": {"id": "ch_1", "payment_intent": "pi_1", "metadata": {}}},
+    }
+    assert await service.extract_tenant_slug_from_event(event) == "pizza-test"
+    assert retrieve_calls["kwargs"] == {"stripe_account": "acct_123"}
+
+
+async def test_extract_tenant_slug_from_event_logs_error_on_retrieve_failure(monkeypatch, caplog):
+    def fake_retrieve(pi_id, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", fake_retrieve)
+
+    event = {
+        "type": "charge.refunded",
+        "data": {"object": {"id": "ch_1", "payment_intent": "pi_1", "metadata": {}}},
+    }
+    with caplog.at_level("ERROR", logger="app.modules.payments.service"):
+        with pytest.raises(AppError) as exc:
+            await service.extract_tenant_slug_from_event(event)
+    assert exc.value.code == "WEBHOOK_TENANT_REQUIRED"
+    assert any(record.levelname == "ERROR" for record in caplog.records)
 
 
 def test_local_fallback_disabled_in_production(monkeypatch):

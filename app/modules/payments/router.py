@@ -89,9 +89,10 @@ async def confirm_local_test_payment(
 async def webhook(request: Request):
     """Handle incoming Stripe webhook events.
 
-    Verifies the Stripe signature via ``stripe.Webhook.construct_event`` before
-    processing any event. The raw body must be read before any JSON parsing so
-    the HMAC digest matches the original bytes.
+    Verifies the Stripe signature via ``service.verify_stripe_webhook_event`` before
+    processing any event, trying the platform secret then the Connect secret (direct
+    charges on connected accounts have their own signing secret). The raw body must
+    be read before any JSON parsing so the HMAC digest matches the original bytes.
 
     Args:
         request: Raw FastAPI request object.
@@ -106,17 +107,20 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail="Missing stripe-signature header")
 
     try:
-        event = stripe.Webhook.construct_event(
+        event = service.verify_stripe_webhook_event(
             raw_body,
             sig_header,
-            settings.stripe_webhook_secret,
-            tolerance=service.WEBHOOK_TOLERANCE_SECONDS,
+            secrets=[
+                ("platform", settings.stripe_webhook_secret),
+                ("connect", settings.stripe_webhook_connect_secret),
+            ],
         )
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
 
+    arq_pool = getattr(request.app.state, "arq_pool", None)
     try:
-        tenant_slug = await service.extract_tenant_slug_from_event(event)
+        tenant_slug = await service.extract_tenant_slug_from_event(event, arq_pool=arq_pool)
     except Exception:
         raise HTTPException(status_code=400, detail="Missing tenant metadata")
 
