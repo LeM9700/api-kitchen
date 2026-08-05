@@ -23,27 +23,33 @@ def upgrade() -> None:
     bind = op.get_bind()
     for slug in _get_tenant_slugs(bind):
         schema = f"tenant_{slug}"
+        quoted = f'"{schema}"'
 
-        op.create_table(
-            "restaurant_delivery_settings",
-            sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-            sa.Column("restaurant_lat", sa.Float(), nullable=True),
-            sa.Column("restaurant_lng", sa.Float(), nullable=True),
-            sa.Column("display_address", sa.Text(), nullable=True),
-            sa.Column("independent_enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
-            sa.Column("internal_enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
-            sa.Column("pickup_enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
-            sa.Column("internal_delivery_fee", sa.Numeric(10, 2), nullable=True),
-            sa.Column("internal_delivery_minutes", sa.Integer(), nullable=True),
-            sa.Column("internal_max_eta_minutes", sa.Integer(), nullable=True),
-            sa.Column("restaurant_share_giveaway_points", sa.Integer(), nullable=False, server_default="0"),
-            sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
-            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
-            sa.CheckConstraint(
-                "restaurant_share_giveaway_points IN (0, 5, 10, 15)",
-                name="ck_restaurant_delivery_settings_share_giveaway_points",
-            ),
-            schema=schema,
+        # CREATE TABLE IF NOT EXISTS : cf. 0035, un tenant peut deja avoir cette
+        # table si son schema a ete provisionne apres coup avec un DDL plus recent
+        # que la derniere fois que cette migration a tourne sur les tenants existants.
+        bind.execute(
+            sa.text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {quoted}.restaurant_delivery_settings (
+                    id SERIAL PRIMARY KEY,
+                    restaurant_lat DOUBLE PRECISION,
+                    restaurant_lng DOUBLE PRECISION,
+                    display_address TEXT,
+                    independent_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    internal_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    pickup_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    internal_delivery_fee NUMERIC(10, 2),
+                    internal_delivery_minutes INTEGER,
+                    internal_max_eta_minutes INTEGER,
+                    restaurant_share_giveaway_points INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT ck_restaurant_delivery_settings_share_giveaway_points
+                        CHECK (restaurant_share_giveaway_points IN (0, 5, 10, 15))
+                )
+                """
+            )
         )
 
 

@@ -23,10 +23,12 @@ def upgrade() -> None:
     bind = op.get_bind()
     for slug in _get_tenant_slugs(bind):
         schema = f"tenant_{slug}"
-        op.add_column(
-            "products",
-            sa.Column("is_delivery_prohibited", sa.Boolean(), nullable=False, server_default=sa.false()),
-            schema=schema,
+        quoted = f'"{schema}"'
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE {quoted}.products ADD COLUMN IF NOT EXISTS "
+                "is_delivery_prohibited BOOLEAN NOT NULL DEFAULT FALSE"
+            )
         )
 
 

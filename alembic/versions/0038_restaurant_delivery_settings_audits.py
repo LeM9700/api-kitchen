@@ -23,25 +23,30 @@ def upgrade() -> None:
     bind = op.get_bind()
     for slug in _get_tenant_slugs(bind):
         schema = f"tenant_{slug}"
+        quoted = f'"{schema}"'
 
-        op.create_table(
-            "restaurant_delivery_settings_audits",
-            sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-            sa.Column("changed_by_user_id", sa.Integer(), nullable=False),
-            sa.Column("user_email", sa.String(255), nullable=True),
-            sa.Column("changed_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
-            sa.Column("field_name", sa.String(255), nullable=False),
-            sa.Column("old_value", sa.Text(), nullable=True),
-            sa.Column("new_value", sa.Text(), nullable=True),
-            sa.Column("ip_address", sa.String(45), nullable=True),
-            sa.Column("user_agent", sa.Text(), nullable=True),
-            schema=schema,
+        bind.execute(
+            sa.text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {quoted}.restaurant_delivery_settings_audits (
+                    id SERIAL PRIMARY KEY,
+                    changed_by_user_id INTEGER NOT NULL,
+                    user_email VARCHAR(255),
+                    changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    field_name VARCHAR(255) NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    ip_address VARCHAR(45),
+                    user_agent TEXT
+                )
+                """
+            )
         )
-        op.create_index(
-            "ix_restaurant_delivery_settings_audits_changed_at",
-            "restaurant_delivery_settings_audits",
-            ["changed_at"],
-            schema=schema,
+        bind.execute(
+            sa.text(
+                f"CREATE INDEX IF NOT EXISTS ix_restaurant_delivery_settings_audits_changed_at "
+                f"ON {quoted}.restaurant_delivery_settings_audits (changed_at)"
+            )
         )
 
 
