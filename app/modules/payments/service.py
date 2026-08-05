@@ -117,6 +117,22 @@ def verify_stripe_webhook_event(
     )
 
 
+def warn_if_webhook_connect_secret_missing() -> None:
+    """Log un warning si ``STRIPE_WEBHOOK_CONNECT_SECRET`` est absent en production.
+
+    Appelé au démarrage de l'application (voir ``app/main.py::lifespan``). Ne bloque
+    pas le démarrage : les events plateforme continuent de fonctionner sans le
+    secret Connect, mais les events Stripe Connect (comptes connectés) seront
+    rejetés en 400 tant que la variable n'est pas configurée.
+    """
+    is_production = (settings.environment or "").lower() in {"production", "prod"}
+    if is_production and not settings.stripe_webhook_connect_secret:
+        logger.warning(
+            "STRIPE_WEBHOOK_CONNECT_SECRET is not configured — Stripe Connect webhook "
+            "events (connected accounts) will fail signature verification and be rejected with 400."
+        )
+
+
 def _payment_out(payment: Payment, receipt_url: str | None = None) -> PaymentOut:
     return PaymentOut(
         id=payment.id,

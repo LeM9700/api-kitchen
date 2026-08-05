@@ -213,6 +213,36 @@ async def test_webhook_route_accepts_connect_secret_signature(client, monkeypatc
     handle_webhook_mock.assert_awaited_once()
 
 
+def test_warn_if_webhook_connect_secret_missing_logs_in_production(monkeypatch, caplog):
+    monkeypatch.setattr(service.settings, "environment", "production")
+    monkeypatch.setattr(service.settings, "stripe_webhook_connect_secret", "")
+
+    with caplog.at_level("WARNING", logger="app.modules.payments.service"):
+        service.warn_if_webhook_connect_secret_missing()
+
+    assert any("STRIPE_WEBHOOK_CONNECT_SECRET" in record.getMessage() for record in caplog.records)
+
+
+def test_warn_if_webhook_connect_secret_missing_silent_when_configured(monkeypatch, caplog):
+    monkeypatch.setattr(service.settings, "environment", "production")
+    monkeypatch.setattr(service.settings, "stripe_webhook_connect_secret", "whsec_connect_configured")
+
+    with caplog.at_level("WARNING", logger="app.modules.payments.service"):
+        service.warn_if_webhook_connect_secret_missing()
+
+    assert not caplog.records
+
+
+def test_warn_if_webhook_connect_secret_missing_silent_outside_production(monkeypatch, caplog):
+    monkeypatch.setattr(service.settings, "environment", "local")
+    monkeypatch.setattr(service.settings, "stripe_webhook_connect_secret", "")
+
+    with caplog.at_level("WARNING", logger="app.modules.payments.service"):
+        service.warn_if_webhook_connect_secret_missing()
+
+    assert not caplog.records
+
+
 async def test_extract_tenant_slug_from_event_requires_metadata():
     with pytest.raises(AppError) as exc:
         await service.extract_tenant_slug_from_event({"data": {"object": {"metadata": {}}}})

@@ -23,6 +23,7 @@ from app.core.http.limiter import limiter
 from app.core.http.logging_config import configure_logging, set_request_id
 from app.core.http.security_headers import SecurityHeadersMiddleware
 from app.core.tenancy.tenant import TenantMiddleware
+from app.modules.payments import service as payments_service
 from worker.main import get_redis_settings
 
 configure_logging()
@@ -78,6 +79,7 @@ async def lifespan(app: FastAPI):
         Controle a l'application durant sa duree de vie.
     """
     # --- startup ---
+    payments_service.warn_if_webhook_connect_secret_missing()
     init_cloudinary(settings)
     app.state.motor_client = AsyncIOMotorClient(settings.mongo_url)
     app.state.arq_pool = await create_pool(get_redis_settings())
