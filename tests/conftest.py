@@ -10,7 +10,7 @@ Strategie d'isolation DB :
     [PROD] Ce pattern ne fonctionne qu'avec PostgreSQL (SAVEPOINT) et asyncpg.
 """
 
-import asyncio
+import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -19,18 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.core.config import settings
 from app.main import app
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Boucle asyncio partagee sur toute la session de test.
-
-    Necessaire pour que les fixtures de scope ``session`` (``db_engine``) et
-    les fixtures de scope ``function`` (``db_session``) partagent la meme boucle.
-    """
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session")
@@ -103,3 +91,15 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as test_client:
         yield test_client
+
+
+@pytest.fixture
+def unique_slug() -> str:
+    """Suffixe court unique par test, pour les tenants crees via ``client``.
+
+    ``client`` commit reellement en base (pas de rollback) : un tenant_slug/email
+    fixe reste enregistre entre deux executions locales de la suite contre le
+    meme conteneur Postgres persistant, ce qui casse l'idempotence des tests
+    (409 sur re-inscription, schema tenant fige avant une migration recente).
+    """
+    return uuid.uuid4().hex[:8]
