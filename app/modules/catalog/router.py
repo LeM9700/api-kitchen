@@ -3,6 +3,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_arq_pool, get_pagination, require_permission, require_role
+from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
@@ -44,6 +45,13 @@ def _user_id(current_user: dict) -> int | None:
     return int(value) if value is not None else None
 
 
+def _tenant_slug_from_header(request: Request) -> str:
+    slug = request.headers.get("X-Tenant-Slug")
+    if not slug:
+        raise AppError("MISSING_TENANT_SLUG", "X-Tenant-Slug header is required", 400)
+    return slug
+
+
 # ---------------------------------------------------------------------------
 # Categories
 # ---------------------------------------------------------------------------
@@ -55,7 +63,7 @@ async def categories(
     request: Request,
     pagination: PaginationParams = Depends(get_pagination),
 ):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         items, total = await service.list_categories(session, pagination)
     return CatalogPaginatedResponse.build(items, total, pagination)
@@ -89,7 +97,7 @@ async def update_category(
 @router.get("/categories/{category_id}/products", response_model=list[ProductSummaryOut])
 @limiter.limit("60/minute")
 async def products_by_category(request: Request, category_id: int):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         items = await service.list_products_by_category(session, category_id)
         return await service.build_product_summaries(session, items, include_availability=True)
@@ -116,7 +124,7 @@ async def products(
     allergen_free: bool = Query(False, description="Ne retourner que les produits sans allergene declare"),
     redis=Depends(get_arq_pool),
 ):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     effective_allergen = allergen_slug or allergen
     effective_dietary = dietary_tag_slug or dietary_tag
     is_default_listing = not (
@@ -171,7 +179,7 @@ async def product_suggestions(
     q: str = Query(..., min_length=2, max_length=100),
     limit: int = Query(8, ge=1, le=20),
 ):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         return await service.suggest_products(session, q, limit)
 
@@ -182,7 +190,7 @@ async def featured_products(
     request: Request,
     limit: int = Query(10, ge=1, le=50),
 ):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         items = await service.list_featured_products(session, limit=limit)
         return await service.build_product_summaries(session, items, include_availability=True)
@@ -191,7 +199,7 @@ async def featured_products(
 @router.get("/products/{product_id}", response_model=ProductDetailOut)
 @limiter.limit("60/minute")
 async def product_detail(request: Request, product_id: int):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         return await service.get_product_detail(session, product_id)
 
@@ -398,7 +406,7 @@ async def extras(
     request: Request,
     pagination: PaginationParams = Depends(get_pagination),
 ):
-    slug = request.headers.get("X-Tenant-Slug", "default")
+    slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         items, total = await service.list_extras(session, pagination)
     return CatalogPaginatedResponse.build(items, total, pagination)

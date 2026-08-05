@@ -77,6 +77,13 @@ async def test_create_product_requires_admin(client):
     assert response.status_code == 401
 
 
+async def test_featured_products_requires_tenant_header(client):
+    response = await client.get("/api/v1/catalog/products/featured")
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "MISSING_TENANT_SLUG"
+
+
 def test_catalog_paginated_response_exposes_total_count():
     from app.core.http.schemas import PaginationParams
     from app.modules.catalog.schemas import CatalogPaginatedResponse
