@@ -1,6 +1,7 @@
 import logging
 import csv
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from io import StringIO
 
 from arq import ArqRedis
@@ -25,15 +26,61 @@ from app.modules.stock.service import deduct_for_order, restore_for_order
 
 logger = logging.getLogger(__name__)
 
+
+class TransitionAuthority(str, Enum):
+    """Authority that requested an order status transition.
+
+    Attributes:
+        INTERNAL: The transition was requested through this system's own
+            staff-facing tooling (e.g. the admin/kitchen PATCH endpoint).
+            Internal transitions are validated strictly against
+            VALID_TRANSITIONS: anything outside the graph is rejected with a
+            422 INVALID_STATUS_TRANSITION error, exactly as before this
+            authority concept existed. This is the default, so every
+            existing caller keeps its current behavior unchanged.
+        EXTERNAL: The transition was imposed by a third-party system (e.g. a
+            POS) that owns its own state machine, which may not match
+            VALID_TRANSITIONS. External transitions are always applied and
+            persisted; when one falls outside VALID_TRANSITIONS it is never
+            rejected, but it is logged as a warning and counted via
+            ``external_out_of_graph_transitions_total`` so the discrepancy
+            stays observable instead of silently accepted.
+    """
+
+    INTERNAL = "internal"
+    EXTERNAL = "external"
+
+
+class _MetricCounter:
+    """Minimal in-process counter.
+
+    This project has no metrics backend wired in yet (no prometheus_client
+    dependency, no equivalent). This is the simplest primitive that lets
+    callers observe/increment a dedicated counter and lets tests assert on
+    it, without introducing a new third-party dependency for a single
+    counter. Swap for a real metrics client if one is added to the project.
+    """
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def increment(self) -> None:
+        self.value += 1
+
+
+external_out_of_graph_transitions_total = _MetricCounter()
+
 VALID_TRANSITIONS = {
-    "pending": {"confirmed", "cancelled"},
+    "pending": {"confirmed", "cancelled", "rejected"},
     "confirmed": {"preparing", "cancelled"},
     "queued": {"confirmed", "cancelled"},
     "preparing": {"ready", "cancelled"},
     "ready": {"out_for_delivery", "delivered"},
-    "out_for_delivery": {"delivered", "cancelled"},
+    "out_for_delivery": {"delivered", "cancelled", "delivery_failed"},
     "delivered": set(),
     "cancelled": set(),
+    "rejected": set(),
+    "delivery_failed": set(),
 }
 NON_DELIVERY_ORDER_TYPES = {"pickup", "dine_in"}
 ACTIVE_PREPARATION_ORDER_STATUSES = {"pending", "confirmed", "queued", "preparing", "ready", "out_for_delivery"}
@@ -164,6 +211,7 @@ async def _serialize_order_detail(session: AsyncSession, order: Order) -> dict:
                 {
                     "status": history.status,
                     "note": history.note,
+                    "authority": getattr(history, "authority", None) or "internal",
                     "created_at": history.created_at,
                 }
                 for history in history_result.scalars()
@@ -941,6 +989,7 @@ async def update_status(
     arq_pool: ArqRedis | None = None,
     actor_user_id: int | None = None,
     is_staff: bool = True,
+    authority: TransitionAuthority = TransitionAuthority.INTERNAL,
 ) -> Order:
     """Met a jour le statut d'une commande avec notifications temps reel.
 
@@ -957,17 +1006,22 @@ async def update_status(
         session: Session SQLAlchemy async. Le caller NE DOIT PAS commit avant le
             retour de cette fonction.
         order_id: Cle primaire de la commande a mettre a jour.
-        status: Statut cible. Doit etre une transition valide depuis le statut actuel.
+        status: Statut cible. Avec authority=INTERNAL, doit etre une transition
+            valide depuis le statut actuel. Avec authority=EXTERNAL, toute
+            valeur est appliquee (voir TransitionAuthority).
         note: Note humaine optionnelle ajoutee a l'entree d'historique de statut.
         tenant_slug: Identifiant tenant requis quand status == "confirmed" ou "cancelled".
         arq_pool: Pool arq singleton injecte depuis le lifespan.
+        authority: Qui impose la transition (INTERNAL par defaut). Voir
+            TransitionAuthority pour la semantique complete.
 
     Returns:
         Instance Order rafraichie apres commit.
 
     Raises:
         AppError: ORDER_NOT_FOUND (404) si la commande n'existe pas.
-        AppError: INVALID_STATUS_TRANSITION (422) si la transition n'est pas autorisee.
+        AppError: INVALID_STATUS_TRANSITION (422) si authority=INTERNAL et la
+            transition n'est pas autorisee par VALID_TRANSITIONS.
         AppError: INSUFFICIENT_STOCK (409) si confirmation et stock insuffisant.
     """
     order = await session.get(Order, order_id)
@@ -980,8 +1034,22 @@ async def update_status(
         raise AppError("PAYMENT_REQUIRED", "Order must be paid before confirmation", 409, "payment_status")
 
     # Validate the transition using the ORIGINAL requested status before any redirect.
-    if status not in VALID_TRANSITIONS.get(previous_status, set()):
-        raise AppError("INVALID_STATUS_TRANSITION", "Invalid order status transition", 422, "status")
+    is_graph_transition = status in VALID_TRANSITIONS.get(previous_status, set())
+    if authority == TransitionAuthority.INTERNAL:
+        if not is_graph_transition:
+            raise AppError("INVALID_STATUS_TRANSITION", "Invalid order status transition", 422, "status")
+    elif not is_graph_transition:
+        # [EXTERNAL] Une autorite externe (ex. POS) peut imposer une transition
+        # hors VALID_TRANSITIONS -- jamais rejetee, mais toujours observable.
+        logger.warning(
+            "ORDER_STATUS_TRANSITION_OUT_OF_GRAPH: order_id=%s previous_status=%s "
+            "requested_status=%s authority=%s",
+            order_id,
+            previous_status,
+            status,
+            authority.value,
+        )
+        external_out_of_graph_transitions_total.increment()
 
     # [FILE D'ATTENTE] Si la confirmation est demandée et que la capacité est dépassée,
     # router vers "queued" au lieu de "confirmed" (APRES validation).
@@ -999,7 +1067,9 @@ async def update_status(
                 actual_status = "queued"
 
     order.status = actual_status
-    session.add(OrderStatusHistory(order_id=order.id, status=actual_status, note=note))
+    session.add(
+        OrderStatusHistory(order_id=order.id, status=actual_status, note=note, authority=authority.value)
+    )
 
     low_stock: list = []
 

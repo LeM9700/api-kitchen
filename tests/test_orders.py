@@ -218,3 +218,111 @@ async def test_update_item_preparation_rejects_terminal_order():
         )
 
     assert exc_info.value.code == "ORDER_NOT_ACTIVE"
+
+
+def _mock_session(order):
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=order)
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+    return session
+
+
+async def test_internal_authority_valid_transition_persists_without_warning():
+    """INTERNAL + transition valide : comportement inchangé, authority='internal' persisté."""
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="preparing", payment_status="paid", total=10)
+    session = _mock_session(order)
+
+    with patch.object(service.logger, "warning") as mock_warning:
+        result = await service.update_status(session, 1, "ready", tenant_slug="acme")
+
+    assert result.status == "ready"
+    mock_warning.assert_not_called()
+    history_entry = session.add.call_args_list[0].args[0]
+    assert history_entry.status == "ready"
+    assert history_entry.authority == service.TransitionAuthority.INTERNAL.value
+
+
+async def test_internal_authority_invalid_transition_rejected_422():
+    """INTERNAL + transition hors VALID_TRANSITIONS : rejet 422 inchangé."""
+    from app.core.http.errors import AppError
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", payment_status="paid", total=10)
+    session = _mock_session(order)
+
+    with pytest.raises(AppError) as exc_info:
+        await service.update_status(session, 1, "confirmed", tenant_slug="acme")
+
+    assert exc_info.value.code == "INVALID_STATUS_TRANSITION"
+    assert exc_info.value.status_code == 422
+    session.commit.assert_not_called()
+
+
+async def test_external_authority_valid_transition_persists_without_warning():
+    """EXTERNAL + transition valide : persistée, authority='external', pas de warning."""
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="preparing", payment_status="paid", total=10)
+    session = _mock_session(order)
+
+    with patch.object(service.logger, "warning") as mock_warning:
+        result = await service.update_status(
+            session, 1, "ready", tenant_slug="acme", authority=service.TransitionAuthority.EXTERNAL
+        )
+
+    assert result.status == "ready"
+    mock_warning.assert_not_called()
+    history_entry = session.add.call_args_list[0].args[0]
+    assert history_entry.status == "ready"
+    assert history_entry.authority == service.TransitionAuthority.EXTERNAL.value
+
+
+async def test_external_authority_out_of_graph_transition_never_rejected():
+    """EXTERNAL + ready->cancelled (hors VALID_TRANSITIONS) : jamais de 422.
+
+    Persistée quand même, avec un warning loggé et le compteur métrique dédié
+    incrémenté -- la transition reste observable sans jamais être bloquée.
+    """
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+
+    assert "cancelled" not in service.VALID_TRANSITIONS["ready"]
+
+    order = Order(id=1, status="ready", payment_status="paid", total=10)
+    session = _mock_session(order)
+
+    counter_before = service.external_out_of_graph_transitions_total.value
+    with patch.object(service.logger, "warning") as mock_warning:
+        result = await service.update_status(
+            session, 1, "cancelled", tenant_slug="acme", authority=service.TransitionAuthority.EXTERNAL
+        )
+
+    assert result.status == "cancelled"
+    mock_warning.assert_called_once()
+    assert service.external_out_of_graph_transitions_total.value == counter_before + 1
+    history_entry = session.add.call_args_list[0].args[0]
+    assert history_entry.status == "cancelled"
+    assert history_entry.authority == service.TransitionAuthority.EXTERNAL.value
+
+
+async def test_internal_authority_supports_rejected_and_delivery_failed_statuses():
+    """Les statuts d'interopérabilité rejected/delivery_failed sont des transitions valides."""
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="pending", payment_status="pending", total=10)
+    session = _mock_session(order)
+    result = await service.update_status(session, 1, "rejected", tenant_slug="acme")
+    assert result.status == "rejected"
+
+    order2 = Order(id=2, status="out_for_delivery", payment_status="paid", total=10)
+    session2 = _mock_session(order2)
+    result2 = await service.update_status(session2, 2, "delivery_failed", tenant_slug="acme")
+    assert result2.status == "delivery_failed"

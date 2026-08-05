@@ -99,9 +99,17 @@ class OrderItem(Base):
 
 class OrderStatusHistory(Base):
     __tablename__ = "order_status_history"
+    __table_args__ = (
+        CheckConstraint("authority IN ('internal', 'external')", name="ck_order_status_history_authority"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 'internal' | 'external' -- qui a impose la transition (cf. TransitionAuthority
+    # dans orders/service.py). CHECK constraint en base, cf. migrations et
+    # _TENANT_DDL_STATEMENTS. VARCHAR plutot qu'un type ENUM Postgres natif, pour
+    # rester coherent avec status/payment_status deja en place dans ce module.
+    authority: Mapped[str] = mapped_column(String(16), nullable=False, default="internal", server_default="internal")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

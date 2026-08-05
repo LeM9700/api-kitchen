@@ -148,6 +148,7 @@ class OrderStationSummaryOut(BaseModel):
 class OrderStatusHistoryOut(BaseModel):
     status: str
     note: str | None = None
+    authority: str = "internal"
     created_at: datetime | None = None
 
 
