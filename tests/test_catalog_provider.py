@@ -146,3 +146,70 @@ def test_providers_satisfy_catalog_provider_protocol():
 
     assert isinstance(LocalCatalogProvider(), CatalogProvider)
     assert isinstance(ConnectedCatalogProvider(), CatalogProvider)
+
+
+async def test_get_catalog_provider_resolves_local_for_standalone(monkeypatch):
+    from app.core.tenancy.integration_mode import IntegrationMode
+    from app.modules.catalog import deps
+    from app.modules.catalog.providers import LocalCatalogProvider
+
+    async def fake_load(tenant_slug: str) -> IntegrationMode:
+        return IntegrationMode.STANDALONE
+
+    monkeypatch.setattr(deps, "_load_integration_mode", fake_load)
+
+    provider = await deps.get_catalog_provider("any-slug")
+    assert isinstance(provider, LocalCatalogProvider)
+
+
+async def test_get_catalog_provider_resolves_connected_for_connected(monkeypatch):
+    from app.core.tenancy.integration_mode import IntegrationMode
+    from app.modules.catalog import deps
+    from app.modules.catalog.providers import ConnectedCatalogProvider
+
+    async def fake_load(tenant_slug: str) -> IntegrationMode:
+        return IntegrationMode.CONNECTED
+
+    monkeypatch.setattr(deps, "_load_integration_mode", fake_load)
+
+    provider = await deps.get_catalog_provider("any-slug")
+    assert isinstance(provider, ConnectedCatalogProvider)
+
+
+async def test_load_integration_mode_reads_real_tenant_row():
+    """Verifie la lecture reelle en base (cross-connection, comme en prod) --
+    pas la session de test isolee par savepoint, qui n'est pas visible depuis
+    une autre connexion (cf. docstring de la fixture ``client`` dans conftest.py)."""
+    import uuid
+
+    import pytest
+    import sqlalchemy as sa
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.config import settings
+    from app.core.tenancy.integration_mode import IntegrationMode
+    from app.modules.catalog.deps import _load_integration_mode
+
+    engine = create_async_engine(settings.test_database_url or settings.database_url)
+    slug = f"test-catalog-provider-{uuid.uuid4().hex[:8]}"
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO public.tenants (slug, name, integration_mode) "
+                    "VALUES (:slug, 'Test Tenant', 'connected')"
+                ),
+                {"slug": slug},
+            )
+
+        mode = await _load_integration_mode(slug)
+        assert mode == IntegrationMode.CONNECTED
+
+        mode_missing = await _load_integration_mode(f"{slug}-missing")
+        assert mode_missing == IntegrationMode.STANDALONE
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(sa.text("DELETE FROM public.tenants WHERE slug = :slug"), {"slug": slug})
+        await engine.dispose()
