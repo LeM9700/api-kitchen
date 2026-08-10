@@ -260,6 +260,7 @@ def create_app() -> FastAPI:
     from app.modules.orders.router import router as orders_router
     from app.modules.payments.router import router as payments_router
     from app.modules.payments.connect_router import router as payments_connect_router
+    from app.modules.pos.router import router as pos_router
     from app.modules.stock.router import router as stock_router
     from app.modules.loyalty.router import router as loyalty_router
     from app.modules.promotions.router import router as promotions_router
@@ -277,6 +278,7 @@ def create_app() -> FastAPI:
     app.include_router(orders_router, prefix=prefix + "/orders", tags=["orders"])
     app.include_router(payments_router, prefix=prefix + "/payments", tags=["payments"])
     app.include_router(payments_connect_router, prefix=prefix + "/payments/connect", tags=["payments-connect"])
+    app.include_router(pos_router, prefix=prefix + "/pos/connect", tags=["pos-connect"])
     app.include_router(stock_router, prefix=prefix + "/stock", tags=["stock"])
     app.include_router(loyalty_router, prefix=prefix + "/loyalty")
     app.include_router(promotions_router, prefix=prefix + "/promotions", tags=["promotions"])

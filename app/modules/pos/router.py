@@ -1,0 +1,161 @@
+"""Routes de connexion OAuth 2.0 a un hub POS externe.
+
+Endpoints :
+    POST /pos/connect/start
+        Initie le flux OAuth pour le tenant courant. Genere un state a
+        usage unique et retourne l'URL d'autorisation du hub POS.
+
+    GET /pos/connect/callback
+        Callback OAuth atteint par une navigation navigateur depuis le hub
+        POS. Echange le code contre des tokens, persiste la connexion, puis
+        redirige toujours le navigateur vers le frontend.
+
+    POST /pos/connect/disconnect
+        Revoque la connexion POS active du tenant courant.
+
+Acces :
+    - admin/super-admin : start et disconnect (action sensible touchant
+      paiements/commandes).
+    - callback : pas de dependance d'authentification (navigation navigateur
+      sans header Bearer) -- protege intrinsequement par le state OAuth a
+      usage unique.
+
+[SECURITE]
+    - Rate limit sur /start : 5/minute (empeche la generation abusive de
+      states/URLs d'autorisation).
+    - Le callback ne redirige jamais vers une URL fournie par le client --
+      uniquement vers settings.pos_oauth_frontend_return_url (evite tout
+      open-redirect).
+    - Aucun token n'est jamais loggue ni renvoye dans une reponse API.
+"""
+import logging
+
+from arq import ArqRedis
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+
+from app.core.config import settings
+from app.core.http.deps import get_arq_pool, require_role
+from app.core.http.errors import AppError
+from app.core.http.limiter import limiter
+from app.modules.pos import service as pos_service
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+class PosConnectStartResponse(BaseModel):
+    """URL d'autorisation OAuth a ouvrir immediatement cote frontend."""
+
+    url: str
+
+
+class PosDisconnectResponse(BaseModel):
+    """Confirmation de la revocation de la connexion POS."""
+
+    status: str
+
+
+@router.post("/start", response_model=PosConnectStartResponse)
+@limiter.limit("5/minute")
+async def start_connection(
+    request: Request,
+    current_user: dict = Depends(require_role("admin", "super-admin")),
+    redis: ArqRedis = Depends(get_arq_pool),
+) -> PosConnectStartResponse:
+    """Initie le flux OAuth POS pour le tenant courant.
+
+    Args:
+        request: Requete FastAPI (requis par SlowAPI).
+        current_user: Utilisateur admin ou super-admin authentifie.
+        redis: Pool Redis partage, utilise pour stocker le state OAuth.
+
+    Returns:
+        PosConnectStartResponse avec l'URL d'autorisation du hub POS.
+
+    Raises:
+        AppError: POS_ALREADY_CONNECTED (409) si une connexion active existe deja.
+    """
+    tenant_slug = current_user["tenant_slug"]
+
+    if await pos_service.get_active_connection(tenant_slug) is not None:
+        raise AppError(
+            "POS_ALREADY_CONNECTED",
+            "Une connexion POS est deja active pour ce restaurant.",
+            409,
+        )
+
+    state = pos_service.generate_state()
+    await pos_service.store_oauth_state(redis, state, tenant_slug)
+    url = pos_service.build_authorization_url(state)
+
+    logger.info("POS OAuth flow started: tenant=%s", tenant_slug)
+    return PosConnectStartResponse(url=url)
+
+
+@router.get("/callback")
+async def oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    redis: ArqRedis = Depends(get_arq_pool),
+) -> RedirectResponse:
+    """Callback OAuth atteint par le navigateur depuis le hub POS.
+
+    Consomme le state (usage unique), echange le code contre des tokens,
+    persiste la connexion, puis redirige toujours vers
+    settings.pos_oauth_frontend_return_url -- jamais vers une URL fournie
+    par le client.
+
+    Args:
+        code: Code d'autorisation renvoye par le hub POS.
+        state: State OAuth genere par /start.
+        error: Code d'erreur renvoye par le hub si l'utilisateur refuse
+            l'autorisation.
+        redis: Pool Redis partage, utilise pour consommer le state OAuth.
+
+    Returns:
+        RedirectResponse vers le frontend avec ?status=success ou
+        ?status=error&reason=....
+    """
+    return_url = settings.pos_oauth_frontend_return_url
+
+    if error or not code or not state:
+        return RedirectResponse(f"{return_url}?status=error&reason=denied")
+
+    try:
+        tenant_slug = await pos_service.consume_oauth_state(redis, state)
+    except AppError:
+        return RedirectResponse(f"{return_url}?status=error&reason=invalid_state")
+
+    try:
+        token_data = await pos_service.exchange_code_for_tokens(code)
+        await pos_service.save_connection(tenant_slug, token_data)
+    except AppError:
+        return RedirectResponse(f"{return_url}?status=error&reason=exchange_failed")
+
+    logger.info("POS connection activated: tenant=%s", tenant_slug)
+    return RedirectResponse(f"{return_url}?status=success")
+
+
+@router.post("/disconnect", response_model=PosDisconnectResponse)
+async def disconnect_connection(
+    current_user: dict = Depends(require_role("admin", "super-admin")),
+) -> PosDisconnectResponse:
+    """Revoque la connexion POS active du tenant courant.
+
+    Args:
+        current_user: Utilisateur admin ou super-admin authentifie.
+
+    Returns:
+        PosDisconnectResponse avec status="revoked".
+
+    Raises:
+        AppError: POS_NOT_CONNECTED (404) si aucune connexion active n'existe.
+    """
+    tenant_slug = current_user["tenant_slug"]
+    await pos_service.disconnect(tenant_slug)
+    logger.info("POS connection revoked: tenant=%s by=%s", tenant_slug, current_user.get("id"))
+    return PosDisconnectResponse(status="revoked")
