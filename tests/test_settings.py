@@ -54,3 +54,24 @@ def test_test_database_url_is_also_normalized():
 def test_empty_test_database_url_is_left_untouched():
     s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db")
     assert s.test_database_url == ""
+
+
+def test_pos_oauth_settings_default_to_empty_and_disabled():
+    s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db")
+    assert s.pos_hub_provider_name == "generic_hub"
+    assert s.pos_hub_client_id == ""
+    assert s.pos_hub_client_secret == ""
+    assert s.pos_hub_authorize_url == ""
+    assert s.pos_hub_token_url == ""
+    assert s.pos_hub_revoke_url == ""
+    assert s.pos_hub_redirect_uri == ""
+    assert s.pos_hub_default_scopes == ""
+    assert s.pos_hub_establishment_id_field == "establishment_id"
+    assert s.pos_token_encryption_key == ""
+    assert s.pos_oauth_frontend_return_url == ""
+
+
+def test_pos_oauth_settings_can_be_overridden():
+    s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db", pos_hub_client_id="abc", pos_hub_authorize_url="https://hub.example/authorize")
+    assert s.pos_hub_client_id == "abc"
+    assert s.pos_hub_authorize_url == "https://hub.example/authorize"

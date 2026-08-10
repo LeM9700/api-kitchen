@@ -86,5 +86,25 @@ class Settings(BaseSettings):
     fcm_project_id: str | None = None
     fcm_service_account_json: str | None = None
 
+    # Hub POS OAuth 2.0 — generique/configurable, aucun fournisseur reel choisi
+    # pour l'instant. Chaine vide = feature desactivee (comme smtp_host,
+    # stripe_webhook_connect_secret).
+    pos_hub_provider_name: str = "generic_hub"
+    pos_hub_client_id: str = ""
+    pos_hub_client_secret: str = ""
+    pos_hub_authorize_url: str = ""
+    pos_hub_token_url: str = ""
+    pos_hub_revoke_url: str = ""
+    pos_hub_redirect_uri: str = ""
+    pos_hub_default_scopes: str = ""
+    # Nom de la cle dans la reponse JSON du token endpoint qui porte
+    # l'identifiant d'etablissement cote POS. A confirmer avec le vrai fournisseur.
+    pos_hub_establishment_id_field: str = "establishment_id"
+    # Cle Fernet pour chiffrer les tokens OAuth au repos (app.core.services.crypto).
+    pos_token_encryption_key: str = ""
+    # Page frontend vers laquelle /pos/connect/callback redirige toujours
+    # (jamais une URL fournie par le client -- evite l'open-redirect).
+    pos_oauth_frontend_return_url: str = ""
+
 
 settings = Settings()
