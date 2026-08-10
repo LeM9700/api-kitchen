@@ -80,6 +80,13 @@ async def start_connection(
     """
     tenant_slug = current_user["tenant_slug"]
 
+    if not pos_service.is_configured():
+        raise AppError(
+            "POS_NOT_CONFIGURED",
+            "La connexion POS n'est pas configuree sur ce serveur.",
+            503,
+        )
+
     if await pos_service.get_active_connection(tenant_slug) is not None:
         raise AppError(
             "POS_ALREADY_CONNECTED",
@@ -122,6 +129,13 @@ async def oauth_callback(
     """
     return_url = settings.pos_oauth_frontend_return_url
 
+    if not pos_service.is_configured():
+        raise AppError(
+            "POS_NOT_CONFIGURED",
+            "La connexion POS n'est pas configuree sur ce serveur.",
+            503,
+        )
+
     if error or not code or not state:
         return RedirectResponse(f"{return_url}?status=error&reason=denied")
 
@@ -135,6 +149,9 @@ async def oauth_callback(
         await pos_service.save_connection(tenant_slug, token_data)
     except AppError:
         return RedirectResponse(f"{return_url}?status=error&reason=exchange_failed")
+    except Exception:
+        logger.exception("POS callback failed unexpectedly: tenant=%s", tenant_slug)
+        return RedirectResponse(f"{return_url}?status=error&reason=internal_error")
 
     logger.info("POS connection activated: tenant=%s", tenant_slug)
     return RedirectResponse(f"{return_url}?status=success")

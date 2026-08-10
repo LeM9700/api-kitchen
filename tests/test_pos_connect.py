@@ -38,6 +38,16 @@ def staff_user_override():
 
 
 @pytest.fixture(autouse=True)
+def _pos_hub_configured(monkeypatch):
+    monkeypatch.setattr(pos_router.settings, "pos_hub_client_id", "client-123")
+    monkeypatch.setattr(pos_router.settings, "pos_hub_authorize_url", "https://hub.example/authorize")
+    monkeypatch.setattr(pos_router.settings, "pos_hub_token_url", "https://hub.example/token")
+    monkeypatch.setattr(pos_router.settings, "pos_hub_redirect_uri", "https://api.example/pos/connect/callback")
+    monkeypatch.setattr(pos_router.settings, "pos_token_encryption_key", "dummy-key-value")
+    monkeypatch.setattr(pos_router.settings, "pos_oauth_frontend_return_url", "https://app.example/settings/pos")
+
+
+@pytest.fixture(autouse=True)
 def _arq_pool():
     had = hasattr(app.state, "arq_pool")
     previous = getattr(app.state, "arq_pool", None)
@@ -140,6 +150,20 @@ async def test_callback_redirects_on_exchange_failure(client, monkeypatch):
     assert "reason=exchange_failed" in response.headers["location"]
 
 
+async def test_callback_redirects_on_unexpected_exception(client, monkeypatch):
+    monkeypatch.setattr(pos_router.pos_service, "consume_oauth_state", AsyncMock(return_value="acme"))
+    monkeypatch.setattr(
+        pos_router.pos_service,
+        "exchange_code_for_tokens",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    response = await client.get(
+        "/api/v1/pos/connect/callback", params={"code": "c1", "state": "s1"}, follow_redirects=False
+    )
+    assert response.status_code in (302, 307)
+    assert "reason=internal_error" in response.headers["location"]
+
+
 async def test_callback_redirects_to_success_on_valid_flow(client, monkeypatch):
     monkeypatch.setattr(pos_router.pos_service, "consume_oauth_state", AsyncMock(return_value="acme"))
     monkeypatch.setattr(
@@ -208,3 +232,24 @@ async def test_disconnect_returns_404_when_not_connected(client, admin_user_over
     )
     response = await client.post("/api/v1/pos/connect/disconnect")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Feature disabled when unconfigured
+# ---------------------------------------------------------------------------
+
+
+async def test_start_returns_503_when_not_configured(client, admin_user_override, monkeypatch):
+    monkeypatch.setattr(pos_router.settings, "pos_hub_authorize_url", "")
+    response = await client.post("/api/v1/pos/connect/start")
+    assert response.status_code == 503
+    assert response.json()["code"] == "POS_NOT_CONFIGURED"
+
+
+async def test_callback_returns_503_when_not_configured(client, monkeypatch):
+    monkeypatch.setattr(pos_router.settings, "pos_token_encryption_key", "")
+    response = await client.get(
+        "/api/v1/pos/connect/callback", params={"code": "c1", "state": "s1"}
+    )
+    assert response.status_code == 503
+    assert response.json()["code"] == "POS_NOT_CONFIGURED"

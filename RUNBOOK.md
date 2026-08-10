@@ -212,3 +212,13 @@ l'observabilité opérationnelle.
 4. Si une clé secrète a fuité (`JWT_SECRET`, `STRIPE_SECRET_KEY`, etc.) : la faire tourner
    immédiatement dans les variables d'environnement Railway et redéployer — toutes les sessions
    actives seront invalidées (JWT signés avec l'ancien secret deviennent invalides).
+
+## 7. Connexion POS (hub externe) — limitations connues
+
+Avant d'activer la fonctionnalité en configurant les variables `POS_HUB_*` en production, prendre connaissance de ces limitations identifiées lors de la revue finale (2026-08-10), acceptées comme dette technique à traiter dans un lot futur :
+
+1. **Le catalogue passe en lecture seule dès la connexion POS active.** `save_connection` (`app/modules/pos/service.py`) passe `public.tenants.integration_mode` à `'connected'`, et `app/modules/catalog/deps.py` (`require_catalog_writable`) bloque alors toutes les écritures catalogue (produits, allergènes, images) pour ce tenant. Ce comportement n'est aujourd'hui affiché nulle part côté admin — un restaurant qui active la connexion POS perd silencieusement la possibilité d'éditer son catalogue depuis l'interface interne.
+2. **Une connexion POS peut être transférée d'un tenant à un autre.** L'upsert dans `save_connection` cible `(provider, external_establishment_id)` (contrainte `uq_pos_connections_provider_establishment`, migration 0044) sans vérifier le tenant. Si deux tenants complètent un flux OAuth pour le même `external_establishment_id` côté hub, le second « vole » la ligne : le premier tenant reste avec `integration_mode='connected'` mais sans ligne `pos_connections` active — `POST /pos/connect/disconnect` renvoie alors `404 POS_NOT_CONNECTED` et ce tenant ne peut plus revenir en mode standalone via l'API. Récupération actuelle : correction manuelle en base (`UPDATE public.tenants SET integration_mode = 'standalone' WHERE slug = '...'`).
+3. **Pas de contrainte DB empêchant plusieurs connexions actives pour un même tenant.** La règle « une seule connexion active par tenant » n'est appliquée que par une vérification applicative dans `POST /pos/connect/start` (lire-puis-décider), pas par une contrainte SQL. Deux appels concurrents à `/start` pourraient théoriquement produire deux connexions actives pour le même tenant.
+
+Avant d'activer la fonctionnalité pour un client réel, traiter au minimum le point 1 (affichage cohérent côté admin du mode « connecté » et de ses conséquences) et envisager un index unique partiel pour le point 3 (`CREATE UNIQUE INDEX ... ON public.pos_connections (tenant_id) WHERE status = 'active'`).

@@ -36,6 +36,23 @@ STATE_TTL_SECONDS = 600
 _STATE_KEY_PREFIX = "pos_oauth_state:"
 
 
+def is_configured() -> bool:
+    """Retourne True si tous les settings necessaires au flux OAuth POS sont renseignes.
+
+    Utilise pour desactiver explicitement /start et /callback (503) plutot que
+    de laisser le flux echouer silencieusement avec une URL vide/cassee quand
+    aucun fournisseur POS reel n'est encore configure.
+    """
+    return bool(
+        settings.pos_hub_client_id
+        and settings.pos_hub_authorize_url
+        and settings.pos_hub_token_url
+        and settings.pos_hub_redirect_uri
+        and settings.pos_token_encryption_key
+        and settings.pos_oauth_frontend_return_url
+    )
+
+
 def generate_state() -> str:
     """Genere un identifiant de state OAuth imprevisible.
 
@@ -218,6 +235,7 @@ async def save_connection(tenant_slug: str, token_data: dict) -> None:
                 " refresh_token_encrypted, scopes, status, connected_at, token_expires_at) "
                 "VALUES (:tenant_id, :provider, :external_establishment_id, :access_token_encrypted, "
                 " :refresh_token_encrypted, :scopes, 'active', now(), :token_expires_at) "
+                # [LIMITE CONNUE] voir RUNBOOK.md section 7 -- pas de verification cross-tenant sur ce conflit.
                 "ON CONFLICT (provider, external_establishment_id) DO UPDATE SET "
                 " tenant_id = EXCLUDED.tenant_id, "
                 " access_token_encrypted = EXCLUDED.access_token_encrypted, "
