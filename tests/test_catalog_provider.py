@@ -249,3 +249,33 @@ async def test_products_route_still_returns_paginated_summaries_for_standalone_t
     body = response.json()
     assert "items" in body
     assert "total" in body
+
+
+async def test_require_catalog_writable_returns_user_unchanged_for_standalone(monkeypatch):
+    from app.core.tenancy.integration_mode import IntegrationMode
+    from app.modules.catalog import deps
+
+    async def fake_load(tenant_slug: str) -> IntegrationMode:
+        return IntegrationMode.STANDALONE
+
+    monkeypatch.setattr(deps, "_load_integration_mode", fake_load)
+
+    user = {"tenant_slug": "any-slug", "id": 1}
+    result = await deps.require_catalog_writable(current_user=user)
+    assert result is user
+
+
+async def test_require_catalog_writable_blocks_connected(monkeypatch):
+    import pytest
+
+    from app.core.tenancy.integration_mode import IntegrationMode
+    from app.modules.catalog import deps
+    from app.modules.catalog.exceptions import ReadOnlyCatalogError
+
+    async def fake_load(tenant_slug: str) -> IntegrationMode:
+        return IntegrationMode.CONNECTED
+
+    monkeypatch.setattr(deps, "_load_integration_mode", fake_load)
+
+    with pytest.raises(ReadOnlyCatalogError):
+        await deps.require_catalog_writable(current_user={"tenant_slug": "any-slug", "id": 1})

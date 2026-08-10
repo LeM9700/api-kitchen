@@ -1,9 +1,12 @@
 """Resolution du CatalogProvider par tenant (P9)."""
 
+from fastapi import Depends
 from sqlalchemy import text
 
 from app.core.database import get_public_session
+from app.core.http.deps import get_current_user
 from app.core.tenancy.integration_mode import IntegrationMode
+from app.modules.catalog.exceptions import ReadOnlyCatalogError
 from app.modules.catalog.ports import CatalogProvider
 from app.modules.catalog.providers import ConnectedCatalogProvider, LocalCatalogProvider
 
@@ -47,3 +50,21 @@ async def get_catalog_provider(tenant_slug: str) -> CatalogProvider:
     if mode == IntegrationMode.CONNECTED:
         return ConnectedCatalogProvider()
     return LocalCatalogProvider()
+
+
+async def require_catalog_writable(current_user: dict = Depends(get_current_user)) -> dict:
+    """Bloque les ecritures catalogue pour un tenant CONNECTED.
+
+    Args:
+        current_user: Utilisateur courant, deja authentifie.
+
+    Returns:
+        Le meme dict ``current_user``, inchange, si le tenant est STANDALONE.
+
+    Raises:
+        ReadOnlyCatalogError: si le tenant est CONNECTED.
+    """
+    mode = await _load_integration_mode(current_user["tenant_slug"])
+    if mode == IntegrationMode.CONNECTED:
+        raise ReadOnlyCatalogError()
+    return current_user
