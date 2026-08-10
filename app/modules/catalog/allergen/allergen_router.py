@@ -18,6 +18,7 @@ from app.modules.catalog.allergen.allergen_schemas import (
     ProductAllergenSummary,
     ProductDietaryTagsSet,
 )
+from app.modules.catalog.deps import require_catalog_writable
 
 router = APIRouter()
 
@@ -42,6 +43,7 @@ async def list_allergens(request: Request):
 async def create_allergen(
     body: AllergenDefinitionCreate,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     """Crée un allergène personnalisé (non réglementaire).
 
@@ -85,6 +87,7 @@ async def set_ingredient_allergens(
     ingredient_id: int,
     body: list[IngredientAllergenSet],
     current_user=Depends(require_role("staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     """Remplace les allergènes d'un ingrédient et propage aux produits liés.
 
@@ -128,6 +131,7 @@ async def patch_product_allergen(
     allergen_id: int,
     body: ProductAllergenPatch,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     """Déclare manuellement un allergène sur un produit (priorité sur le calcul auto).
 
@@ -167,6 +171,7 @@ async def recompute_product_allergens(
     request: Request,
     product_id: int,
     current_user=Depends(require_role("admin", "staff")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     """Force le recalcul des allergènes d'un produit depuis ses ingrédients.
 
@@ -230,6 +235,7 @@ async def set_product_dietary_tags(
     product_id: int,
     body: ProductDietaryTagsSet,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     """Remplace les dietary tags d'un produit (PUT complet).
 

@@ -282,10 +282,11 @@ async def test_require_catalog_writable_blocks_connected(monkeypatch):
 
 
 async def test_write_routes_are_wired_to_require_catalog_writable():
-    """Verifie le wiring Task 2 : un echantillon representatif (une route par
-    section) a bien _catalog_writable=Depends(require_catalog_writable) dans
-    sa signature. La logique du guard lui-meme est testee dans
-    test_require_catalog_writable_blocks_connected (Task 1)."""
+    """Verifie que TOUTES les routes d'ecriture catalogue (router.py + les
+    sous-routers allergen/image, montes sous le meme prefixe /catalog) ont
+    _catalog_writable=Depends(require_catalog_writable) dans leur signature.
+    La logique du guard lui-meme est testee dans
+    test_require_catalog_writable_blocks_connected."""
     import inspect
 
     from app.modules.catalog.deps import require_catalog_writable
@@ -294,20 +295,61 @@ async def test_write_routes_are_wired_to_require_catalog_writable():
         create_category,
         create_extra,
         create_variant,
+        delete_extra,
+        delete_recommendation,
+        delete_variant,
         import_csv_confirm,
         link_extra,
         set_product_availability_override,
+        unlink_extra,
+        update_category,
+        update_extra,
+        update_recommendation,
+        update_variant,
+    )
+    from app.modules.catalog.allergen.allergen_router import (
+        create_allergen,
+        patch_product_allergen,
+        recompute_product_allergens,
+        set_ingredient_allergens,
+        set_product_dietary_tags,
+    )
+    from app.modules.catalog.image.image_router import (
+        delete_image,
+        reorder_images,
+        set_primary,
+        upload_image,
     )
 
-    for route_fn in (
+    all_write_routes = (
         create_category,
-        create_extra,
-        create_variant,
-        import_csv_confirm,
-        link_extra,
+        update_category,
         set_product_availability_override,
+        create_variant,
+        update_variant,
+        delete_variant,
+        link_extra,
+        unlink_extra,
+        create_extra,
+        update_extra,
+        delete_extra,
         add_recommendation,
-    ):
+        update_recommendation,
+        delete_recommendation,
+        import_csv_confirm,
+        create_allergen,
+        set_ingredient_allergens,
+        patch_product_allergen,
+        recompute_product_allergens,
+        set_product_dietary_tags,
+        upload_image,
+        delete_image,
+        set_primary,
+        reorder_images,
+    )
+    assert len(all_write_routes) == 24
+
+    for route_fn in all_write_routes:
         sig = inspect.signature(route_fn)
         assert "_catalog_writable" in sig.parameters, f"{route_fn.__name__} missing require_catalog_writable"
         param = sig.parameters["_catalog_writable"]

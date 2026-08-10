@@ -8,6 +8,7 @@ from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
+from app.modules.catalog.deps import require_catalog_writable
 from app.modules.catalog.image import image_service
 from app.modules.catalog.image.image_schemas import ImageReorderBody, MediaImageOut
 
@@ -59,6 +60,7 @@ async def upload_image(
     alt_text: str | None = None,
     is_primary: bool = False,
     current_user: dict = Depends(require_role("staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ) -> JSONResponse:
     """Upload et associe une image à une entité du catalogue.
 
@@ -145,6 +147,7 @@ async def list_images(
 async def delete_image(
     image_id: int,
     current_user: dict = Depends(require_role("staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ) -> None:
     """Supprime une image de Cloudinary et de la base de données.
 
@@ -173,6 +176,7 @@ async def set_primary(
     entity_type: str,
     entity_id: int,
     current_user: dict = Depends(require_role("staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ) -> MediaImageOut:
     """Définit l'image spécifiée comme principale de son entité.
 
@@ -210,6 +214,7 @@ async def reorder_images(
     entity_id: int,
     body: ImageReorderBody,
     current_user: dict = Depends(require_role("staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ) -> list[MediaImageOut]:
     """Réordonne les images d'une entité selon la liste d'IDs fournie.
 
