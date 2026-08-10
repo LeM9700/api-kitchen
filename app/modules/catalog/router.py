@@ -8,7 +8,7 @@ from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
 from app.modules.catalog import service
-from app.modules.catalog.deps import get_catalog_provider
+from app.modules.catalog.deps import get_catalog_provider, require_catalog_writable
 from app.modules.catalog.schemas import (
     CatalogCsvConfirmResponse,
     CatalogCsvDryRunResponse,
@@ -74,6 +74,7 @@ async def categories(
 async def create_category(
     body: CategoryCreate,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
     redis=Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -87,6 +88,7 @@ async def update_category(
     category_id: int,
     body: CategoryUpdate,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
     redis=Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -272,6 +274,7 @@ async def set_product_availability_override(
     product_id: int,
     body: ProductAvailabilityOverrideCreate,
     current_user=Depends(require_permission("catalog:availability", "staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
     redis=Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -307,6 +310,7 @@ async def create_variant(
     product_id: int,
     body: VariantCreate,
     current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.create_variant(session, product_id, body, user_id=_user_id(current_user))
@@ -329,6 +333,7 @@ async def update_variant(
     variant_id: int,
     body: VariantUpdate,
     current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.update_variant(
@@ -345,6 +350,7 @@ async def delete_variant(
     product_id: int,
     variant_id: int,
     current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.delete_variant(session, product_id, variant_id)
@@ -364,6 +370,7 @@ async def link_extra(
     product_id: int,
     extra_id: int,
     current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.link_extra_to_product(session, product_id, extra_id)
@@ -375,6 +382,7 @@ async def unlink_extra(
     product_id: int,
     extra_id: int,
     current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.unlink_extra_from_product(session, product_id, extra_id)
@@ -409,7 +417,11 @@ async def extras(
 
 
 @router.post("/extras", response_model=ExtraOut, status_code=201)
-async def create_extra(body: ExtraCreate, current_user=Depends(require_role("admin"))):
+async def create_extra(
+    body: ExtraCreate,
+    current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
+):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.create_extra(session, body, user_id=_user_id(current_user))
 
@@ -419,6 +431,7 @@ async def update_extra(
     extra_id: int,
     body: ExtraUpdate,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.update_extra(session, extra_id, body, user_id=_user_id(current_user))
@@ -428,6 +441,7 @@ async def update_extra(
 async def delete_extra(
     extra_id: int,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     """Supprime definitivement un extra. Refuse (409) s'il est encore lie a un produit."""
     async with get_tenant_session(current_user["tenant_slug"]) as session:
@@ -453,6 +467,7 @@ async def add_recommendation(
     product_id: int,
     body: ProductRecommendationCreate,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         recommendation = await service.add_product_recommendation(session, product_id, body)
@@ -466,6 +481,7 @@ async def update_recommendation(
     recommendation_id: int,
     body: ProductRecommendationUpdate,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.update_product_recommendation(session, product_id, recommendation_id, body)
@@ -478,6 +494,7 @@ async def delete_recommendation(
     product_id: int,
     recommendation_id: int,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await service.delete_product_recommendation(session, product_id, recommendation_id)
@@ -506,6 +523,7 @@ async def import_csv_dry_run(
 async def import_csv_confirm(
     token: str,
     current_user=Depends(require_role("admin")),
+    _catalog_writable=Depends(require_catalog_writable),
     redis=Depends(get_arq_pool),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:

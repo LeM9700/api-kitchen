@@ -279,3 +279,36 @@ async def test_require_catalog_writable_blocks_connected(monkeypatch):
 
     with pytest.raises(ReadOnlyCatalogError):
         await deps.require_catalog_writable(current_user={"tenant_slug": "any-slug", "id": 1})
+
+
+async def test_write_routes_are_wired_to_require_catalog_writable():
+    """Verifie le wiring Task 2 : un echantillon representatif (une route par
+    section) a bien _catalog_writable=Depends(require_catalog_writable) dans
+    sa signature. La logique du guard lui-meme est testee dans
+    test_require_catalog_writable_blocks_connected (Task 1)."""
+    import inspect
+
+    from app.modules.catalog.deps import require_catalog_writable
+    from app.modules.catalog.router import (
+        add_recommendation,
+        create_category,
+        create_extra,
+        create_variant,
+        import_csv_confirm,
+        link_extra,
+        set_product_availability_override,
+    )
+
+    for route_fn in (
+        create_category,
+        create_extra,
+        create_variant,
+        import_csv_confirm,
+        link_extra,
+        set_product_availability_override,
+        add_recommendation,
+    ):
+        sig = inspect.signature(route_fn)
+        assert "_catalog_writable" in sig.parameters, f"{route_fn.__name__} missing require_catalog_writable"
+        param = sig.parameters["_catalog_writable"]
+        assert param.default.dependency is require_catalog_writable, f"{route_fn.__name__} wired to the wrong dependency"
