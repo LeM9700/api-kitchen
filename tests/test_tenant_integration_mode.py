@@ -79,3 +79,35 @@ async def test_pos_connections_unique_provider_establishment(public_session, uni
             ),
             {"tenant_id": tenant_id},
         )
+
+
+async def test_pos_connections_has_refresh_token_and_expiry_columns(public_session, unique_slug):
+    tenant_id = await public_session.scalar(
+        sa.text(
+            "INSERT INTO public.tenants (slug, name) VALUES (:slug, 'Test Tenant') RETURNING id"
+        ),
+        {"slug": unique_slug},
+    )
+    await public_session.commit()
+
+    await public_session.execute(
+        sa.text(
+            "INSERT INTO public.pos_connections "
+            "(tenant_id, provider, external_establishment_id, status) "
+            "VALUES (:tenant_id, 'generic_hub', 'store-1', 'pending')"
+        ),
+        {"tenant_id": tenant_id},
+    )
+    await public_session.commit()
+
+    row = (
+        await public_session.execute(
+            sa.text(
+                "SELECT refresh_token_encrypted, token_expires_at "
+                "FROM public.pos_connections WHERE tenant_id = :tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+    ).one()
+    assert row.refresh_token_encrypted is None
+    assert row.token_expires_at is None
