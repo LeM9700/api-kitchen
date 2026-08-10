@@ -148,9 +148,9 @@ async def products(
         if cached is not None:
             return cached
 
+    provider = await get_catalog_provider(slug) if is_default_listing else None
     async with get_tenant_session(slug) as session:
         if is_default_listing:
-            provider = await get_catalog_provider(slug)
             summaries, total = await provider.get_catalog(session, pagination)
         else:
             offset = (pagination.page - 1) * pagination.page_size
