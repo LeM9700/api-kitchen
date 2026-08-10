@@ -2,7 +2,7 @@ import contextlib
 import hashlib
 import hmac
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import stripe
@@ -588,6 +588,378 @@ async def test_confirm_finalizes_only_after_verified_stripe_intent():
     assert order.payment_status == "paid"
     session.commit.assert_awaited_once()
     loyalty_confirm.assert_awaited_once_with(session, order.id, order.user_id)
+
+
+def _refund_session(order, payment, already_refunded_cents: int):
+    """Session AsyncMock configuree pour create_refund : session.get() -> order,
+    session.scalar() successif -> payment puis le montant deja rembourse
+    (appel interne a _refunded_amount_cents)."""
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=order)
+    session.scalar = AsyncMock(side_effect=[payment, already_refunded_cents])
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+
+    async def _fake_refresh(obj):
+        if getattr(obj, "id", None) is None:
+            obj.id = 99
+
+    session.refresh = AsyncMock(side_effect=_fake_refresh)
+    return session
+
+
+async def test_create_refund_requires_reason():
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=12.5)
+    session = AsyncMock()
+
+    with pytest.raises(AppError) as exc:
+        await service.create_refund(session, "acme", 1, user_id=7, amount=None, reason="   ")
+
+    assert exc.value.code == "REFUND_REASON_REQUIRED"
+    session.get.assert_not_called()
+
+
+async def test_create_refund_rejects_unfulfilled_order_by_default():
+    """[⚠️ PROD] Une commande encore active (ni annulee ni livree) ne doit pas
+    pouvoir etre remboursee sans le flag explicite allow_unfulfilled_order."""
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="preparing", total=12.5)
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=order)
+
+    with pytest.raises(AppError) as exc:
+        await service.create_refund(session, "acme", 1, user_id=7, amount=None, reason="client request")
+
+    assert exc.value.code == "REFUND_NOT_ALLOWED"
+    session.scalar.assert_not_called()
+
+
+async def test_create_refund_already_fully_refunded_rejected():
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=12.5)
+    payment = Payment(id=2, order_id=1, provider="stripe", provider_payment_id="pi_x", amount=12.5, status="paid")
+    session = _refund_session(order, payment, already_refunded_cents=1250)
+
+    with pytest.raises(AppError) as exc:
+        await service.create_refund(session, "acme", 1, user_id=7, amount=None, reason="client request")
+
+    assert exc.value.code == "REFUND_ALREADY_COMPLETE"
+    session.commit.assert_not_called()
+
+
+async def test_create_refund_amount_exceeding_remaining_rejected():
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=12.5)
+    payment = Payment(id=2, order_id=1, provider="stripe", provider_payment_id="pi_x", amount=12.5, status="paid")
+    session = _refund_session(order, payment, already_refunded_cents=0)
+
+    with pytest.raises(AppError) as exc:
+        await service.create_refund(session, "acme", 1, user_id=7, amount=2000, reason="client request")
+
+    assert exc.value.code == "REFUND_AMOUNT_EXCEEDS_PAYMENT"
+    session.commit.assert_not_called()
+
+
+async def test_create_refund_full_amount_calls_stripe_and_marks_refunded():
+    """[💰 FINANCIER] Un remboursement total sans montant explicite doit rembourser
+    le solde exact restant via Stripe et marquer le paiement 'refunded'."""
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=12.5)
+    payment = Payment(
+        id=2, order_id=1, provider="stripe", provider_payment_id="pi_full", amount=12.5, status="paid"
+    )
+    session = _refund_session(order, payment, already_refunded_cents=0)
+
+    with patch(
+        "app.modules.payments.service.stripe.Refund.create",
+        return_value={"id": "re_full_123"},
+    ) as mock_stripe_refund:
+        result = await service.create_refund(
+            session, "acme", 1, user_id=7, amount=None, reason="client request"
+        )
+
+    mock_stripe_refund.assert_called_once()
+    assert mock_stripe_refund.call_args.kwargs["amount"] == 1250
+    assert mock_stripe_refund.call_args.kwargs["payment_intent"] == "pi_full"
+    assert payment.status == "refunded"
+    assert result.stripe_refund_id == "re_full_123"
+    session.commit.assert_awaited_once()
+
+
+async def test_create_refund_partial_amount_marks_partially_refunded():
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=20.0)
+    payment = Payment(
+        id=2, order_id=1, provider="stripe", provider_payment_id="pi_partial", amount=20.0, status="paid"
+    )
+    session = _refund_session(order, payment, already_refunded_cents=0)
+
+    with patch(
+        "app.modules.payments.service.stripe.Refund.create",
+        return_value={"id": "re_partial_123"},
+    ) as mock_stripe_refund:
+        await service.create_refund(session, "acme", 1, user_id=7, amount=500, reason="partial goodwill")
+
+    assert mock_stripe_refund.call_args.kwargs["amount"] == 500
+    assert payment.status == "partially_refunded"
+
+
+async def test_create_refund_manual_provider_skips_stripe_call():
+    """Un paiement encaisse hors Stripe (especes, TPE externe) doit generer un
+    remboursement 'manual' sans jamais appeler l'API Stripe."""
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=12.5)
+    payment = Payment(id=2, order_id=1, provider="cash", provider_payment_id=None, amount=12.5, status="paid")
+    session = _refund_session(order, payment, already_refunded_cents=0)
+
+    with patch("app.modules.payments.service.stripe.Refund.create") as mock_stripe_refund:
+        result = await service.create_refund(
+            session, "acme", 1, user_id=7, amount=None, reason="client request"
+        )
+
+    mock_stripe_refund.assert_not_called()
+    assert result.stripe_refund_id.startswith("manual_")
+    assert payment.status == "refunded"
+    session.commit.assert_awaited_once()
+
+
+async def test_create_refund_stripe_failure_records_failed_refund_and_raises():
+    """[⚠️ PROD] Si Stripe rejette le remboursement, un Refund status='failed' doit
+    quand meme etre persiste (traçabilite/audit) et l'appelant doit recevoir une
+    erreur explicite -- jamais un echec silencieux qui laisserait croire au staff
+    que le client a ete rembourse."""
+    import stripe as stripe_module
+
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="delivered", total=12.5)
+    payment = Payment(
+        id=2, order_id=1, provider="stripe", provider_payment_id="pi_fail", amount=12.5, status="paid"
+    )
+    session = _refund_session(order, payment, already_refunded_cents=0)
+
+    with patch(
+        "app.modules.payments.service.stripe.Refund.create",
+        side_effect=stripe_module.error.StripeError("card issuer declined the refund"),
+    ):
+        with pytest.raises(AppError) as exc:
+            await service.create_refund(session, "acme", 1, user_id=7, amount=None, reason="client request")
+
+    assert exc.value.code == "STRIPE_REFUND_FAILED"
+    assert exc.value.status_code == 502
+    saved_refund = session.add.call_args.args[0]
+    assert saved_refund.status == "failed"
+    assert saved_refund.failure_reason
+    session.commit.assert_awaited_once()
+
+
+async def test_auto_refund_after_confirmation_failure_payment_not_found_raises():
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=None)
+
+    with pytest.raises(AppError) as exc:
+        await service._auto_refund_after_confirmation_failure(
+            session, "acme", 999, AppError("INSUFFICIENT_STOCK", "no stock", 409), source="confirm"
+        )
+
+    assert exc.value.code == "PAYMENT_NOT_FOUND"
+
+
+async def test_auto_refund_after_confirmation_failure_marks_paid_before_attempting_refund():
+    """[⚠️ PROD] Le client a deja ete debite par Stripe avant l'echec de
+    confirmation cote metier (ex. stock insuffisant decouvert apres paiement) :
+    la commande/le paiement DOIVENT etre marques payes et committes en premier,
+    independamment du succes du remboursement automatique qui suit -- sinon un
+    client debite se retrouve avec une commande visible comme non payee."""
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="pending", payment_status="pending", total=12.5)
+    payment = Payment(id=2, order_id=1, provider="stripe", provider_payment_id="pi_x", amount=12.5, status="pending")
+    session = AsyncMock()
+    session.get = AsyncMock(side_effect=[payment, order, payment])
+    session.commit = AsyncMock()
+
+    marked_paid_before_refund_attempt = {"value": False}
+
+    async def _fake_create_refund(*args, **kwargs):
+        marked_paid_before_refund_attempt["value"] = (
+            payment.status == "paid" and order.payment_status == "paid"
+        )
+        raise AppError("STRIPE_REFUND_FAILED", "declined", 502)
+
+    with patch.object(service, "create_refund", new=AsyncMock(side_effect=_fake_create_refund)):
+        await service._auto_refund_after_confirmation_failure(
+            session, "acme", 2, AppError("INSUFFICIENT_STOCK", "no stock", 409), source="confirm"
+        )
+
+    assert marked_paid_before_refund_attempt["value"] is True
+    assert session.commit.await_count >= 1
+
+
+async def test_auto_refund_after_confirmation_failure_success_marks_refunded():
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="pending", payment_status="pending", total=12.5)
+    payment = Payment(id=2, order_id=1, provider="stripe", provider_payment_id="pi_x", amount=12.5, status="pending")
+    session = AsyncMock()
+    session.get = AsyncMock(side_effect=[payment, order, payment])
+    session.commit = AsyncMock()
+
+    fake_refund_out = object()
+    with patch.object(service, "create_refund", new=AsyncMock(return_value=fake_refund_out)) as mock_refund:
+        refund, alert = await service._auto_refund_after_confirmation_failure(
+            session, "acme", 2, AppError("INSUFFICIENT_STOCK", "no stock", 409), source="confirm"
+        )
+
+    mock_refund.assert_awaited_once()
+    assert mock_refund.call_args.kwargs["allow_unfulfilled_order"] is True
+    assert refund is fake_refund_out
+    assert payment.status == "refunded"
+    assert alert["reason"] == "INSUFFICIENT_STOCK"
+    assert alert["order_id"] == 1
+
+
+async def test_auto_refund_after_confirmation_failure_refund_failure_does_not_raise():
+    """[⚠️ PROD] Si le remboursement automatique echoue lui-meme (ex. Stripe
+    indisponible), la fonction ne doit JAMAIS laisser remonter l'exception --
+    le paiement doit etre marque 'refund_failed' pour suivi manuel par le staff,
+    sans faire planter le flux appelant (deja dans un chemin d'erreur)."""
+    from app.modules.orders.models import Order
+
+    order = Order(id=1, status="pending", payment_status="pending", total=12.5)
+    payment = Payment(id=2, order_id=1, provider="stripe", provider_payment_id="pi_x", amount=12.5, status="pending")
+    session = AsyncMock()
+    session.get = AsyncMock(side_effect=[payment, order, payment])
+    session.commit = AsyncMock()
+
+    refund_error = AppError("STRIPE_REFUND_FAILED", "Stripe : card issuer declined", 502)
+    with patch.object(service, "create_refund", new=AsyncMock(side_effect=refund_error)):
+        refund, alert = await service._auto_refund_after_confirmation_failure(
+            session, "acme", 2, AppError("INSUFFICIENT_STOCK", "no stock", 409), source="confirm"
+        )
+
+    assert refund is None
+    assert payment.status == "refund_failed"
+    assert alert["refund_error"] == refund_error.detail
+
+
+def _webhook_session(rowcount: int = 1):
+    """Session AsyncMock configuree pour handle_webhook : session.execute() ->
+    resultat de l'INSERT ... ON CONFLICT d'idempotence, avec le rowcount donne
+    (0 = event Stripe deja traite, 1 = nouvel event)."""
+    session = AsyncMock()
+    execute_result = MagicMock()
+    execute_result.rowcount = rowcount
+    session.execute = AsyncMock(return_value=execute_result)
+    session.commit = AsyncMock()
+    return session
+
+
+async def test_handle_webhook_skips_already_processed_event():
+    """[🔒 IDEMPOTENCE] Un event Stripe deja vu (rejeu/retry) ne doit declencher
+    aucun handler -- protection contre le double traitement d'un paiement."""
+    session = _webhook_session(rowcount=0)
+    event = {"id": "evt_dup", "type": "payment_intent.succeeded", "data": {"object": {"id": "pi_x"}}}
+
+    with patch.object(service, "finalize_payment", new=AsyncMock()) as mock_finalize:
+        await service.handle_webhook(session, "acme", event)
+
+    mock_finalize.assert_not_called()
+    session.commit.assert_awaited_once()
+
+
+async def test_handle_webhook_dispatches_payment_succeeded_to_finalize_payment():
+    session = _webhook_session(rowcount=1)
+    event = {
+        "id": "evt_ok",
+        "type": "payment_intent.succeeded",
+        "data": {"object": {"id": "pi_ok"}},
+    }
+
+    with patch.object(service, "finalize_payment", new=AsyncMock()) as mock_finalize:
+        await service.handle_webhook(session, "acme", event)
+
+    mock_finalize.assert_awaited_once()
+    assert mock_finalize.call_args.args[2] == "pi_ok"
+    assert mock_finalize.call_args.kwargs["source"] == "webhook"
+
+
+async def test_handle_webhook_dispatches_payment_failed_to_handle_payment_failure():
+    session = _webhook_session(rowcount=1)
+    event = {
+        "id": "evt_failed",
+        "type": "payment_intent.payment_failed",
+        "data": {"object": {"id": "pi_failed"}},
+    }
+
+    with patch.object(service, "handle_payment_failure", new=AsyncMock()) as mock_failure:
+        await service.handle_webhook(session, "acme", event)
+
+    mock_failure.assert_awaited_once_with(session, "pi_failed")
+
+
+async def test_handle_webhook_dispatches_canceled_to_handle_payment_failure():
+    session = _webhook_session(rowcount=1)
+    event = {
+        "id": "evt_canceled",
+        "type": "payment_intent.canceled",
+        "data": {"object": {"id": "pi_canceled"}},
+    }
+
+    with patch.object(service, "handle_payment_failure", new=AsyncMock()) as mock_failure:
+        await service.handle_webhook(session, "acme", event)
+
+    mock_failure.assert_awaited_once_with(session, "pi_canceled")
+
+
+async def test_handle_webhook_dispatches_dispute_created_to_alert():
+    """[🔒 SECURITE] Une contestation Stripe (chargeback) doit toujours declencher
+    l'alerte dediee -- jamais tombee silencieusement dans le cas 'unhandled'."""
+    session = _webhook_session(rowcount=1)
+    dispute_object = {"id": "dp_1", "charge": "ch_1"}
+    event = {"id": "evt_dispute", "type": "charge.dispute.created", "data": {"object": dispute_object}}
+
+    with patch.object(service, "_handle_dispute_alert", new=AsyncMock()) as mock_alert:
+        await service.handle_webhook(session, "acme", event)
+
+    mock_alert.assert_awaited_once_with("acme", dispute_object)
+
+
+async def test_handle_webhook_dispatches_charge_refunded_to_handler():
+    session = _webhook_session(rowcount=1)
+    charge_object = {"id": "ch_1", "payment_intent": "pi_refunded"}
+    event = {"id": "evt_refunded", "type": "charge.refunded", "data": {"object": charge_object}}
+
+    with patch.object(service, "handle_charge_refunded", new=AsyncMock()) as mock_refunded:
+        await service.handle_webhook(session, "acme", event)
+
+    mock_refunded.assert_awaited_once_with(session, "pi_refunded", charge_object)
+
+
+async def test_handle_webhook_unhandled_event_type_dispatches_nothing():
+    session = _webhook_session(rowcount=1)
+    event = {"id": "evt_unknown", "type": "customer.created", "data": {"object": {}}}
+
+    with (
+        patch.object(service, "finalize_payment", new=AsyncMock()) as mock_finalize,
+        patch.object(service, "handle_payment_failure", new=AsyncMock()) as mock_failure,
+        patch.object(service, "_handle_dispute_alert", new=AsyncMock()) as mock_alert,
+        patch.object(service, "handle_charge_refunded", new=AsyncMock()) as mock_refunded,
+    ):
+        await service.handle_webhook(session, "acme", event)
+
+    mock_finalize.assert_not_called()
+    mock_failure.assert_not_called()
+    mock_alert.assert_not_called()
+    mock_refunded.assert_not_called()
 
 
 @pytest.fixture
