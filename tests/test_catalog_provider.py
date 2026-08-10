@@ -213,3 +213,40 @@ async def test_load_integration_mode_reads_real_tenant_row():
         async with engine.begin() as conn:
             await conn.execute(sa.text("DELETE FROM public.tenants WHERE slug = :slug"), {"slug": slug})
         await engine.dispose()
+
+
+async def test_products_route_still_returns_paginated_summaries_for_standalone_tenant(client):
+    """Regression smoke test : la route publique GET /products doit continuer
+    a fonctionner en mode STANDALONE (par defaut) exactement comme avant,
+    maintenant qu'elle passe par LocalCatalogProvider."""
+    # Le fixture `client` (tests/conftest.py, hors scope de cette tache) branche
+    # directement l'ASGITransport sans jamais declencher le `lifespan` de l'app
+    # -- `app.state.arq_pool` (peuple normalement par app/main.py::lifespan a
+    # chaque vrai demarrage serveur) n'existe donc pas dans ce contexte de test.
+    # GET /products en depend directement via `redis=Depends(get_arq_pool)` pour
+    # son cache 30s (voir router.py) et n'a pas de fallback getattr(..., None)
+    # comme customer/router.py:28 -- aucun test existant ne frappait ce chemin
+    # HTTP avant ce smoke test, donc le trou n'avait jamais ete expose. Pas lie
+    # au refactor CatalogProvider (Task 5) : reproductible a l'identique avec
+    # l'ancien code du routeur. On simule ici l'etat "arq_pool absent/None"
+    # (equivalent a l'environnement local sans Redis), que get_cached_json /
+    # set_cached_json degradent deja silencieusement (cf. cache.py).
+    from app.main import app
+
+    had_arq_pool = hasattr(app.state, "arq_pool")
+    previous_arq_pool = getattr(app.state, "arq_pool", None)
+    app.state.arq_pool = None
+    try:
+        response = await client.get(
+            "/api/v1/catalog/products",
+            headers={"X-Tenant-Slug": "pizza_test"},
+        )
+    finally:
+        if had_arq_pool:
+            app.state.arq_pool = previous_arq_pool
+        else:
+            del app.state.arq_pool
+    assert response.status_code == 200
+    body = response.json()
+    assert "items" in body
+    assert "total" in body

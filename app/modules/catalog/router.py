@@ -8,6 +8,7 @@ from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
 from app.modules.catalog import service
+from app.modules.catalog.deps import get_catalog_provider
 from app.modules.catalog.schemas import (
     CatalogCsvConfirmResponse,
     CatalogCsvDryRunResponse,
@@ -149,7 +150,8 @@ async def products(
 
     async with get_tenant_session(slug) as session:
         if is_default_listing:
-            items, total = await service.list_products(session, pagination)
+            provider = await get_catalog_provider(slug)
+            summaries, total = await provider.get_catalog(session, pagination)
         else:
             offset = (pagination.page - 1) * pagination.page_size
             items, total = await service.search_products(
@@ -164,7 +166,7 @@ async def products(
                 price_max=price_max,
                 allergen_free=allergen_free,
             )
-        summaries = await service.build_product_summaries(session, items, include_availability=True)
+            summaries = await service.build_product_summaries(session, items, include_availability=True)
 
     response = CatalogPaginatedResponse.build(summaries, total, pagination)
     if is_default_listing:
@@ -228,8 +230,9 @@ async def create_product(
     current_user=Depends(require_role("admin")),
     redis=Depends(get_arq_pool),
 ):
+    provider = await get_catalog_provider(current_user["tenant_slug"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        product = await service.create_product(session, body, user_id=_user_id(current_user))
+        product = await provider.create_product(session, body, user_id=_user_id(current_user))
     await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
     return product
 
@@ -241,12 +244,9 @@ async def update_product(
     current_user=Depends(require_role("admin")),
     redis=Depends(get_arq_pool),
 ):
+    provider = await get_catalog_provider(current_user["tenant_slug"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        if body.is_active is True:
-            from app.modules.catalog.allergen.allergen_service import validate_product_for_publication
-
-            await validate_product_for_publication(session, product_id)
-        product = await service.update_product(session, product_id, body, user_id=_user_id(current_user))
+        product = await provider.update_product(session, product_id, body, user_id=_user_id(current_user))
     await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
     return product
 
@@ -257,13 +257,9 @@ async def delete_product(
     current_user=Depends(require_role("admin")),
     redis=Depends(get_arq_pool),
 ):
+    provider = await get_catalog_provider(current_user["tenant_slug"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        await service.update_product(
-            session,
-            product_id,
-            ProductUpdate(is_active=False),
-            user_id=_user_id(current_user),
-        )
+        await provider.delete_product(session, product_id, user_id=_user_id(current_user))
     await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
 
 
