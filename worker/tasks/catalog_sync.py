@@ -5,6 +5,7 @@ catalog_snapshots (schema tenant). Jamais appelee pendant une requete entrante
 HubCatalogProvider sur un snapshot perime.
 """
 import logging
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -114,5 +115,57 @@ async def sync_catalog_from_hub(ctx, connection_id: int) -> None:
         finally:
             if redis is not None:
                 await release_sync_lock(redis, connection_id)
+    finally:
+        await engine.dispose()
+
+
+async def sync_stale_catalog_connections(ctx) -> None:
+    """Cron ARQ (horaire) : enqueue sync_catalog_from_hub pour toute connexion
+    POS active dont le snapshot catalogue est absent ou perime.
+
+    Filet de securite en complement du webhook et de la resynchronisation
+    paresseuse declenchee sur lecture (HubCatalogProvider.get_catalog).
+
+    Args:
+        ctx: Contexte ARQ injecte automatiquement (``redis``).
+    """
+    # Meme pattern que sync_catalog_from_hub ci-dessus : un seul engine cree
+    # pour toute l'invocation du cron (potentiellement de nombreuses
+    # connexions/sessions), dispose() une seule fois dans le finally externe.
+    # Les sessions issues de session_factory partagent le pool de connexions
+    # du meme engine -- pas besoin d'un engine par connexion.
+    engine = create_async_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    redis = ctx.get("redis")
+    staleness = timedelta(minutes=settings.pos_hub_snapshot_staleness_minutes)
+
+    try:
+        session = session_factory()
+        try:
+            result = await session.execute(
+                text(
+                    "SELECT pc.id AS connection_id, t.slug AS tenant_slug "
+                    "FROM public.pos_connections pc "
+                    "JOIN public.tenants t ON t.id = pc.tenant_id "
+                    "WHERE pc.status = 'active'"
+                )
+            )
+            connections = result.mappings().all()
+        finally:
+            await session.close()
+
+        now = datetime.now(timezone.utc)
+        for row in connections:
+            schema = tenant_schema_name(row["tenant_slug"])
+            tenant_session = session_factory()
+            try:
+                await tenant_session.execute(text(f'SET search_path TO "{schema}", public'))
+                snapshot = await snapshot_repository.get_snapshot(tenant_session, row["connection_id"])
+            finally:
+                await tenant_session.close()
+
+            needs_sync = snapshot is None or (now - snapshot.synced_at) > staleness
+            if needs_sync and redis is not None:
+                await redis.enqueue_job("sync_catalog_from_hub", connection_id=row["connection_id"])
     finally:
         await engine.dispose()

@@ -8,14 +8,19 @@ async def _seed_active_connection(db_session, connection_id: int, tenant_slug: s
 
     await db_session.execute(sa.text('SET search_path TO public'))
     tenant_id = await db_session.scalar(sa.text("SELECT id FROM public.tenants WHERE slug = :slug"), {"slug": tenant_slug})
+    # external_establishment_id is derived from connection_id (not a fixed "est-1")
+    # because uq_pos_connections_provider_establishment (alembic 0044) is a *global*
+    # unique constraint on (provider, external_establishment_id), not scoped per
+    # tenant/connection -- a fixed value would collide as soon as a single test seeds
+    # more than one active connection (as the stale-connections cron tests below do).
     await db_session.execute(
         sa.text(
             "INSERT INTO public.pos_connections "
             "(id, tenant_id, provider, external_establishment_id, access_token_encrypted, status, connected_at) "
-            "VALUES (:id, :tenant_id, 'generic_hub', 'est-1', 'cipher', 'active', now()) "
+            "VALUES (:id, :tenant_id, 'generic_hub', :external_establishment_id, 'cipher', 'active', now()) "
             "ON CONFLICT (id) DO NOTHING"
         ),
-        {"id": connection_id, "tenant_id": tenant_id},
+        {"id": connection_id, "tenant_id": tenant_id, "external_establishment_id": f"est-{connection_id}"},
     )
     await db_session.commit()
 
@@ -209,3 +214,83 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "MalformedHubCatalogPayloadError" in log_text
     assert secret_marker not in log_text
+
+
+async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db_session, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    import sqlalchemy as sa
+
+    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.schemas import NormalizedCatalogProduct
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90101)
+    await _seed_active_connection(db_session, connection_id=90102)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    fresh = await snapshot_repository.upsert_snapshot(
+        db_session, connection_id=90101, payload={}, normalized=[NormalizedCatalogProduct(external_id="e", name="n", price=1.0)]
+    )
+    fresh.synced_at = datetime.now(timezone.utc)
+    await db_session.commit()
+    # 90102 has no snapshot at all -- must also be enqueued.
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+
+    redis = AsyncMock()
+    await catalog_sync.sync_stale_catalog_connections({"redis": redis})
+
+    enqueued_ids = {call.kwargs["connection_id"] for call in redis.enqueue_job.await_args_list}
+    assert 90101 not in enqueued_ids
+    assert 90102 in enqueued_ids
+
+    fake_engine.dispose.assert_awaited_once()
+
+
+async def test_sync_stale_catalog_connections_enqueues_stale_snapshot(db_session, monkeypatch):
+    """A connection whose snapshot exists but is older than the configured staleness
+    window must also be enqueued -- not just connections with no snapshot at all."""
+    from datetime import datetime, timedelta, timezone
+
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.schemas import NormalizedCatalogProduct
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90103)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    stale = await snapshot_repository.upsert_snapshot(
+        db_session, connection_id=90103, payload={}, normalized=[NormalizedCatalogProduct(external_id="e", name="n", price=1.0)]
+    )
+    stale.synced_at = datetime.now(timezone.utc) - timedelta(
+        minutes=settings.pos_hub_snapshot_staleness_minutes + 1
+    )
+    await db_session.commit()
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+
+    redis = AsyncMock()
+    await catalog_sync.sync_stale_catalog_connections({"redis": redis})
+
+    enqueued_ids = {call.kwargs["connection_id"] for call in redis.enqueue_job.await_args_list}
+    assert 90103 in enqueued_ids
+
+    fake_engine.dispose.assert_awaited_once()
+
+
+def test_sync_catalog_from_hub_registered_in_worker_settings():
+    from worker.main import WorkerSettings
+
+    names = [f if isinstance(f, str) else f.__name__ for f in WorkerSettings.functions]
+    assert "worker.tasks.catalog_sync.sync_catalog_from_hub" in names or "sync_catalog_from_hub" in names
+
+
+def test_sync_stale_catalog_connections_registered_as_cron():
+    from worker.main import WorkerSettings
+
+    cron_functions = [job.coroutine.__name__ for job in WorkerSettings.cron_jobs]
+    assert "sync_stale_catalog_connections" in cron_functions

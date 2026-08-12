@@ -4,6 +4,7 @@ from arq import cron
 from arq.connections import RedisSettings
 
 from app.core.config import settings
+from worker.tasks.catalog_sync import sync_catalog_from_hub, sync_stale_catalog_connections
 from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
 from worker.tasks.scheduled_closures import process_scheduled_closures
@@ -29,6 +30,8 @@ class WorkerSettings:
         "worker.tasks.worker_utils.dead_letter_handler",
         process_scheduled_closures,
         aggregate_stock_snapshot,
+        sync_catalog_from_hub,
+        sync_stale_catalog_connections,
     ]
     # Cron jobs ARQ : les fonctions recoivent uniquement ctx (pas de parametres dynamiques).
     cron_jobs: ClassVar[list] = [
@@ -48,6 +51,10 @@ class WorkerSettings:
             process_scheduled_closures,
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
         ),
+        # Synchronisation catalogue POS (hub) — filet de securite horaire, en
+        # complement du webhook et de la resynchronisation paresseuse sur
+        # snapshot perime (HubCatalogProvider.get_catalog).
+        cron(sync_stale_catalog_connections, hour=set(range(24)), minute={0}),
     ]
     redis_settings = get_redis_settings()
     on_startup = None
