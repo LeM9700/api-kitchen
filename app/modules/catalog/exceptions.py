@@ -21,3 +21,23 @@ class ReadOnlyCatalogError(AppError):
             ),
             status_code=409,
         )
+
+
+class CatalogSnapshotUnavailableError(AppError):
+    """Le catalogue de ce tenant CONNECTED n'a pas encore ete synchronise.
+
+    Levee par ``HubCatalogProvider.get_catalog`` quand aucun snapshot n'existe
+    encore pour la connexion POS active (connexion recente, premiere
+    synchronisation pas encore effectuee).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            code="CATALOG_SNAPSHOT_UNAVAILABLE",
+            detail=(
+                "Le catalogue de votre système de caisse n'a pas encore été "
+                "synchronisé. Réessayez dans quelques instants ou contactez "
+                "votre support si le problème persiste."
+            ),
+            status_code=409,
+        )
