@@ -106,5 +106,16 @@ class Settings(BaseSettings):
     # (jamais une URL fournie par le client -- evite l'open-redirect).
     pos_oauth_frontend_return_url: str = ""
 
+    # Hub POS — recuperation catalogue (synchro en cache local). Chaine vide =
+    # feature desactivee, meme pattern que pos_hub_client_id ci-dessus.
+    # [HYPOTHESE NON CONFIRMEE] URL et format de reponse a confirmer avec le
+    # vrai fournisseur — voir app/modules/catalog/hub_client.py.
+    pos_hub_catalog_url: str = ""
+    # [HYPOTHESE NON CONFIRMEE] Format de signature a confirmer — voir
+    # app/modules/pos/webhook_service.py.
+    pos_hub_webhook_secret: str = ""
+    pos_hub_catalog_rate_limit_per_minute: int = 10
+    pos_hub_snapshot_staleness_minutes: int = 60
+
 
 settings = Settings()

@@ -75,3 +75,12 @@ def test_pos_oauth_settings_can_be_overridden():
     s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db", pos_hub_client_id="abc", pos_hub_authorize_url="https://hub.example/authorize")
     assert s.pos_hub_client_id == "abc"
     assert s.pos_hub_authorize_url == "https://hub.example/authorize"
+
+
+def test_hub_catalog_sync_settings_have_safe_defaults():
+    from app.core.config import settings
+
+    assert settings.pos_hub_catalog_url == ""
+    assert settings.pos_hub_webhook_secret == ""
+    assert settings.pos_hub_catalog_rate_limit_per_minute == 10
+    assert settings.pos_hub_snapshot_staleness_minutes == 60
