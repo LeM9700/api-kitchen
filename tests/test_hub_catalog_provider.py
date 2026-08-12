@@ -215,6 +215,42 @@ async def test_get_catalog_sorts_by_display_order_then_name():
         await engine.dispose()
 
 
+async def test_get_catalog_excludes_inactive_products():
+    """Un produit desactive cote caisse (is_active=False dans le snapshot) ne doit
+    apparaitre ni dans la page servie ni dans le total -- meme semantique que
+    LocalCatalogProvider (service.list_products filtre Product.is_active)."""
+    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.providers import HubCatalogProvider
+    from app.modules.catalog.schemas import NormalizedCatalogProduct
+
+    try:
+        engine, conn, session = await _tenant_session()
+        await snapshot_repository.upsert_snapshot(
+            session,
+            connection_id=565,
+            payload={},
+            normalized=[
+                NormalizedCatalogProduct(external_id="ext-a", name="Anchois", price=9.0, is_active=True),
+                NormalizedCatalogProduct(external_id="ext-b", name="Bolognese", price=10.0, is_active=False),
+                NormalizedCatalogProduct(external_id="ext-c", name="Calzone", price=12.0, is_active=True),
+            ],
+        )
+
+        provider = HubCatalogProvider(connection_id=565)
+        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
+
+        assert total == 2  # le produit inactif ne compte pas dans le total
+        assert [s.name for s in summaries] == ["Anchois", "Calzone"]
+        assert all(s.is_active is True for s in summaries)
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        await session.close()
+        await conn.rollback()
+        await conn.close()
+        await engine.dispose()
+
+
 async def test_get_catalog_paginates_in_memory():
     """La pagination porte sur le snapshot deja charge en memoire : total = taille
     totale du snapshot, la page ne contient que la tranche demandee."""

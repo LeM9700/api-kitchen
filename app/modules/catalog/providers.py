@@ -146,6 +146,9 @@ class HubCatalogProvider:
     ) -> tuple[list[ProductSummaryOut], int]:
         """Retourne la page de catalogue construite depuis le snapshot hub.
 
+        Seuls les produits actifs du snapshot sont servis (et comptes dans le
+        total), comme ``LocalCatalogProvider``.
+
         Args:
             session: Session SQLAlchemy positionnee sur le schema du tenant.
             pagination: Parametres de pagination (appliques en memoire : le
@@ -154,7 +157,8 @@ class HubCatalogProvider:
                 perime, une resynchronisation est enqueue en best-effort.
 
         Returns:
-            Tuple ``(resumes de produits de la page, total du snapshot)``.
+            Tuple ``(resumes de produits actifs de la page, total des produits
+            actifs du snapshot)``.
 
         Raises:
             CatalogSnapshotUnavailableError: si le tenant CONNECTED n'a pas de
@@ -168,7 +172,14 @@ class HubCatalogProvider:
             raise CatalogSnapshotUnavailableError()
 
         overrides = await snapshot_repository.list_overrides(session, self._connection_id)
-        items = [NormalizedCatalogProduct(**entry) for entry in snapshot.normalized]
+        # Meme semantique que LocalCatalogProvider (service.list_products) : un
+        # produit desactive cote caisse sort du listing public ET du total, sans
+        # attendre le prochain cycle de synchronisation du snapshot.
+        items = [
+            item
+            for item in (NormalizedCatalogProduct(**entry) for entry in snapshot.normalized)
+            if item.is_active
+        ]
         items.sort(
             key=lambda item: (
                 overrides[item.external_id].display_order
