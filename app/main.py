@@ -3,7 +3,6 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
 
 import sentry_sdk
 from arq import create_pool
@@ -30,21 +29,13 @@ from worker.main import get_redis_settings
 configure_logging()
 logger = logging.getLogger(__name__)
 
-
-def _is_valid_sentry_dsn(dsn: str) -> bool:
-    parsed = urlparse(dsn)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-if settings.sentry_dsn and _is_valid_sentry_dsn(settings.sentry_dsn):
+if settings.sentry_dsn:
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
         environment=settings.environment,
         integrations=[FastApiIntegration()],
         traces_sample_rate=0.1,
     )
-elif settings.sentry_dsn:
-    logger.warning("invalid SENTRY_DSN ignored")
 
 # [🔒 SÉCURITÉ] Import déclenche l'enregistrement du listener SQLAlchemy qui
 # bloque la publication d'un produit sans allergènes réglementaires complets.
