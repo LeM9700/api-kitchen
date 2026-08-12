@@ -90,6 +90,11 @@ class ProductOut(BaseModel):
     image_url: str | None = None
     preparation_station: PreparationStation | None = None
     is_active: bool
+    # Renseigne uniquement pour les tenants CONNECTED (HubCatalogProvider) --
+    # toujours None/False pour STANDALONE (LocalCatalogProvider). Voir
+    # docs/superpowers/specs/2026-08-11-hub-catalog-sync-design.md.
+    tax_rate: float | None = None
+    is_featured: bool = False
 
 
 class ExtraCreate(BaseModel):
@@ -318,3 +323,48 @@ class ProductAvailabilityOverrideOut(BaseModel):
     reason: str | None = None
     changed_by_user_id: int
     created_at: datetime
+
+
+class NormalizedCatalogProduct(BaseModel):
+    """Format pivot d'un produit tel que stocke dans catalog_snapshots.normalized.
+
+    [HYPOTHESE NON CONFIRMEE] Champs derives d'une hypothese raisonnable sur le
+    format de reponse du hub -- a confirmer avec le vrai fournisseur. Isole
+    dans app/modules/catalog/normalize.py (seul point de mapping depuis le
+    payload brut du hub).
+    """
+
+    external_id: str
+    name: str
+    description: str | None = None
+    category: str | None = None
+    price: float
+    tax_rate: float | None = None
+    image_url: str | None = None
+    is_active: bool = True
+
+
+class ProductOverrideCreate(BaseModel):
+    """Donnees de presentation modifiables localement pour un produit synchronise
+    depuis le hub. Aucun champ prix/TVA -- garde-fou fiscal au niveau schema,
+    pas seulement applicatif (voir CatalogSnapshotUnavailableError et le design
+    spec pour le contexte)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_url: str | None = None
+    description: str | None = None
+    is_featured: bool | None = None
+    display_order: int | None = None
+
+
+class ProductOverrideOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    connection_id: int
+    external_product_id: str
+    image_url: str | None = None
+    description: str | None = None
+    is_featured: bool | None = None
+    display_order: int | None = None
