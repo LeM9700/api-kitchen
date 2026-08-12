@@ -8,7 +8,7 @@ from app.core.http.deps import get_current_user
 from app.core.tenancy.integration_mode import IntegrationMode
 from app.modules.catalog.exceptions import ReadOnlyCatalogError
 from app.modules.catalog.ports import CatalogProvider
-from app.modules.catalog.providers import ConnectedCatalogProvider, LocalCatalogProvider
+from app.modules.catalog.providers import HubCatalogProvider, LocalCatalogProvider
 
 
 async def _load_integration_mode(tenant_slug: str) -> IntegrationMode:
@@ -30,6 +30,28 @@ async def _load_integration_mode(tenant_slug: str) -> IntegrationMode:
     return IntegrationMode(value) if value else IntegrationMode.STANDALONE
 
 
+async def _load_active_connection_id(tenant_slug: str) -> int | None:
+    """Retourne l'id de la connexion POS active du tenant, ou None.
+
+    Args:
+        tenant_slug: Slug du tenant.
+
+    Returns:
+        ``public.pos_connections.id`` de la connexion active, ou None si
+        aucune connexion active n'existe (cas limite : tenant CONNECTED sans
+        connexion active, ex. juste apres une revocation).
+    """
+    async with get_public_session() as session:
+        return await session.scalar(
+            text(
+                "SELECT pc.id FROM public.pos_connections pc "
+                "JOIN public.tenants t ON t.id = pc.tenant_id "
+                "WHERE t.slug = :slug AND pc.status = 'active'"
+            ),
+            {"slug": tenant_slug},
+        )
+
+
 async def get_catalog_provider(tenant_slug: str) -> CatalogProvider:
     """Resout l'implementation CatalogProvider a utiliser pour un tenant.
 
@@ -44,11 +66,13 @@ async def get_catalog_provider(tenant_slug: str) -> CatalogProvider:
 
     Returns:
         ``LocalCatalogProvider`` si le tenant est STANDALONE (par defaut),
-        ``ConnectedCatalogProvider`` si CONNECTED.
+        ``HubCatalogProvider`` si CONNECTED (avec l'id de sa connexion active,
+        ou None si CONNECTED sans connexion active).
     """
     mode = await _load_integration_mode(tenant_slug)
     if mode == IntegrationMode.CONNECTED:
-        return ConnectedCatalogProvider()
+        connection_id = await _load_active_connection_id(tenant_slug)
+        return HubCatalogProvider(connection_id)
     return LocalCatalogProvider()
 
 

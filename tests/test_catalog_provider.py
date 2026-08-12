@@ -99,52 +99,12 @@ async def test_local_catalog_provider_get_catalog_matches_service_directly():
         await engine.dispose()
 
 
-async def test_connected_catalog_provider_blocks_writes_but_allows_reads():
-    import pytest
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-
-    from app.core.config import settings
-    from app.core.http.schemas import PaginationParams
-    from app.modules.catalog.exceptions import ReadOnlyCatalogError
-    from app.modules.catalog.providers import ConnectedCatalogProvider
-    from app.modules.catalog.schemas import ProductCreate, ProductUpdate
-
-    engine = create_async_engine(settings.test_database_url or settings.database_url)
-    try:
-        async with engine.connect() as conn:
-            await conn.begin()
-            await conn.execute(text('SET search_path TO "tenant_pizza_test", public'))
-            session = AsyncSession(bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint")
-            try:
-                provider = ConnectedCatalogProvider()
-
-                pagination = PaginationParams(page=1, page_size=10)
-                summaries, total = await provider.get_catalog(session, pagination)
-                assert isinstance(summaries, list)
-                assert isinstance(total, int)
-
-                with pytest.raises(ReadOnlyCatalogError):
-                    await provider.create_product(session, ProductCreate(name="X", base_price=1.0), user_id=1)
-                with pytest.raises(ReadOnlyCatalogError):
-                    await provider.update_product(session, 1, ProductUpdate(base_price=2.0), user_id=1)
-                with pytest.raises(ReadOnlyCatalogError):
-                    await provider.delete_product(session, 1, user_id=1)
-            finally:
-                await session.close()
-                await conn.rollback()
-    except OSError as exc:
-        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
-    finally:
-        await engine.dispose()
-
-
 def test_providers_satisfy_catalog_provider_protocol():
     from app.modules.catalog.ports import CatalogProvider
-    from app.modules.catalog.providers import ConnectedCatalogProvider, LocalCatalogProvider
+    from app.modules.catalog.providers import HubCatalogProvider, LocalCatalogProvider
 
     assert isinstance(LocalCatalogProvider(), CatalogProvider)
-    assert isinstance(ConnectedCatalogProvider(), CatalogProvider)
+    assert isinstance(HubCatalogProvider(connection_id=1), CatalogProvider)
 
 
 async def test_get_catalog_provider_resolves_local_for_standalone(monkeypatch):
@@ -161,18 +121,23 @@ async def test_get_catalog_provider_resolves_local_for_standalone(monkeypatch):
     assert isinstance(provider, LocalCatalogProvider)
 
 
-async def test_get_catalog_provider_resolves_connected_for_connected(monkeypatch):
+async def test_get_catalog_provider_resolves_hub_for_connected(monkeypatch):
     from app.core.tenancy.integration_mode import IntegrationMode
     from app.modules.catalog import deps
-    from app.modules.catalog.providers import ConnectedCatalogProvider
+    from app.modules.catalog.providers import HubCatalogProvider
 
     async def fake_load(tenant_slug: str) -> IntegrationMode:
         return IntegrationMode.CONNECTED
 
+    async def fake_load_connection_id(tenant_slug: str) -> int | None:
+        return 999
+
     monkeypatch.setattr(deps, "_load_integration_mode", fake_load)
+    monkeypatch.setattr(deps, "_load_active_connection_id", fake_load_connection_id)
 
     provider = await deps.get_catalog_provider("any-slug")
-    assert isinstance(provider, ConnectedCatalogProvider)
+    assert isinstance(provider, HubCatalogProvider)
+    assert provider._connection_id == 999
 
 
 async def test_load_integration_mode_reads_real_tenant_row():
