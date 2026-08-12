@@ -3,6 +3,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import sentry_sdk
 from arq import create_pool
@@ -29,13 +30,21 @@ from worker.main import get_redis_settings
 configure_logging()
 logger = logging.getLogger(__name__)
 
-if settings.sentry_dsn:
+
+def _is_valid_sentry_dsn(dsn: str) -> bool:
+    parsed = urlparse(dsn)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+if settings.sentry_dsn and _is_valid_sentry_dsn(settings.sentry_dsn):
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
         environment=settings.environment,
         integrations=[FastApiIntegration()],
         traces_sample_rate=0.1,
     )
+elif settings.sentry_dsn:
+    logger.warning("invalid SENTRY_DSN ignored")
 
 # [🔒 SÉCURITÉ] Import déclenche l'enregistrement du listener SQLAlchemy qui
 # bloque la publication d'un produit sans allergènes réglementaires complets.
@@ -261,6 +270,7 @@ def create_app() -> FastAPI:
     from app.modules.payments.router import router as payments_router
     from app.modules.payments.connect_router import router as payments_connect_router
     from app.modules.pos.router import router as pos_router
+    from app.modules.pos.router import webhook_router as pos_webhook_router
     from app.modules.stock.router import router as stock_router
     from app.modules.loyalty.router import router as loyalty_router
     from app.modules.promotions.router import router as promotions_router
@@ -279,6 +289,7 @@ def create_app() -> FastAPI:
     app.include_router(payments_router, prefix=prefix + "/payments", tags=["payments"])
     app.include_router(payments_connect_router, prefix=prefix + "/payments/connect", tags=["payments-connect"])
     app.include_router(pos_router, prefix=prefix + "/pos/connect", tags=["pos-connect"])
+    app.include_router(pos_webhook_router, prefix=prefix + "/pos", tags=["pos-webhook"])
     app.include_router(stock_router, prefix=prefix + "/stock", tags=["stock"])
     app.include_router(loyalty_router, prefix=prefix + "/loyalty")
     app.include_router(promotions_router, prefix=prefix + "/promotions", tags=["promotions"])

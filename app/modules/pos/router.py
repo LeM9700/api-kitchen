@@ -33,13 +33,14 @@ import logging
 from arq import ArqRedis
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.core.config import settings
 from app.core.http.deps import get_arq_pool, require_role
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.modules.pos import service as pos_service
+from app.modules.pos import webhook_service
 
 logger = logging.getLogger(__name__)
 
@@ -176,3 +177,66 @@ async def disconnect_connection(
     await pos_service.disconnect(tenant_slug)
     logger.info("POS connection revoked: tenant=%s by=%s", tenant_slug, current_user.get("id"))
     return PosDisconnectResponse(status="revoked")
+
+
+webhook_router = APIRouter()
+
+
+class PosCatalogWebhookPayload(BaseModel):
+    """Payload webhook hub -- format hypothese, a confirmer avec le vrai fournisseur."""
+
+    external_establishment_id: str
+
+
+class PosCatalogWebhookResponse(BaseModel):
+    """Confirmation de prise en compte du webhook (jamais de traitement synchrone)."""
+
+    accepted: bool
+
+
+@webhook_router.post("/catalog-webhook", response_model=PosCatalogWebhookResponse, status_code=202)
+async def catalog_webhook(request: Request) -> PosCatalogWebhookResponse:
+    """Webhook entrant du hub POS : notifie un changement d'inventaire cote caisse.
+
+    Ne fait jamais d'appel synchrone au hub -- se contente d'enqueue
+    sync_catalog_from_hub et retourne immediatement.
+
+    [NOTE] Le pool arq (``get_arq_pool``) est recupere manuellement, apres
+    toutes les verifications, plutot que via ``Depends`` -- une dependance
+    FastAPI est resolue avant le corps de la fonction, ce qui casserait le
+    503/401/400/404 attendu sur une requete non configuree/non signee (acces
+    a ``app.state.arq_pool`` avant meme la verification de signature).
+
+    Args:
+        request: Requete FastAPI (corps brut lu pour la verification de signature).
+
+    Returns:
+        PosCatalogWebhookResponse(accepted=True) si le job a ete enqueue.
+
+    Raises:
+        AppError: POS_WEBHOOK_NOT_CONFIGURED (503) si non configure.
+        AppError: POS_WEBHOOK_INVALID_SIGNATURE (401) si la signature est invalide.
+        AppError: POS_WEBHOOK_INVALID_PAYLOAD (400) si le payload est mal forme.
+        AppError: POS_WEBHOOK_UNKNOWN_CONNECTION (404) si l'etablissement est inconnu.
+    """
+    if not webhook_service.is_webhook_configured():
+        raise AppError("POS_WEBHOOK_NOT_CONFIGURED", "Le webhook catalogue POS n'est pas configure.", 503)
+
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature")
+    if not webhook_service.verify_signature(raw_body, signature):
+        raise AppError("POS_WEBHOOK_INVALID_SIGNATURE", "Signature webhook invalide.", 401)
+
+    try:
+        payload = PosCatalogWebhookPayload.model_validate_json(raw_body)
+    except ValidationError as exc:
+        raise AppError("POS_WEBHOOK_INVALID_PAYLOAD", "Payload webhook invalide.", 400) from exc
+
+    connection_id = await webhook_service.resolve_connection_id(payload.external_establishment_id)
+    if connection_id is None:
+        raise AppError("POS_WEBHOOK_UNKNOWN_CONNECTION", "Etablissement inconnu.", 404)
+
+    redis: ArqRedis = get_arq_pool(request)
+    await redis.enqueue_job("sync_catalog_from_hub", connection_id=connection_id)
+    logger.info("POS catalog webhook accepted: connection_id=%s", connection_id)
+    return PosCatalogWebhookResponse(accepted=True)
