@@ -50,6 +50,7 @@ class Product(Base):
             text("to_tsvector('french', name || ' ' || COALESCE(description, ''))"),
             postgresql_using="gin",
         ),
+        UniqueConstraint("external_product_id", name="uq_products_external_product_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -64,6 +65,14 @@ class Product(Base):
     is_delivery_prohibited: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Renseigne uniquement pour un produit materialise depuis un hub POS
+    # (CONNECTED) -- NULL pour tout produit STANDALONE. Ecrit exclusivement
+    # par worker/tasks/catalog_sync.py::sync_catalog_from_hub, jamais par
+    # ProductCreate/ProductUpdate (qui n'ont pas ce champ).
+    external_product_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Idem : TVA du produit, fournie par le hub. Garde-fou fiscal structurel
+    # inchange -- ProductCreate/ProductUpdate n'exposent pas ce champ.
+    tax_rate: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
 
 
 class ProductAvailabilityOverride(Base):
@@ -190,16 +199,17 @@ class CatalogSnapshot(Base):
 
 
 class ProductOverride(Base):
+    """Donnees de presentation modifiables localement pour un produit
+    materialise depuis un hub POS. Aucune colonne prix/TVA -- garde-fou
+    fiscal structurel (voir docs/superpowers/specs/2026-08-12-hub-catalog-
+    materialization-design.md)."""
+
     __tablename__ = "product_overrides"
-    __table_args__ = (
-        UniqueConstraint(
-            "connection_id", "external_product_id", name="uq_product_overrides_connection_external_id"
-        ),
-    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    connection_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    external_product_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
     image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_featured: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

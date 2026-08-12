@@ -55,3 +55,18 @@ async def test_list_overrides_keyed_by_external_product_id(db_session):
 
     overrides = await snapshot_repository.list_overrides(db_session, connection_id=42)
     assert overrides["ext-1"].is_featured is True
+
+
+async def test_product_and_product_override_have_materialization_columns(db_session):
+    import sqlalchemy as sa
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    await db_session.execute(
+        sa.text("SELECT id, external_product_id, tax_rate FROM products LIMIT 0")
+    )
+    await db_session.execute(
+        sa.text(
+            "SELECT id, product_id, image_url, description, is_featured, display_order "
+            "FROM product_overrides LIMIT 0"
+        )
+    )
