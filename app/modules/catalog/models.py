@@ -173,3 +173,38 @@ class CatalogImportBatch(Base):
         nullable=False,
         server_default=text("now()"),
     )
+
+
+class CatalogSnapshot(Base):
+    __tablename__ = "catalog_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connection_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    normalized: Mapped[list] = mapped_column(JSON, nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ProductOverride(Base):
+    __tablename__ = "product_overrides"
+    __table_args__ = (
+        UniqueConstraint(
+            "connection_id", "external_product_id", name="uq_product_overrides_connection_external_id"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connection_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    external_product_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_featured: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    display_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
