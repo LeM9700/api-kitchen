@@ -18,6 +18,7 @@ Worker ARQ gérant les tâches asynchrones hors du chemin HTTP : emails, alertes
 | `send_verification_email` | Enqueue à l'inscription | Récupère l'email depuis la DB tenant, envoie le lien de vérification UUID4 |
 | `aggregate_daily_stats` | Enqueue manuel (par date) | Agrège commandes `delivered` J-1 de PostgreSQL vers `daily_stats_{slug}` MongoDB |
 | `dead_letter_handler` | ARQ `on_job_startup` / monitoring | Enregistre explicitement un job en dead-letter MongoDB |
+| `sync_catalog_from_hub` | Webhook `/pos/catalog-webhook`, cron `sync_stale_catalog_connections`, ou resynchronisation paresseuse (`HubCatalogProvider.get_catalog` sur snapshot périmé) | Récupère le catalogue du hub (`HttpHubCatalogClient`) pour une `pos_connections.id`, normalise, upsert dans `catalog_snapshots` (schema tenant). Verrou Redis par connexion (`acquire_sync_lock`, TTL 150s > `job_timeout` 120s — skip si sync déjà en cours) + rate limit (`check_rate_limit`, `pos_hub_catalog_rate_limit_per_minute`=10/min — re-enqueue différé 30s si dépassé). |
 
 ## Cron jobs
 
@@ -26,6 +27,7 @@ Worker ARQ gérant les tâches asynchrones hors du chemin HTTP : emails, alertes
 | `aggregate_monthly_stats` | 00:00 UTC quotidien | Agrège `daily_stats_{slug}` par année+mois (pipeline MongoDB) vers `monthly_stats_{slug}`. Moyenne pondérée `avg_order_value`. Tous les tenants. |
 | `aggregate_live_stats` | Toutes les 5 minutes | Commandes/revenue des 24h + commandes `pending` depuis PostgreSQL, écrit dans `live_dashboard_{slug}`. Tous les tenants. |
 | `expire_loyalty_points` | 03:00 UTC quotidien | Expire les points de fidélité obsolètes par tenant. Rate-limité, timeout 600s. |
+| `sync_stale_catalog_connections` | Toutes les heures (minute 0) | Filet de sécurité : parcourt toutes les `pos_connections` actives, enqueue `sync_catalog_from_hub` pour celles dont le snapshot catalogue est absent ou périmé (`pos_hub_snapshot_staleness_minutes`=60min). Une connexion en échec (schema tenant supprimé, erreur DB) n'interrompt pas la boucle. |
 
 ## Dead-letter handling
 
