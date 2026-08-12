@@ -1,15 +1,6 @@
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
-
-
-def _tenant_session_context(db_session):
-    @asynccontextmanager
-    async def _context():
-        yield db_session
-
-    return _context
 
 
 async def _seed_active_connection(db_session, connection_id: int, tenant_slug: str = "pizza_test"):
@@ -29,13 +20,33 @@ async def _seed_active_connection(db_session, connection_id: int, tenant_slug: s
     await db_session.commit()
 
 
+def _patch_engine_and_sessions(monkeypatch, db_session):
+    """Redirects the task's engine/session creation so every session it opens is the
+    test's isolated, rollback-only ``db_session`` -- while still returning a spy engine
+    whose ``dispose()`` can be asserted, proving the real engine-lifecycle wiring
+    (``create_async_engine`` -> ... -> ``engine.dispose()``) is exercised end to end
+    rather than bypassed.
+
+    ``fake_engine`` stands in for the real ``AsyncEngine`` returned by
+    ``create_async_engine`` inside ``sync_catalog_from_hub``; ``async_sessionmaker`` is
+    patched to ignore that engine and always hand back ``db_session`` instead, so DB
+    writes/reads made by the task stay inside the test's transaction/rollback boundary.
+    """
+    from worker.tasks import catalog_sync
+
+    fake_engine = AsyncMock()
+    monkeypatch.setattr(catalog_sync, "create_async_engine", lambda *a, **kw: fake_engine)
+    monkeypatch.setattr(catalog_sync, "async_sessionmaker", lambda *a, **kw: (lambda: db_session))
+    return fake_engine
+
+
 async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
     from app.modules.catalog import snapshot_repository
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90001)
 
-    monkeypatch.setattr(catalog_sync, "_session_factory", lambda: (lambda: db_session))
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
@@ -53,13 +64,15 @@ async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
     assert snapshot is not None
     assert snapshot.normalized[0]["external_id"] == "ext-1"
 
+    fake_engine.dispose.assert_awaited_once()
+
 
 async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, monkeypatch):
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90002)
 
-    monkeypatch.setattr(catalog_sync, "_session_factory", lambda: (lambda: db_session))
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=False))
     fetch_mock = AsyncMock()
     monkeypatch.setattr(catalog_sync.HttpHubCatalogClient, "fetch_catalog", fetch_mock)
@@ -67,6 +80,7 @@ async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, mo
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90002)
 
     fetch_mock.assert_not_awaited()
+    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, monkeypatch):
@@ -76,7 +90,7 @@ async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, m
 
     await _seed_active_connection(db_session, connection_id=90003)
 
-    monkeypatch.setattr(catalog_sync, "_session_factory", lambda: (lambda: db_session))
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=False))
@@ -88,24 +102,27 @@ async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, m
 
     fetch_mock.assert_not_awaited()
     redis.enqueue_job.assert_awaited_once_with("sync_catalog_from_hub", connection_id=90003, _defer_by=30)
+    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_noop_when_connection_not_found_or_inactive(monkeypatch, db_session):
     from worker.tasks import catalog_sync
 
-    monkeypatch.setattr(catalog_sync, "_session_factory", lambda: (lambda: db_session))
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
     fetch_mock = AsyncMock()
     monkeypatch.setattr(catalog_sync.HttpHubCatalogClient, "fetch_catalog", fetch_mock)
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=99999999)
 
     fetch_mock.assert_not_awaited()
+    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_error(db_session, monkeypatch, caplog):
     """Proves fetch_catalog failures are caught, logged (exception TYPE only -- never the
-    message, which could contain secrets/tokens/PII), re-raised for ARQ's retry, and that
-    the sync lock is still released via the finally block."""
+    message, which could contain secrets/tokens/PII), re-raised (as a sanitized
+    RuntimeError, not the original exception) for ARQ's retry, the sync lock is still
+    released via the finally block, and the engine is still disposed."""
     import logging
 
     import httpx
@@ -115,7 +132,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_err
     await _seed_active_connection(db_session, connection_id=90004)
 
     release_mock = AsyncMock()
-    monkeypatch.setattr(catalog_sync, "_session_factory", lambda: (lambda: db_session))
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", release_mock)
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
@@ -128,10 +145,23 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_err
     )
 
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(httpx.HTTPError):
+        with pytest.raises(RuntimeError) as exc_info:
             await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90004)
 
+    # Not the raw httpx.HTTPError -- a sanitized RuntimeError carrying only the type name.
+    assert not isinstance(exc_info.value, httpx.HTTPError)
+    assert "HTTPError" in str(exc_info.value)
+    assert secret_message not in str(exc_info.value)
+    # `raise ... from None` must sever chaining (__cause__ = None, suppress_context =
+    # True) so standard traceback formatting -- and with_dead_letter's str(error), which
+    # only ever looks at the raised exception itself, never walks __context__ -- can't
+    # recover the original message. (Note: __context__ itself is still set by Python's
+    # implicit chaining regardless of `from None`; nothing in this codebase reads it.)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
     release_mock.assert_awaited_once()
+    fake_engine.dispose.assert_awaited_once()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "HTTPError" in log_text
@@ -139,9 +169,9 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_err
 
 
 async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_payload(db_session, monkeypatch, caplog):
-    """Same guarantee as above, but for a payload that fetch_catalog returns successfully
+    """Same guarantees as above, but for a payload that fetch_catalog returns successfully
     and normalize_catalog then rejects as malformed -- the raw payload must never appear
-    in logs either."""
+    in logs or in the re-raised exception's message either."""
     import logging
 
     from app.modules.catalog.normalize import MalformedHubCatalogPayloadError
@@ -150,12 +180,13 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     await _seed_active_connection(db_session, connection_id=90005)
 
     release_mock = AsyncMock()
-    monkeypatch.setattr(catalog_sync, "_session_factory", lambda: (lambda: db_session))
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", release_mock)
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
 
-    malformed_payload = {"products": "not-a-list-and-also-not-secret-but-must-not-leak"}
+    secret_marker = "not-a-list-and-also-not-secret-but-must-not-leak"
+    malformed_payload = {"products": secret_marker}
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
@@ -163,11 +194,18 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     )
 
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(MalformedHubCatalogPayloadError):
+        with pytest.raises(RuntimeError) as exc_info:
             await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90005)
 
+    assert not isinstance(exc_info.value, MalformedHubCatalogPayloadError)
+    assert "MalformedHubCatalogPayloadError" in str(exc_info.value)
+    assert secret_marker not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
     release_mock.assert_awaited_once()
+    fake_engine.dispose.assert_awaited_once()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "MalformedHubCatalogPayloadError" in log_text
-    assert "not-a-list-and-also-not-secret-but-must-not-leak" not in log_text
+    assert secret_marker not in log_text

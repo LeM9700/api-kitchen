@@ -24,11 +24,6 @@ logger = logging.getLogger(__name__)
 _SYNC_LOCK_TTL_SECONDS = 150
 
 
-def _session_factory():
-    engine = create_async_engine(settings.database_url)
-    return async_sessionmaker(engine, expire_on_commit=False)
-
-
 async def _load_active_connection(session, connection_id: int) -> dict | None:
     result = await session.execute(
         text(
@@ -51,54 +46,73 @@ async def sync_catalog_from_hub(ctx, connection_id: int) -> None:
         ctx: Contexte ARQ injecte automatiquement (``redis``, ``job_try``).
         connection_id: Identifiant ``public.pos_connections.id`` a synchroniser.
     """
-    session_factory = _session_factory()
+    # Engine cree directement ici (comme worker/tasks/stock_alerts.py::send_stock_alert)
+    # et dispose() dans le finally externe -- ce worker etant appele par job (webhook,
+    # cron de balayage), un engine non dispose fuirait une pool de connexions Postgres
+    # par invocation.
+    engine = create_async_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
     redis = ctx.get("redis")
 
-    session = session_factory()
     try:
-        connection = await _load_active_connection(session, connection_id)
-    finally:
-        await session.close()
+        session = session_factory()
+        try:
+            connection = await _load_active_connection(session, connection_id)
+        finally:
+            await session.close()
 
-    if connection is None:
-        logger.warning("sync_catalog_from_hub: connection_id=%s introuvable ou inactive", connection_id)
-        return
-
-    if redis is not None:
-        locked = await acquire_sync_lock(redis, connection_id, _SYNC_LOCK_TTL_SECONDS)
-        if not locked:
-            logger.info("sync_catalog_from_hub: sync deja en cours, connection_id=%s", connection_id)
+        if connection is None:
+            logger.warning("sync_catalog_from_hub: connection_id=%s introuvable ou inactive", connection_id)
             return
 
-    try:
         if redis is not None:
-            allowed = await check_rate_limit(redis, connection_id, settings.pos_hub_catalog_rate_limit_per_minute)
-            if not allowed:
-                logger.info("sync_catalog_from_hub: rate limit atteint, re-enqueue connection_id=%s", connection_id)
-                await redis.enqueue_job("sync_catalog_from_hub", connection_id=connection_id, _defer_by=30)
+            locked = await acquire_sync_lock(redis, connection_id, _SYNC_LOCK_TTL_SECONDS)
+            if not locked:
+                logger.info("sync_catalog_from_hub: sync deja en cours, connection_id=%s", connection_id)
                 return
 
         try:
-            client = HttpHubCatalogClient()
-            payload = await client.fetch_catalog(connection)
-            normalized = normalize_catalog(payload)
-        except Exception as exc:
-            logger.error(
-                "sync_catalog_from_hub: echec recuperation/normalisation connection_id=%s error_type=%s",
-                connection_id,
-                type(exc).__name__,
-            )
-            raise
+            if redis is not None:
+                allowed = await check_rate_limit(redis, connection_id, settings.pos_hub_catalog_rate_limit_per_minute)
+                if not allowed:
+                    logger.info("sync_catalog_from_hub: rate limit atteint, re-enqueue connection_id=%s", connection_id)
+                    await redis.enqueue_job("sync_catalog_from_hub", connection_id=connection_id, _defer_by=30)
+                    return
 
-        schema = tenant_schema_name(connection["tenant_slug"])
-        tenant_session = session_factory()
-        try:
-            await tenant_session.execute(text(f'SET search_path TO "{schema}", public'))
-            await snapshot_repository.upsert_snapshot(tenant_session, connection_id, payload, normalized)
+            try:
+                client = HttpHubCatalogClient()
+                payload = await client.fetch_catalog(connection)
+                normalized = normalize_catalog(payload)
+            except Exception as exc:
+                logger.error(
+                    "sync_catalog_from_hub: echec recuperation/normalisation connection_id=%s error_type=%s",
+                    connection_id,
+                    type(exc).__name__,
+                )
+                # On ne re-leve JAMAIS l'exception d'origine : son message peut
+                # contenir des fragments du payload hub (cf. normalize.py, qui
+                # interpole les valeurs de champs invalides dans son message
+                # d'erreur) ou, via une future evolution de hub_client, un
+                # extrait de reponse HTTP. with_dead_letter (worker_utils.py)
+                # persiste str(exception) tel quel dans MongoDB -- seul le nom
+                # du type est sur a propager. `from None` supprime le
+                # chainage (__cause__/__context__) pour qu'aucun formateur de
+                # traceback en aval ne puisse remonter au message original.
+                raise RuntimeError(
+                    f"sync_catalog_from_hub: echec recuperation/normalisation ({type(exc).__name__})"
+                ) from None
+
+            schema = tenant_schema_name(connection["tenant_slug"])
+            tenant_session = session_factory()
+            try:
+                await tenant_session.execute(text(f'SET search_path TO "{schema}", public'))
+                await snapshot_repository.upsert_snapshot(tenant_session, connection_id, payload, normalized)
+            finally:
+                await tenant_session.close()
+
+            logger.info("sync_catalog_from_hub: succes connection_id=%s produits=%s", connection_id, len(normalized))
         finally:
-            await tenant_session.close()
-
-        logger.info("sync_catalog_from_hub: succes connection_id=%s produits=%s", connection_id, len(normalized))
+            if redis is not None:
+                await release_sync_lock(redis, connection_id)
     finally:
-        if redis is not None:
-            await release_sync_lock(redis, connection_id)
+        await engine.dispose()
