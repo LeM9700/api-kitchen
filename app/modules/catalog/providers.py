@@ -16,7 +16,7 @@ class LocalCatalogProvider:
     """
 
     async def get_catalog(
-        self, session: AsyncSession, pagination: PaginationParams
+        self, session: AsyncSession, pagination: PaginationParams, redis=None
     ) -> tuple[list[ProductSummaryOut], int]:
         items, total = await service.list_products(session, pagination)
         summaries = await service.build_product_summaries(session, items, include_availability=True)

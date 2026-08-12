@@ -20,7 +20,7 @@ class CatalogProvider(Protocol):
     """Port d'acces au catalogue produits d'un tenant."""
 
     async def get_catalog(
-        self, session: AsyncSession, pagination: PaginationParams
+        self, session: AsyncSession, pagination: PaginationParams, redis=None
     ) -> tuple[list[ProductSummaryOut], int]:
         """Retourne la page de produits actifs du catalogue (listing par defaut).
 
@@ -32,6 +32,10 @@ class CatalogProvider(Protocol):
             session: Session SQLAlchemy deja ouverte sur le schema du tenant
                 courant (``get_tenant_session``).
             pagination: Parametres de pagination (page, page_size).
+            redis: Pool Redis partage (optionnel), utilise par les adaptateurs
+                qui doivent enqueue une tache de fond (ex: resynchronisation
+                d'un snapshot perime). Ignore par les adaptateurs qui n'en ont
+                pas besoin.
 
         Returns:
             Tuple ``(resumes de produits, nombre total de produits actifs)``.

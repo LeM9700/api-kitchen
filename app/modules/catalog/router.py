@@ -153,7 +153,7 @@ async def products(
     provider = await get_catalog_provider(slug) if is_default_listing else None
     async with get_tenant_session(slug) as session:
         if is_default_listing:
-            summaries, total = await provider.get_catalog(session, pagination)
+            summaries, total = await provider.get_catalog(session, pagination, redis=redis)
         else:
             offset = (pagination.page - 1) * pagination.page_size
             items, total = await service.search_products(

@@ -367,3 +367,13 @@ def test_catalog_snapshot_unavailable_error_message_is_restaurant_facing():
     assert exc.status_code == 409
     assert "technique" not in exc.detail.lower()
     assert "synchronisé" in exc.detail
+
+
+def test_get_catalog_accepts_optional_redis_kwarg_without_error():
+    import inspect
+
+    from app.modules.catalog.providers import LocalCatalogProvider
+
+    sig = inspect.signature(LocalCatalogProvider.get_catalog)
+    assert "redis" in sig.parameters
+    assert sig.parameters["redis"].default is None
