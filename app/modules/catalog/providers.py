@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.http.schemas import PaginationParams
-from app.modules.catalog import service, snapshot_repository
+from app.modules.catalog import hub_client, service, snapshot_repository
 from app.modules.catalog.allergen.allergen_service import validate_product_for_publication
 from app.modules.catalog.exceptions import CatalogSnapshotUnavailableError, ReadOnlyCatalogError
 from app.modules.catalog.models import Product, ProductOverride
@@ -196,9 +196,16 @@ class HubCatalogProvider:
         page_items = summaries[start:end]
 
         staleness = timedelta(minutes=settings.pos_hub_snapshot_staleness_minutes)
-        if redis is not None and datetime.now(timezone.utc) - snapshot.synced_at > staleness:
+        if (
+            redis is not None
+            and hub_client.is_configured()
+            and datetime.now(timezone.utc) - snapshot.synced_at > staleness
+        ):
             # Best-effort : un snapshot perime reste servi, une panne Redis ne
-            # doit jamais faire echouer la lecture du catalogue.
+            # doit jamais faire echouer la lecture du catalogue. hub_client.is_configured()
+            # evite d'enqueuer un job pour rien : sync_catalog_from_hub se termine
+            # deja en no-op si le hub n'est pas configure (meme garde-fou global), mais
+            # eviter l'enqueue ici economise un aller-retour Redis/ARQ inutile.
             try:
                 await redis.enqueue_job("sync_catalog_from_hub", connection_id=self._connection_id)
             except Exception:  # noqa: BLE001 - resynchronisation opportuniste

@@ -336,6 +336,7 @@ async def test_get_catalog_enqueues_resync_when_snapshot_is_stale(monkeypatch):
     try:
         engine, conn, session = await _tenant_session()
         monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
+        monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
         snapshot = await snapshot_repository.upsert_snapshot(
             session,
             connection_id=557,
@@ -374,6 +375,7 @@ async def test_get_catalog_still_served_when_stale_enqueue_fails(monkeypatch):
     try:
         engine, conn, session = await _tenant_session()
         monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
+        monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
         snapshot = await snapshot_repository.upsert_snapshot(
             session,
             connection_id=563,
@@ -454,6 +456,47 @@ async def test_get_catalog_does_not_enqueue_resync_when_snapshot_is_fresh():
         provider = HubCatalogProvider(connection_id=558)
         await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
 
+        redis.enqueue_job.assert_not_awaited()
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        await session.close()
+        await conn.rollback()
+        await conn.close()
+        await engine.dispose()
+
+
+async def test_get_catalog_does_not_enqueue_resync_when_hub_not_configured(monkeypatch):
+    """Finding 1 (cleanliness follow-up): even for a stale snapshot, no resync job is
+    enqueued when pos_hub_catalog_url is empty -- sync_catalog_from_hub would just
+    no-op it anyway (worker/tasks/catalog_sync.py's own is_configured() gate), so
+    enqueuing here is a pointless Redis/ARQ round trip."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import AsyncMock
+
+    from app.core.config import settings as app_settings
+    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.providers import HubCatalogProvider
+    from app.modules.catalog.schemas import NormalizedCatalogProduct
+
+    try:
+        engine, conn, session = await _tenant_session()
+        monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
+        monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "")
+        snapshot = await snapshot_repository.upsert_snapshot(
+            session,
+            connection_id=566,
+            payload={},
+            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
+        )
+        snapshot.synced_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        await session.commit()
+
+        redis = AsyncMock()
+        provider = HubCatalogProvider(connection_id=566)
+        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
+
+        assert total == 1  # stale snapshot still served
         redis.enqueue_job.assert_not_awaited()
     except OSError as exc:
         pytest.skip(f"PostgreSQL test database unavailable: {exc}")

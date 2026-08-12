@@ -46,12 +46,14 @@ def _patch_engine_and_sessions(monkeypatch, db_session):
 
 
 async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
+    from app.core.config import settings
     from app.modules.catalog import snapshot_repository
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90001)
 
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
@@ -73,11 +75,13 @@ async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
 
 
 async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, monkeypatch):
+    from app.core.config import settings
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90002)
 
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=False))
     fetch_mock = AsyncMock()
     monkeypatch.setattr(catalog_sync.HttpHubCatalogClient, "fetch_catalog", fetch_mock)
@@ -91,11 +95,13 @@ async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, mo
 async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, monkeypatch):
     from unittest.mock import AsyncMock as Mock
 
+    from app.core.config import settings
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90003)
 
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=False))
@@ -132,12 +138,14 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_err
 
     import httpx
 
+    from app.core.config import settings
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90004)
 
     release_mock = AsyncMock()
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", release_mock)
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
@@ -179,6 +187,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     in logs or in the re-raised exception's message either."""
     import logging
 
+    from app.core.config import settings
     from app.modules.catalog.normalize import MalformedHubCatalogPayloadError
     from worker.tasks import catalog_sync
 
@@ -186,6 +195,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
 
     release_mock = AsyncMock()
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", release_mock)
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
@@ -221,6 +231,7 @@ async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db
 
     import sqlalchemy as sa
 
+    from app.core.config import settings
     from app.modules.catalog import snapshot_repository
     from app.modules.catalog.schemas import NormalizedCatalogProduct
     from worker.tasks import catalog_sync
@@ -237,6 +248,7 @@ async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db
     # 90102 has no snapshot at all -- must also be enqueued.
 
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
 
     redis = AsyncMock()
     await catalog_sync.sync_stale_catalog_connections({"redis": redis})
@@ -272,6 +284,7 @@ async def test_sync_stale_catalog_connections_enqueues_stale_snapshot(db_session
     await db_session.commit()
 
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
 
     redis = AsyncMock()
     await catalog_sync.sync_stale_catalog_connections({"redis": redis})
@@ -316,6 +329,7 @@ async def test_sync_stale_catalog_connections_isolates_per_connection_failures(d
     the first failure."""
     import logging
 
+    from app.core.config import settings
     from worker.tasks import catalog_sync
 
     await _seed_active_connection(db_session, connection_id=90104)
@@ -324,6 +338,7 @@ async def test_sync_stale_catalog_connections_isolates_per_connection_failures(d
     # 90104 and 90105 have no snapshot -- both must still be enqueued despite 90106 failing.
 
     fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
 
     redis = AsyncMock()
     with caplog.at_level(logging.INFO):
@@ -343,6 +358,128 @@ async def test_sync_stale_catalog_connections_isolates_per_connection_failures(d
     # Summary log proves the observability half of the fix: scanned/enqueued/failed counts.
     assert "sync_stale_catalog_connections: termine" in log_text
     assert "echecs=1" in log_text
+
+
+async def test_sync_catalog_from_hub_skips_when_not_configured(db_session, monkeypatch):
+    """Finding 1: pos_hub_catalog_url empty (the default, safe-looking state) must
+    short-circuit before the lock/rate-limiter/hub are touched at all -- otherwise a
+    tenant with an active connection but no hub URL configured gets retried (and
+    dead-lettered) every single hour, forever."""
+    from app.core.config import settings
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90006)
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "")
+    lock_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", lock_mock)
+    fetch_mock = AsyncMock()
+    monkeypatch.setattr(catalog_sync.HttpHubCatalogClient, "fetch_catalog", fetch_mock)
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90006)
+
+    lock_mock.assert_not_awaited()
+    fetch_mock.assert_not_awaited()
+    fake_engine.dispose.assert_awaited_once()
+
+
+async def test_sync_stale_catalog_connections_skips_when_not_configured(db_session, monkeypatch):
+    """Finding 1: same global gate for the hourly cron -- no point scanning active
+    connections at all when the hub isn't configured."""
+    from app.core.config import settings
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90007)
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "")
+
+    redis = AsyncMock()
+    await catalog_sync.sync_stale_catalog_connections({"redis": redis})
+
+    redis.enqueue_job.assert_not_awaited()
+    fake_engine.dispose.assert_awaited_once()
+
+
+async def test_sync_catalog_from_hub_rejects_empty_catalog_overwriting_existing_snapshot(db_session, monkeypatch):
+    """Finding 2: a hub response with an empty product list must never silently wipe
+    out an already-populated snapshot (transient hub issue, wrong establishment id,
+    partial response, application bug returning 200 with []) -- the restaurant's
+    public menu must not disappear until a real update comes in."""
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.schemas import NormalizedCatalogProduct
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90008)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    original = await snapshot_repository.upsert_snapshot(
+        db_session,
+        connection_id=90008,
+        payload={"products": [{"id": "ext-1", "name": "Regina", "price": 11.5}]},
+        normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
+    )
+    original_synced_at = original.synced_at
+    original_normalized = original.normalized
+    await db_session.commit()
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(return_value={"products": []}),
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90008)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    snapshot = await snapshot_repository.get_snapshot(db_session, connection_id=90008)
+    assert snapshot is not None
+    assert snapshot.normalized == original_normalized
+    assert snapshot.synced_at == original_synced_at
+
+    fake_engine.dispose.assert_awaited_once()
+
+
+async def test_sync_catalog_from_hub_allows_empty_catalog_on_first_sync(db_session, monkeypatch):
+    """Finding 2: when there is NO existing snapshot yet, an empty catalog from the
+    hub is a legitimate (if unusual) first-sync state -- must be persisted as-is,
+    not rejected."""
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from app.modules.catalog import snapshot_repository
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90009)
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(return_value={"products": []}),
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90009)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    snapshot = await snapshot_repository.get_snapshot(db_session, connection_id=90009)
+    assert snapshot is not None
+    assert snapshot.normalized == []
+
+    fake_engine.dispose.assert_awaited_once()
 
 
 def test_sync_catalog_from_hub_registered_in_worker_settings():

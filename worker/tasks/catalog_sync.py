@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import settings
 from app.core.database import tenant_schema_name
-from app.modules.catalog import snapshot_repository
+from app.modules.catalog import hub_client, snapshot_repository
 from app.modules.catalog.hub_client import HttpHubCatalogClient
 from app.modules.catalog.normalize import normalize_catalog
 from app.modules.catalog.sync_guards import acquire_sync_lock, check_rate_limit, release_sync_lock
@@ -66,6 +66,17 @@ async def sync_catalog_from_hub(ctx, connection_id: int) -> None:
             logger.warning("sync_catalog_from_hub: connection_id=%s introuvable ou inactive", connection_id)
             return
 
+        # Garde-fou global (Contraintes globales du plan) : pos_hub_catalog_url vide
+        # = fonctionnalite desactivee. Verifie AVANT le verrou/rate-limiter/appel hub
+        # -- sans ce garde-fou, toute connexion active mais non configuree serait
+        # re-tentee (et mise en dead-letter) a chaque cron horaire, indefiniment.
+        if not hub_client.is_configured():
+            logger.info(
+                "sync_catalog_from_hub: hub non configure (pos_hub_catalog_url vide), sync ignoree connection_id=%s",
+                connection_id,
+            )
+            return
+
         if redis is not None:
             locked = await acquire_sync_lock(redis, connection_id, _SYNC_LOCK_TTL_SECONDS)
             if not locked:
@@ -107,6 +118,25 @@ async def sync_catalog_from_hub(ctx, connection_id: int) -> None:
             tenant_session = session_factory()
             try:
                 await tenant_session.execute(text(f'SET search_path TO "{schema}", public'))
+
+                if not normalized:
+                    # Un catalogue vide qui remplacerait un snapshot deja peuple n'est
+                    # pas une mise a jour legitime -- c'est le signe d'un probleme cote
+                    # hub (etablissement errone, reponse partielle, bug applicatif
+                    # renvoyant 200 avec une liste vide). On refuse l'ecrasement plutot
+                    # que de faire disparaitre silencieusement le menu public. Ce n'est
+                    # pas un echec transitoire a retenter : with_dead_letter n'est pas
+                    # sollicite ici, une future sync normale (cron/webhook/lazy-resync)
+                    # captera une vraie mise a jour si/quand le hub en a une.
+                    existing_snapshot = await snapshot_repository.get_snapshot(tenant_session, connection_id)
+                    if existing_snapshot is not None and existing_snapshot.normalized:
+                        logger.warning(
+                            "sync_catalog_from_hub: catalogue vide refuse (snapshot existant non vide conserve) "
+                            "connection_id=%s",
+                            connection_id,
+                        )
+                        return
+
                 await snapshot_repository.upsert_snapshot(tenant_session, connection_id, payload, normalized)
             finally:
                 await tenant_session.close()
@@ -140,6 +170,13 @@ async def sync_stale_catalog_connections(ctx) -> None:
     staleness = timedelta(minutes=settings.pos_hub_snapshot_staleness_minutes)
 
     try:
+        # Garde-fou global (settings vide = feature desactivee), verifie une seule fois
+        # par invocation puisqu'il s'agit d'un reglage global et non par connexion --
+        # inutile de lister les connexions actives si le hub n'est meme pas configure.
+        if not hub_client.is_configured():
+            logger.info("sync_stale_catalog_connections: hub non configure (pos_hub_catalog_url vide), cron ignore")
+            return
+
         session = session_factory()
         try:
             result = await session.execute(
