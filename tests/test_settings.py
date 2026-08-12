@@ -84,3 +84,9 @@ def test_hub_catalog_sync_settings_have_safe_defaults():
     assert settings.pos_hub_webhook_secret == ""
     assert settings.pos_hub_catalog_rate_limit_per_minute == 10
     assert settings.pos_hub_snapshot_staleness_minutes == 60
+
+
+def test_hub_catalog_hard_expiry_setting_defaults_to_24_hours():
+    from app.core.config import settings
+
+    assert settings.pos_hub_snapshot_hard_expiry_hours == 24

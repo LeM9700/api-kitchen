@@ -116,6 +116,11 @@ class Settings(BaseSettings):
     pos_hub_webhook_secret: str = ""
     pos_hub_catalog_rate_limit_per_minute: int = 10
     pos_hub_snapshot_staleness_minutes: int = 60
+    # Au-dela de ce seuil (mesure depuis catalog_snapshots.synced_at), un
+    # snapshot n'est plus servi du tout (meme comportement 409 qu'un snapshot
+    # absent) plutot que d'etre servi indefiniment perime. Distinct de
+    # pos_hub_snapshot_staleness_minutes (qui sert quand meme + resynchronise).
+    pos_hub_snapshot_hard_expiry_hours: int = 24
 
 
 settings = Settings()
