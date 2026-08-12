@@ -155,17 +155,43 @@ async def sync_stale_catalog_connections(ctx) -> None:
             await session.close()
 
         now = datetime.now(timezone.utc)
+        enqueued_count = 0
+        failed_count = 0
         for row in connections:
-            schema = tenant_schema_name(row["tenant_slug"])
-            tenant_session = session_factory()
+            # Une connexion isolee (schema tenant supprime/renomme, slug obsolete,
+            # erreur DB transitoire) ne doit jamais interrompre la boucle : ce cron
+            # est le filet de securite horaire pour TOUTES les connexions actives,
+            # une seule connexion en echec ne doit pas priver les suivantes (triees
+            # apres elle) de resynchronisation pour le reste de l'heure.
             try:
-                await tenant_session.execute(text(f'SET search_path TO "{schema}", public'))
-                snapshot = await snapshot_repository.get_snapshot(tenant_session, row["connection_id"])
-            finally:
-                await tenant_session.close()
+                schema = tenant_schema_name(row["tenant_slug"])
+                tenant_session = session_factory()
+                try:
+                    await tenant_session.execute(text(f'SET search_path TO "{schema}", public'))
+                    snapshot = await snapshot_repository.get_snapshot(tenant_session, row["connection_id"])
+                finally:
+                    await tenant_session.close()
 
-            needs_sync = snapshot is None or (now - snapshot.synced_at) > staleness
-            if needs_sync and redis is not None:
-                await redis.enqueue_job("sync_catalog_from_hub", connection_id=row["connection_id"])
+                needs_sync = snapshot is None or (now - snapshot.synced_at) > staleness
+                if needs_sync and redis is not None:
+                    await redis.enqueue_job("sync_catalog_from_hub", connection_id=row["connection_id"])
+                    enqueued_count += 1
+            except Exception as exc:
+                # Type de l'exception seulement -- jamais son message (peut contenir
+                # des fragments de payload/erreur DB), meme regle que
+                # sync_catalog_from_hub ci-dessus.
+                failed_count += 1
+                logger.error(
+                    "sync_stale_catalog_connections: echec verification connection_id=%s error_type=%s",
+                    row["connection_id"],
+                    type(exc).__name__,
+                )
+
+        logger.info(
+            "sync_stale_catalog_connections: termine connexions_actives=%s enqueues=%s echecs=%s",
+            len(connections),
+            enqueued_count,
+            failed_count,
+        )
     finally:
         await engine.dispose()

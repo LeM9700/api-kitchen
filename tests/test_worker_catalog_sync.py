@@ -282,6 +282,69 @@ async def test_sync_stale_catalog_connections_enqueues_stale_snapshot(db_session
     fake_engine.dispose.assert_awaited_once()
 
 
+async def _seed_active_connection_with_broken_tenant_slug(db_session, connection_id: int) -> None:
+    """Seeds an active pos_connections row whose tenant has a slug that fails
+    ``tenant_schema_name``'s validation (app/core/database/session.py) -- simulating a
+    stale/corrupted ``public.tenants.slug`` row. Used to prove one connection's schema
+    resolution failure doesn't stop sync_stale_catalog_connections from evaluating the
+    rest. No DB constraint stops this: slug format is only validated at the app layer,
+    not by a CHECK constraint on public.tenants.
+    """
+    import sqlalchemy as sa
+
+    await db_session.execute(sa.text('SET search_path TO public'))
+    broken_slug = f"Broken Slug!{connection_id}"
+    tenant_id = await db_session.scalar(
+        sa.text("INSERT INTO public.tenants (slug, name, plan) VALUES (:slug, :name, 'starter') RETURNING id"),
+        {"slug": broken_slug, "name": "Broken Tenant"},
+    )
+    await db_session.execute(
+        sa.text(
+            "INSERT INTO public.pos_connections "
+            "(id, tenant_id, provider, external_establishment_id, access_token_encrypted, status, connected_at) "
+            "VALUES (:id, :tenant_id, 'generic_hub', :external_establishment_id, 'cipher', 'active', now())"
+        ),
+        {"id": connection_id, "tenant_id": tenant_id, "external_establishment_id": f"est-{connection_id}"},
+    )
+    await db_session.commit()
+
+
+async def test_sync_stale_catalog_connections_isolates_per_connection_failures(db_session, monkeypatch, caplog):
+    """One connection whose tenant schema resolution raises (invalid/stale slug) must not
+    stop the cron from evaluating and enqueuing the other active connections -- this cron
+    is the hourly safety net for every active connection, not just the ones sorted before
+    the first failure."""
+    import logging
+
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90104)
+    await _seed_active_connection(db_session, connection_id=90105)
+    await _seed_active_connection_with_broken_tenant_slug(db_session, connection_id=90106)
+    # 90104 and 90105 have no snapshot -- both must still be enqueued despite 90106 failing.
+
+    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+
+    redis = AsyncMock()
+    with caplog.at_level(logging.INFO):
+        await catalog_sync.sync_stale_catalog_connections({"redis": redis})
+
+    enqueued_ids = {call.kwargs["connection_id"] for call in redis.enqueue_job.await_args_list}
+    assert 90104 in enqueued_ids
+    assert 90105 in enqueued_ids
+    assert 90106 not in enqueued_ids
+
+    fake_engine.dispose.assert_awaited_once()
+
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "connection_id=90106" in log_text
+    assert "AppError" in log_text
+    assert "Broken Slug" not in log_text
+    # Summary log proves the observability half of the fix: scanned/enqueued/failed counts.
+    assert "sync_stale_catalog_connections: termine" in log_text
+    assert "echecs=1" in log_text
+
+
 def test_sync_catalog_from_hub_registered_in_worker_settings():
     from worker.main import WorkerSettings
 
