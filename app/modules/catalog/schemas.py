@@ -362,8 +362,7 @@ class ProductOverrideOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    connection_id: int
-    external_product_id: str
+    product_id: int
     image_url: str | None = None
     description: str | None = None
     is_featured: bool | None = None
