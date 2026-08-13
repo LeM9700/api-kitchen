@@ -650,3 +650,46 @@ async def test_sync_catalog_from_hub_empty_catalog_does_not_deactivate_existing_
         await db_session.execute(sa.text("SELECT is_active FROM products WHERE id = :id"), {"id": healthy_id})
     ).mappings().first()
     assert row["is_active"] is True  # untouched -- the empty response was rejected before materialization ran
+
+
+async def test_sync_catalog_from_hub_duplicate_external_id_in_same_batch_does_not_crash(db_session, monkeypatch):
+    """Regression: a malformed hub payload repeating the same external_id twice
+    used to create two in-memory Product rows for one not-yet-materialized
+    external_id, tripping the uq_products_external_product_id constraint on
+    flush. The second occurrence must reuse the row created by the first."""
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90205)
+
+    _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(
+            return_value={
+                "products": [
+                    {"id": "ext-dup-1", "name": "Regina", "price": 11.0},
+                    {"id": "ext-dup-1", "name": "Regina (updated)", "price": 12.0},
+                ]
+            }
+        ),
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90205)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    rows = (
+        await db_session.execute(
+            sa.text("SELECT name, base_price FROM products WHERE external_product_id = 'ext-dup-1'")
+        )
+    ).mappings().all()
+    assert len(rows) == 1  # one row, not a constraint-violation crash or a duplicate
+    assert rows[0]["name"] == "Regina (updated)"  # last item in the batch wins
+    assert float(rows[0]["base_price"]) == 12.0

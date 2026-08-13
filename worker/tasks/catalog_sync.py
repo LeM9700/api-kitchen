@@ -63,6 +63,7 @@ async def _materialize_products(session, normalized: list[NormalizedCatalogProdu
         if product is None:
             product = Product(external_product_id=item.external_id)
             session.add(product)
+            existing[item.external_id] = product
         product.name = item.name
         product.description = item.description
         product.base_price = item.price
