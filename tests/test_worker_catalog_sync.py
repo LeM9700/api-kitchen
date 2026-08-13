@@ -494,3 +494,159 @@ def test_sync_stale_catalog_connections_registered_as_cron():
 
     cron_functions = [job.coroutine.__name__ for job in WorkerSettings.cron_jobs]
     assert "sync_stale_catalog_connections" in cron_functions
+
+
+async def test_sync_catalog_from_hub_inserts_new_product(db_session, monkeypatch):
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90201)
+
+    _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(
+            return_value={
+                "products": [
+                    {"id": "ext-new-1", "name": "Regina", "price": 11.5, "tax_rate": 0.1, "is_active": True}
+                ]
+            }
+        ),
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90201)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    row = (
+        await db_session.execute(
+            sa.text("SELECT name, base_price, tax_rate, is_active FROM products WHERE external_product_id = 'ext-new-1'")
+        )
+    ).mappings().first()
+    assert row is not None
+    assert row["name"] == "Regina"
+    assert float(row["base_price"]) == 11.5
+    assert float(row["tax_rate"]) == 0.1
+    assert row["is_active"] is True
+
+
+async def test_sync_catalog_from_hub_updates_existing_product(db_session, monkeypatch):
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from app.modules.catalog.models import Product
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90202)
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    existing = Product(name="Old Name", base_price=9.0, external_product_id="ext-upd-1")
+    db_session.add(existing)
+    await db_session.commit()
+    existing_id = existing.id
+
+    _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(
+            return_value={"products": [{"id": "ext-upd-1", "name": "New Name", "price": 13.0, "tax_rate": 0.2}]}
+        ),
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90202)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    row = (
+        await db_session.execute(sa.text("SELECT id, name, base_price, tax_rate FROM products WHERE id = :id"), {"id": existing_id})
+    ).mappings().first()
+    assert row["id"] == existing_id  # same row updated, not a duplicate insert
+    assert row["name"] == "New Name"
+    assert float(row["base_price"]) == 13.0
+    assert float(row["tax_rate"]) == 0.2
+
+
+async def test_sync_catalog_from_hub_deactivates_product_removed_from_hub(db_session, monkeypatch):
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from app.modules.catalog.models import Product
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90203)
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    gone = Product(name="Discontinued", base_price=8.0, external_product_id="ext-gone-1", is_active=True)
+    db_session.add(gone)
+    await db_session.commit()
+    gone_id = gone.id
+
+    _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    # ext-gone-1 is absent from this response -- it disappeared from the hub.
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(return_value={"products": [{"id": "ext-still-here", "name": "Still Here", "price": 5.0}]}),
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90203)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    row = (
+        await db_session.execute(sa.text("SELECT id, is_active FROM products WHERE id = :id"), {"id": gone_id})
+    ).mappings().first()
+    assert row is not None  # never deleted
+    assert row["is_active"] is False
+
+
+async def test_sync_catalog_from_hub_empty_catalog_does_not_deactivate_existing_products(db_session, monkeypatch):
+    """Finding #2 from the prior lot's final review, re-verified at the products
+    level: an empty hub response must not wipe out a healthy materialized catalog."""
+    import sqlalchemy as sa
+
+    from app.core.config import settings
+    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.models import Product
+    from app.modules.catalog.schemas import NormalizedCatalogProduct
+    from worker.tasks import catalog_sync
+
+    await _seed_active_connection(db_session, connection_id=90204)
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    healthy = Product(name="Healthy", base_price=7.0, external_product_id="ext-healthy-1", is_active=True)
+    db_session.add(healthy)
+    await snapshot_repository.upsert_snapshot(
+        db_session,
+        connection_id=90204,
+        payload={},
+        normalized=[NormalizedCatalogProduct(external_id="ext-healthy-1", name="Healthy", price=7.0)],
+    )
+    healthy_id = healthy.id
+
+    _patch_engine_and_sessions(monkeypatch, db_session)
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient, "fetch_catalog", AsyncMock(return_value={"products": []})
+    )
+
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90204)
+
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    row = (
+        await db_session.execute(sa.text("SELECT is_active FROM products WHERE id = :id"), {"id": healthy_id})
+    ).mappings().first()
+    assert row["is_active"] is True  # untouched -- the empty response was rejected before materialization ran

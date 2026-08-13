@@ -7,14 +7,16 @@ HubCatalogProvider sur un snapshot perime.
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import settings
 from app.core.database import tenant_schema_name
 from app.modules.catalog import hub_client, snapshot_repository
 from app.modules.catalog.hub_client import HttpHubCatalogClient
+from app.modules.catalog.models import Product
 from app.modules.catalog.normalize import normalize_catalog
+from app.modules.catalog.schemas import NormalizedCatalogProduct
 from app.modules.catalog.sync_guards import acquire_sync_lock, check_rate_limit, release_sync_lock
 from worker.tasks.worker_utils import with_dead_letter
 
@@ -37,6 +39,40 @@ async def _load_active_connection(session, connection_id: int) -> dict | None:
     )
     row = result.mappings().first()
     return dict(row) if row else None
+
+
+async def _materialize_products(session, normalized: list[NormalizedCatalogProduct]) -> None:
+    """Upsert les produits synchronises dans `products`, matches par
+    `external_product_id`. Un produit disparu du hub est desactive
+    (`is_active=False`), jamais supprime physiquement -- preserve
+    l'integrite des commandes qui le referencent
+    (``session.get(Product, item.product_id)`` dans orders/service.py).
+
+    Args:
+        session: Session SQLAlchemy positionnee sur le schema du tenant.
+        normalized: Catalogue normalise (format pivot) tel que retourne par
+            ``normalize_catalog``.
+    """
+    result = await session.execute(select(Product).where(Product.external_product_id.is_not(None)))
+    existing = {p.external_product_id: p for p in result.scalars()}
+
+    seen_external_ids: set[str] = set()
+    for item in normalized:
+        seen_external_ids.add(item.external_id)
+        product = existing.get(item.external_id)
+        if product is None:
+            product = Product(external_product_id=item.external_id)
+            session.add(product)
+        product.name = item.name
+        product.description = item.description
+        product.base_price = item.price
+        product.tax_rate = item.tax_rate
+        product.image_url = item.image_url
+        product.is_active = item.is_active
+
+    for external_id, product in existing.items():
+        if external_id not in seen_external_ids:
+            product.is_active = False
 
 
 @with_dead_letter
@@ -123,11 +159,13 @@ async def sync_catalog_from_hub(ctx, connection_id: int) -> None:
                     # Un catalogue vide qui remplacerait un snapshot deja peuple n'est
                     # pas une mise a jour legitime -- c'est le signe d'un probleme cote
                     # hub (etablissement errone, reponse partielle, bug applicatif
-                    # renvoyant 200 avec une liste vide). On refuse l'ecrasement plutot
-                    # que de faire disparaitre silencieusement le menu public. Ce n'est
-                    # pas un echec transitoire a retenter : with_dead_letter n'est pas
-                    # sollicite ici, une future sync normale (cron/webhook/lazy-resync)
-                    # captera une vraie mise a jour si/quand le hub en a une.
+                    # renvoyant 200 avec une liste vide). On refuse l'ecrasement (et la
+                    # materialisation, qui desactiverait TOUS les produits synchronises)
+                    # plutot que de faire disparaitre silencieusement le menu public.
+                    # Ce n'est pas un echec transitoire a retenter : with_dead_letter
+                    # n'est pas sollicite ici, une future sync normale
+                    # (cron/webhook/lazy-resync) captera une vraie mise a jour si/quand
+                    # le hub en a une.
                     existing_snapshot = await snapshot_repository.get_snapshot(tenant_session, connection_id)
                     if existing_snapshot is not None and existing_snapshot.normalized:
                         logger.warning(
@@ -137,6 +175,7 @@ async def sync_catalog_from_hub(ctx, connection_id: int) -> None:
                         )
                         return
 
+                await _materialize_products(tenant_session, normalized)
                 await snapshot_repository.upsert_snapshot(tenant_session, connection_id, payload, normalized)
             finally:
                 await tenant_session.close()
