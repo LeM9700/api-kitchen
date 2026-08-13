@@ -5,7 +5,7 @@ async def test_catalog_snapshot_and_product_override_tables_exist(db_session):
     await db_session.execute(sa.text("SELECT id, connection_id, payload, normalized, synced_at FROM catalog_snapshots LIMIT 0"))
     await db_session.execute(
         sa.text(
-            "SELECT id, connection_id, external_product_id, image_url, description, "
+            "SELECT id, product_id, image_url, description, "
             "is_featured, display_order FROM product_overrides LIMIT 0"
         )
     )
@@ -41,20 +41,6 @@ async def test_upsert_snapshot_creates_then_updates(db_session):
 
     fetched = await snapshot_repository.get_snapshot(db_session, connection_id=42)
     assert fetched.payload == {"v": 2}
-
-
-async def test_list_overrides_keyed_by_external_product_id(db_session):
-    import sqlalchemy as sa
-
-    from app.modules.catalog.models import ProductOverride
-    from app.modules.catalog import snapshot_repository
-
-    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
-    db_session.add(ProductOverride(connection_id=42, external_product_id="ext-1", is_featured=True))
-    await db_session.commit()
-
-    overrides = await snapshot_repository.list_overrides(db_session, connection_id=42)
-    assert overrides["ext-1"].is_featured is True
 
 
 async def test_product_and_product_override_have_materialization_columns(db_session):
