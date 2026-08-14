@@ -7,8 +7,9 @@ from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
-from app.modules.catalog import service
+from app.modules.catalog import override_repository, service
 from app.modules.catalog.deps import get_catalog_provider, require_catalog_writable
+from app.modules.catalog.models import Product
 from app.modules.catalog.schemas import (
     CatalogCsvConfirmResponse,
     CatalogCsvDryRunResponse,
@@ -27,6 +28,8 @@ from app.modules.catalog.schemas import (
     ProductDetailOut,
     ProductExtraLink,
     ProductOut,
+    ProductOverrideCreate,
+    ProductOverrideOut,
     ProductRecommendationCreate,
     ProductRecommendationOut,
     ProductRecommendationUpdate,
@@ -262,6 +265,47 @@ async def delete_product(
     provider = await get_catalog_provider(current_user["tenant_slug"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         await provider.delete_product(session, product_id, user_id=_user_id(current_user))
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+
+
+@router.put("/products/{product_id}/override", response_model=ProductOverrideOut)
+async def set_product_override(
+    product_id: int,
+    body: ProductOverrideCreate,
+    current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
+):
+    """Cree ou remplace l'override de presentation d'un produit synchronise
+    depuis un hub POS. Reserve aux produits materialises (``external_product_id``
+    renseigne) -- un produit STANDALONE se modifie directement via
+    ``PUT /products/{id}``.
+    """
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        product = await session.get(Product, product_id)
+        if product is None:
+            raise AppError("PRODUCT_NOT_FOUND", f"Product {product_id} not found", 404, "product_id")
+        if product.external_product_id is None:
+            raise AppError(
+                "PRODUCT_NOT_SYNCED",
+                "Cet override n'a de sens que pour un produit synchronise depuis un hub POS.",
+                422,
+                "product_id",
+            )
+        override = await override_repository.upsert_override(session, product_id, body)
+    await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
+    return override
+
+
+@router.delete("/products/{product_id}/override", status_code=204)
+async def delete_product_override(
+    product_id: int,
+    current_user=Depends(require_role("admin")),
+    redis=Depends(get_arq_pool),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        deleted = await override_repository.delete_override(session, product_id)
+    if not deleted:
+        raise AppError("OVERRIDE_NOT_FOUND", f"No override exists for product {product_id}", 404, "product_id")
     await _invalidate_catalog_cache(redis, current_user["tenant_slug"])
 
 
