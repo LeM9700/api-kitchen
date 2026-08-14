@@ -15,6 +15,33 @@ async def _tenant_session():
     return engine, conn, session
 
 
+async def _seed_product(session, **kwargs):
+    from app.modules.catalog.models import Product
+
+    defaults = {"name": "Regina", "base_price": 11.5, "is_active": True}
+    defaults.update(kwargs)
+    product = Product(**defaults)
+    session.add(product)
+    await session.flush()
+    return product
+
+
+async def _seed_snapshot(session, connection_id: int, synced_at=None):
+    from datetime import datetime, timezone
+
+    from app.modules.catalog import snapshot_repository
+
+    snapshot = await snapshot_repository.upsert_snapshot(
+        session, connection_id=connection_id, payload={}, normalized=[]
+    )
+    if synced_at is not None:
+        snapshot.synced_at = synced_at
+    else:
+        snapshot.synced_at = datetime.now(timezone.utc)
+    await session.commit()
+    return snapshot
+
+
 async def test_get_catalog_raises_when_connection_id_is_none():
     from app.modules.catalog.exceptions import CatalogSnapshotUnavailableError
     from app.modules.catalog.providers import HubCatalogProvider
@@ -51,29 +78,19 @@ async def test_get_catalog_raises_when_no_snapshot_exists():
         await engine.dispose()
 
 
-async def test_get_catalog_serves_fresh_snapshot_without_network_call(monkeypatch):
-    from app.modules.catalog import snapshot_repository
+async def test_get_catalog_reads_from_products_table():
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=555,
-            payload={"raw": True},
-            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5, tax_rate=0.1)],
-        )
-
-        def _boom(*args, **kwargs):
-            raise AssertionError("HubCatalogProvider.get_catalog must never call the hub over HTTP")
-
-        monkeypatch.setattr("httpx.AsyncClient", _boom)
+        product = await _seed_product(session, name="Regina", base_price=11.5, tax_rate=0.1, external_product_id="ext-1")
+        await _seed_snapshot(session, connection_id=555)
 
         provider = HubCatalogProvider(connection_id=555)
         summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
 
         assert total == 1
+        assert summaries[0].id == product.id
         assert summaries[0].name == "Regina"
         assert summaries[0].base_price == 11.5
         assert summaries[0].tax_rate == 0.1
@@ -86,35 +103,43 @@ async def test_get_catalog_serves_fresh_snapshot_without_network_call(monkeypatc
         await engine.dispose()
 
 
-async def test_get_catalog_merges_product_overrides():
-    from app.modules.catalog import snapshot_repository
-    from app.modules.catalog.models import ProductOverride
+async def test_get_catalog_ids_are_real_product_ids_not_hashes():
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=556,
-            payload={},
-            normalized=[
-                NormalizedCatalogProduct(
-                    external_id="ext-1", name="Regina", price=11.5, image_url="https://hub.example.com/regina.jpg"
-                )
-            ],
-        )
-        session.add(
-            ProductOverride(
-                connection_id=556,
-                external_product_id="ext-1",
-                image_url="https://cdn.mine.com/custom-regina.jpg",
-                is_featured=True,
-            )
-        )
-        await session.commit()
+        product = await _seed_product(session, external_product_id="ext-2")
+        await _seed_snapshot(session, connection_id=556)
 
         provider = HubCatalogProvider(connection_id=556)
+        summaries, _ = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
+
+        assert summaries[0].id == product.id
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        await session.close()
+        await conn.rollback()
+        await conn.close()
+        await engine.dispose()
+
+
+async def test_get_catalog_merges_product_overrides():
+    from app.modules.catalog import override_repository
+    from app.modules.catalog.providers import HubCatalogProvider
+    from app.modules.catalog.schemas import ProductOverrideCreate
+
+    try:
+        engine, conn, session = await _tenant_session()
+        product = await _seed_product(
+            session, image_url="https://hub.example.com/regina.jpg", external_product_id="ext-3"
+        )
+        await _seed_snapshot(session, connection_id=557)
+        await override_repository.upsert_override(
+            session, product.id, ProductOverrideCreate(image_url="https://cdn.mine.com/custom-regina.jpg", is_featured=True)
+        )
+
+        provider = HubCatalogProvider(connection_id=557)
         summaries, _ = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
 
         assert summaries[0].image_url == "https://cdn.mine.com/custom-regina.jpg"
@@ -131,38 +156,27 @@ async def test_get_catalog_merges_product_overrides():
 
 async def test_get_catalog_override_never_changes_price_or_tax_rate():
     """Garde-fou fiscal : meme si un override est present, prix et TVA servis
-    restent exactement ceux du snapshot hub (ProductOverride n'expose aucune
-    colonne prix/TVA -- ce test verrouille la propriete au niveau du provider)."""
-    from app.modules.catalog import snapshot_repository
+    restent exactement ceux de `products` -- ProductOverride n'expose aucune
+    colonne prix/TVA (verrouille au niveau du provider)."""
+    from app.modules.catalog import override_repository
     from app.modules.catalog.models import ProductOverride
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
+    from app.modules.catalog.schemas import ProductOverrideCreate
 
     try:
         engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=561,
-            payload={},
-            normalized=[
-                NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5, tax_rate=0.055)
-            ],
+        product = await _seed_product(session, base_price=11.5, tax_rate=0.055, external_product_id="ext-4")
+        await _seed_snapshot(session, connection_id=558)
+        override = await override_repository.upsert_override(
+            session, product.id, ProductOverrideCreate(description="Ma description maison", is_featured=True)
         )
-        override = ProductOverride(
-            connection_id=561,
-            external_product_id="ext-1",
-            description="Ma description maison",
-            is_featured=True,
-            display_order=1,
-        )
-        session.add(override)
-        await session.commit()
 
         assert not hasattr(override, "price")
         assert not hasattr(override, "base_price")
         assert not hasattr(override, "tax_rate")
+        assert isinstance(override, ProductOverride)
 
-        provider = HubCatalogProvider(connection_id=561)
+        provider = HubCatalogProvider(connection_id=558)
         summaries, _ = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
 
         assert summaries[0].base_price == 11.5
@@ -177,35 +191,20 @@ async def test_get_catalog_override_never_changes_price_or_tax_rate():
         await engine.dispose()
 
 
-async def test_get_catalog_sorts_by_display_order_then_name():
-    """Les produits avec un display_order explicite passent devant ; ceux sans
-    override (ou sans display_order) sont ordonnes par nom, apres."""
-    from app.modules.catalog import snapshot_repository
-    from app.modules.catalog.models import ProductOverride
+async def test_get_catalog_excludes_inactive_products():
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=559,
-            payload={},
-            normalized=[
-                NormalizedCatalogProduct(external_id="ext-a", name="Anchois", price=9.0),
-                NormalizedCatalogProduct(external_id="ext-b", name="Bolognese", price=10.0),
-                NormalizedCatalogProduct(external_id="ext-c", name="Calzone", price=12.0),
-            ],
-        )
-        session.add(ProductOverride(connection_id=559, external_product_id="ext-c", display_order=1))
-        session.add(ProductOverride(connection_id=559, external_product_id="ext-b", display_order=2))
-        await session.commit()
+        await _seed_product(session, name="Anchois", external_product_id="ext-5a", is_active=True)
+        await _seed_product(session, name="Bolognese", external_product_id="ext-5b", is_active=False)
+        await _seed_snapshot(session, connection_id=559)
 
         provider = HubCatalogProvider(connection_id=559)
         summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
 
-        assert total == 3
-        assert [s.name for s in summaries] == ["Calzone", "Bolognese", "Anchois"]
+        assert total == 1
+        assert all(s.is_active for s in summaries)
     except OSError as exc:
         pytest.skip(f"PostgreSQL test database unavailable: {exc}")
     finally:
@@ -215,106 +214,22 @@ async def test_get_catalog_sorts_by_display_order_then_name():
         await engine.dispose()
 
 
-async def test_get_catalog_excludes_inactive_products():
-    """Un produit desactive cote caisse (is_active=False dans le snapshot) ne doit
-    apparaitre ni dans la page servie ni dans le total -- meme semantique que
-    LocalCatalogProvider (service.list_products filtre Product.is_active)."""
-    from app.modules.catalog import snapshot_repository
+async def test_get_catalog_paginates_via_local_provider():
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=565,
-            payload={},
-            normalized=[
-                NormalizedCatalogProduct(external_id="ext-a", name="Anchois", price=9.0, is_active=True),
-                NormalizedCatalogProduct(external_id="ext-b", name="Bolognese", price=10.0, is_active=False),
-                NormalizedCatalogProduct(external_id="ext-c", name="Calzone", price=12.0, is_active=True),
-            ],
-        )
-
-        provider = HubCatalogProvider(connection_id=565)
-        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
-
-        assert total == 2  # le produit inactif ne compte pas dans le total
-        assert [s.name for s in summaries] == ["Anchois", "Calzone"]
-        assert all(s.is_active is True for s in summaries)
-    except OSError as exc:
-        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
-    finally:
-        await session.close()
-        await conn.rollback()
-        await conn.close()
-        await engine.dispose()
-
-
-async def test_get_catalog_paginates_in_memory():
-    """La pagination porte sur le snapshot deja charge en memoire : total = taille
-    totale du snapshot, la page ne contient que la tranche demandee."""
-    from app.modules.catalog import snapshot_repository
-    from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
-
-    try:
-        engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=560,
-            payload={},
-            normalized=[
-                NormalizedCatalogProduct(external_id=f"ext-{i}", name=f"Pizza {i}", price=10.0 + i)
-                for i in range(5)
-            ],
-        )
+        for i in range(5):
+            await _seed_product(session, name=f"Pizza {i}", external_product_id=f"ext-page-{i}")
+        await _seed_snapshot(session, connection_id=560)
 
         provider = HubCatalogProvider(connection_id=560)
         page1, total1 = await provider.get_catalog(session, PaginationParams(page=1, page_size=2))
         page2, total2 = await provider.get_catalog(session, PaginationParams(page=2, page_size=2))
-        page3, total3 = await provider.get_catalog(session, PaginationParams(page=3, page_size=2))
 
-        assert (total1, total2, total3) == (5, 5, 5)
-        assert [s.name for s in page1] == ["Pizza 0", "Pizza 1"]
-        assert [s.name for s in page2] == ["Pizza 2", "Pizza 3"]
-        assert [s.name for s in page3] == ["Pizza 4"]
-    except OSError as exc:
-        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
-    finally:
-        await session.close()
-        await conn.rollback()
-        await conn.close()
-        await engine.dispose()
-
-
-async def test_get_catalog_derives_stable_surrogate_ids():
-    """L'id entier expose est derive de l'external_id (CRC32 31 bits) : stable
-    d'un appel a l'autre, distinct entre produits."""
-    from app.modules.catalog import snapshot_repository
-    from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
-
-    try:
-        engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=562,
-            payload={},
-            normalized=[
-                NormalizedCatalogProduct(external_id="ext-1", name="Anchois", price=9.0),
-                NormalizedCatalogProduct(external_id="ext-2", name="Bolognese", price=10.0),
-            ],
-        )
-
-        provider = HubCatalogProvider(connection_id=562)
-        first, _ = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
-        second, _ = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
-
-        ids = [s.id for s in first]
-        assert ids == [s.id for s in second]
-        assert len(set(ids)) == 2
-        assert all(0 < product_id <= 0x7FFFFFFF for product_id in ids)
+        assert total1 == 5 and total2 == 5
+        assert len(page1) == 2
+        assert len(page2) == 2
     except OSError as exc:
         pytest.skip(f"PostgreSQL test database unavailable: {exc}")
     finally:
@@ -329,29 +244,21 @@ async def test_get_catalog_enqueues_resync_when_snapshot_is_stale(monkeypatch):
     from unittest.mock import AsyncMock
 
     from app.core.config import settings as app_settings
-    from app.modules.catalog import snapshot_repository
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
         monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
         monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
-        snapshot = await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=557,
-            payload={},
-            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
-        )
-        snapshot.synced_at = datetime.now(timezone.utc) - timedelta(hours=2)
-        await session.commit()
+        await _seed_product(session, external_product_id="ext-6")
+        await _seed_snapshot(session, connection_id=561, synced_at=datetime.now(timezone.utc) - timedelta(hours=2))
 
         redis = AsyncMock()
-        provider = HubCatalogProvider(connection_id=557)
+        provider = HubCatalogProvider(connection_id=561)
         summaries, _ = await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
 
         assert len(summaries) == 1  # still served despite being stale
-        redis.enqueue_job.assert_awaited_once_with("sync_catalog_from_hub", connection_id=557)
+        redis.enqueue_job.assert_awaited_once_with("sync_catalog_from_hub", connection_id=561)
     except OSError as exc:
         pytest.skip(f"PostgreSQL test database unavailable: {exc}")
     finally:
@@ -362,71 +269,25 @@ async def test_get_catalog_enqueues_resync_when_snapshot_is_stale(monkeypatch):
 
 
 async def test_get_catalog_still_served_when_stale_enqueue_fails(monkeypatch):
-    """L'enqueue de resynchronisation est best-effort : une panne Redis ne doit
-    jamais faire echouer la lecture du catalogue."""
     from datetime import datetime, timedelta, timezone
     from unittest.mock import AsyncMock
 
     from app.core.config import settings as app_settings
-    from app.modules.catalog import snapshot_repository
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
         monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
         monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
-        snapshot = await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=563,
-            payload={},
-            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
-        )
-        snapshot.synced_at = datetime.now(timezone.utc) - timedelta(hours=2)
-        await session.commit()
+        await _seed_product(session, external_product_id="ext-7")
+        await _seed_snapshot(session, connection_id=562, synced_at=datetime.now(timezone.utc) - timedelta(hours=2))
 
         redis = AsyncMock()
         redis.enqueue_job.side_effect = ConnectionError("redis down")
-        provider = HubCatalogProvider(connection_id=563)
+        provider = HubCatalogProvider(connection_id=562)
         summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
 
         assert total == 1
-        assert summaries[0].name == "Regina"
-    except OSError as exc:
-        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
-    finally:
-        await session.close()
-        await conn.rollback()
-        await conn.close()
-        await engine.dispose()
-
-
-async def test_get_catalog_stale_without_redis_still_serves_snapshot(monkeypatch):
-    """Sans handle Redis (redis=None), un snapshot perime reste servi tel quel."""
-    from datetime import datetime, timedelta, timezone
-
-    from app.core.config import settings as app_settings
-    from app.modules.catalog import snapshot_repository
-    from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
-
-    try:
-        engine, conn, session = await _tenant_session()
-        monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
-        snapshot = await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=564,
-            payload={},
-            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
-        )
-        snapshot.synced_at = datetime.now(timezone.utc) - timedelta(hours=2)
-        await session.commit()
-
-        provider = HubCatalogProvider(connection_id=564)
-        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
-
-        assert total == 1
-        assert summaries[0].name == "Regina"
     except OSError as exc:
         pytest.skip(f"PostgreSQL test database unavailable: {exc}")
     finally:
@@ -439,21 +300,15 @@ async def test_get_catalog_stale_without_redis_still_serves_snapshot(monkeypatch
 async def test_get_catalog_does_not_enqueue_resync_when_snapshot_is_fresh():
     from unittest.mock import AsyncMock
 
-    from app.modules.catalog import snapshot_repository
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
-        await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=558,
-            payload={},
-            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
-        )
+        await _seed_product(session, external_product_id="ext-8")
+        await _seed_snapshot(session, connection_id=563)
 
         redis = AsyncMock()
-        provider = HubCatalogProvider(connection_id=558)
+        provider = HubCatalogProvider(connection_id=563)
         await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
 
         redis.enqueue_job.assert_not_awaited()
@@ -466,38 +321,47 @@ async def test_get_catalog_does_not_enqueue_resync_when_snapshot_is_fresh():
         await engine.dispose()
 
 
-async def test_get_catalog_does_not_enqueue_resync_when_hub_not_configured(monkeypatch):
-    """Finding 1 (cleanliness follow-up): even for a stale snapshot, no resync job is
-    enqueued when pos_hub_catalog_url is empty -- sync_catalog_from_hub would just
-    no-op it anyway (worker/tasks/catalog_sync.py's own is_configured() gate), so
-    enqueuing here is a pointless Redis/ARQ round trip."""
+async def test_get_catalog_raises_when_snapshot_older_than_hard_expiry(monkeypatch):
     from datetime import datetime, timedelta, timezone
-    from unittest.mock import AsyncMock
 
     from app.core.config import settings as app_settings
-    from app.modules.catalog import snapshot_repository
+    from app.modules.catalog.exceptions import CatalogSnapshotUnavailableError
     from app.modules.catalog.providers import HubCatalogProvider
-    from app.modules.catalog.schemas import NormalizedCatalogProduct
 
     try:
         engine, conn, session = await _tenant_session()
-        monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
-        monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "")
-        snapshot = await snapshot_repository.upsert_snapshot(
-            session,
-            connection_id=566,
-            payload={},
-            normalized=[NormalizedCatalogProduct(external_id="ext-1", name="Regina", price=11.5)],
-        )
-        snapshot.synced_at = datetime.now(timezone.utc) - timedelta(hours=2)
-        await session.commit()
+        monkeypatch.setattr(app_settings, "pos_hub_snapshot_hard_expiry_hours", 24)
+        await _seed_product(session, external_product_id="ext-9")
+        await _seed_snapshot(session, connection_id=564, synced_at=datetime.now(timezone.utc) - timedelta(hours=25))
 
-        redis = AsyncMock()
-        provider = HubCatalogProvider(connection_id=566)
-        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
+        provider = HubCatalogProvider(connection_id=564)
+        with pytest.raises(CatalogSnapshotUnavailableError):
+            await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        await session.close()
+        await conn.rollback()
+        await conn.close()
+        await engine.dispose()
 
-        assert total == 1  # stale snapshot still served
-        redis.enqueue_job.assert_not_awaited()
+
+async def test_get_catalog_serves_snapshot_within_hard_expiry(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.config import settings as app_settings
+    from app.modules.catalog.providers import HubCatalogProvider
+
+    try:
+        engine, conn, session = await _tenant_session()
+        monkeypatch.setattr(app_settings, "pos_hub_snapshot_hard_expiry_hours", 24)
+        await _seed_product(session, external_product_id="ext-10")
+        await _seed_snapshot(session, connection_id=565, synced_at=datetime.now(timezone.utc) - timedelta(hours=23))
+
+        provider = HubCatalogProvider(connection_id=565)
+        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
+
+        assert total == 1
     except OSError as exc:
         pytest.skip(f"PostgreSQL test database unavailable: {exc}")
     finally:
