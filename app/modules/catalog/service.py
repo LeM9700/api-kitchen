@@ -420,6 +420,11 @@ async def build_product_summaries(
                 image_url=product.image_url,
                 preparation_station=product.preparation_station,
                 is_active=product.is_active,
+                # Renseigne uniquement pour un produit materialise depuis un hub
+                # POS (colonne ecrite par sync_catalog_from_hub) -- toujours None
+                # pour un produit STANDALONE, que ProductCreate/ProductUpdate ne
+                # laissent pas renseigner (garde-fou fiscal structurel).
+                tax_rate=float(product.tax_rate) if product.tax_rate is not None else None,
                 category=CategorySummaryOut.model_validate(category) if category else None,
                 effective_preparation_station=_effective_preparation_station(product, category),
                 primary_image=MediaImagePublicOut.model_validate(primary) if primary else None,
