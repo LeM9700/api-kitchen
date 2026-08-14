@@ -104,3 +104,70 @@ async def test_hub_sync_chain_connects_worker_snapshot_and_provider(db_session, 
     margherita = next(s for s in summaries if s.name == "Margherita")
     assert margherita.base_price == 8.9
     assert margherita.tax_rate == 0.055
+
+
+async def test_hub_synced_product_can_be_ordered_via_real_product_id(db_session, monkeypatch):
+    """Task 9 proof (2026-08-12-hub-catalog-materialization plan): a hub-synced
+    product's real `products.id` -- not a surrogate CRC32 id -- is resolvable by
+    app.modules.orders.service.create_order.
+
+    This is the concrete end-to-end fix for the divergence the prior lot's
+    (2026-08-11-hub-catalog-sync) final review flagged: order creation reads the
+    real `products` table directly, so a hub-synced product had to become a real
+    row (materialized by sync_catalog_from_hub, Tasks 1-8 of this plan) before it
+    could actually be ordered."""
+    from app.core.config import settings
+    from app.modules.catalog.models import Product
+    from app.modules.orders import service as orders_service
+    from app.modules.orders.schemas import OrderCreate, OrderItemCreate
+    from worker.tasks import catalog_sync
+
+    connection_id = 90302
+    await _seed_active_connection(db_session, connection_id=connection_id)
+
+    fake_engine = AsyncMock()
+    monkeypatch.setattr(catalog_sync, "create_async_engine", lambda *a, **kw: fake_engine)
+    monkeypatch.setattr(catalog_sync, "async_sessionmaker", lambda *a, **kw: (lambda: db_session))
+    monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
+    monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
+    monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
+    monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
+
+    fake_hub_payload = {
+        "products": [
+            {"id": "ext-order-1", "name": "Quattro Stagioni", "price": 12.9, "tax_rate": 0.1, "is_active": True},
+        ]
+    }
+    monkeypatch.setattr(
+        catalog_sync.HttpHubCatalogClient,
+        "fetch_catalog",
+        AsyncMock(return_value=fake_hub_payload),
+    )
+
+    # 1-3. Fake the hub call and run the real worker task, exactly as above.
+    await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=connection_id)
+
+    # 4. Materialization (Tasks 1-8): the synced product is a real `products` row
+    # keyed on external_product_id, not a surrogate id -- fetch its real primary
+    # key the same way order creation / product detail routes would.
+    await db_session.execute(sa.text('SET search_path TO "tenant_pizza_test", public'))
+    product = await db_session.scalar(
+        sa.select(Product).where(Product.external_product_id == "ext-order-1")
+    )
+    assert product is not None
+    assert float(product.base_price) == 12.9  # sanity: same value the fake hub sent
+
+    # 5. Order creation against the synced product's real id succeeds (not
+    # PRODUCT_NOT_FOUND) and resolves the price from the catalog server-side,
+    # matching the synced product's base_price.
+    body = OrderCreate(
+        order_type="pickup",
+        items=[OrderItemCreate(product_id=product.id, quantity=1)],
+    )
+    order = await orders_service.create_order(
+        db_session, body, idempotency_key="hub-sync-order-test-90302"
+    )
+
+    assert order.id is not None
+    assert float(order.subtotal) == float(product.base_price)
+    assert float(order.total) == float(product.base_price)
