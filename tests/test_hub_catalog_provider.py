@@ -321,6 +321,65 @@ async def test_get_catalog_does_not_enqueue_resync_when_snapshot_is_fresh():
         await engine.dispose()
 
 
+async def test_get_catalog_stale_without_redis_still_serves_snapshot(monkeypatch):
+    """Sans handle Redis (redis=None), un catalogue perime reste servi tel quel."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.config import settings as app_settings
+    from app.modules.catalog.providers import HubCatalogProvider
+
+    try:
+        engine, conn, session = await _tenant_session()
+        monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
+        await _seed_product(session, external_product_id="ext-11")
+        await _seed_snapshot(session, connection_id=566, synced_at=datetime.now(timezone.utc) - timedelta(hours=2))
+
+        provider = HubCatalogProvider(connection_id=566)
+        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10))
+
+        assert total == 1
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        await session.close()
+        await conn.rollback()
+        await conn.close()
+        await engine.dispose()
+
+
+async def test_get_catalog_does_not_enqueue_resync_when_hub_not_configured(monkeypatch):
+    """Meme pour un catalogue perime, aucun job de resync n'est enqueue quand
+    pos_hub_catalog_url est vide -- sync_catalog_from_hub no-opperait de toute
+    facon (worker/tasks/catalog_sync.py::is_configured()), donc enqueuer ici
+    serait un aller-retour Redis/ARQ inutile."""
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import AsyncMock
+
+    from app.core.config import settings as app_settings
+    from app.modules.catalog.providers import HubCatalogProvider
+
+    try:
+        engine, conn, session = await _tenant_session()
+        monkeypatch.setattr(app_settings, "pos_hub_snapshot_staleness_minutes", 60)
+        monkeypatch.setattr(app_settings, "pos_hub_catalog_url", "")
+        await _seed_product(session, external_product_id="ext-12")
+        await _seed_snapshot(session, connection_id=567, synced_at=datetime.now(timezone.utc) - timedelta(hours=2))
+
+        redis = AsyncMock()
+        provider = HubCatalogProvider(connection_id=567)
+        summaries, total = await provider.get_catalog(session, PaginationParams(page=1, page_size=10), redis=redis)
+
+        assert total == 1  # catalogue perime quand meme servi
+        redis.enqueue_job.assert_not_awaited()
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL test database unavailable: {exc}")
+    finally:
+        await session.close()
+        await conn.rollback()
+        await conn.close()
+        await engine.dispose()
+
+
 async def test_get_catalog_raises_when_snapshot_older_than_hard_expiry(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
