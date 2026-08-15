@@ -3,6 +3,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import sentry_sdk
 from arq import create_pool
@@ -29,13 +30,21 @@ from worker.main import get_redis_settings
 configure_logging()
 logger = logging.getLogger(__name__)
 
-if settings.sentry_dsn:
+
+def _is_valid_sentry_dsn(dsn: str) -> bool:
+    parsed = urlparse(dsn)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+if settings.sentry_dsn and _is_valid_sentry_dsn(settings.sentry_dsn):
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
         environment=settings.environment,
         integrations=[FastApiIntegration()],
         traces_sample_rate=0.1,
     )
+elif settings.sentry_dsn:
+    logger.warning("invalid SENTRY_DSN ignored")
 
 # [🔒 SÉCURITÉ] Import déclenche l'enregistrement du listener SQLAlchemy qui
 # bloque la publication d'un produit sans allergènes réglementaires complets.
@@ -83,6 +92,9 @@ async def lifespan(app: FastAPI):
     init_cloudinary(settings)
     app.state.motor_client = AsyncIOMotorClient(settings.mongo_url)
     app.state.arq_pool = await create_pool(get_redis_settings())
+    from app.modules.notifications import ws_router
+
+    app.state.redis_subscriber_task = asyncio.create_task(ws_router._redis_subscriber())
 
     # Ensure TTL index (90 days) on all existing login_events_* collections.
     # Non-blocking — does not delay startup.
@@ -105,6 +117,15 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- shutdown ---
+    try:
+        task = getattr(app.state, "redis_subscriber_task", None)
+        if task is not None:
+            task.cancel()
+            await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("redis subscriber shutdown failed")
     try:
         await app.state.arq_pool.close()
         await app.state.arq_pool.wait_closed()

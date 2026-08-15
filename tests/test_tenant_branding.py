@@ -1,6 +1,92 @@
 """Tests Plan 02 — GET /tenant/branding (public) + PATCH /tenant/branding (admin)."""
+import uuid
+
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
+
+from app.core.database import engine, tenant_schema_name
+from app.main import app
+
+
+async def _reset_branding(slug: str) -> None:
+    schema = tenant_schema_name(slug)
+    async with engine.begin() as conn:
+        await conn.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
+        await conn.execute(
+            text(
+                "UPDATE tenant_config SET "
+                "display_name = NULL, "
+                "logo_url = NULL, "
+                "primary_color = NULL, "
+                "secondary_color = NULL, "
+                "font_family = NULL"
+            )
+        )
+
+
+@pytest.fixture(scope="module")
+async def demo_tenant_account():
+    """Create an isolated tenant/admin pair through the public registration flow."""
+    unique_slug = uuid.uuid4().hex[:8]
+    email = f"branding-{unique_slug}@test.com"
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as setup_client:
+        response = await setup_client.post(
+            "/api/v1/auth/register",
+            json={
+                "tenant_slug": unique_slug,
+                "tenant_name": "Branding Test",
+                "email": email,
+                "password": "Valid1!aa",
+            },
+        )
+    assert response.status_code == 201, response.text
+
+    token = response.json()["access_token"]
+    try:
+        yield {
+            "slug": unique_slug,
+            "headers": {
+                "Authorization": f"Bearer {token}",
+                "X-Tenant-Slug": unique_slug,
+            },
+        }
+    finally:
+        schema = tenant_schema_name(unique_slug)
+        async with engine.begin() as conn:
+            await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await conn.execute(
+                text(
+                    "DELETE FROM public.tenant_configs "
+                    "WHERE tenant_id IN (SELECT id FROM public.tenants WHERE slug = :slug)"
+                ),
+                {"slug": unique_slug},
+            )
+            await conn.execute(text("DELETE FROM public.tenants WHERE slug = :slug"), {"slug": unique_slug})
+
+
+@pytest.fixture(autouse=True)
+async def reset_demo_branding(demo_tenant_account):
+    await _reset_branding(demo_tenant_account["slug"])
+    yield
+    await _reset_branding(demo_tenant_account["slug"])
+
+
+@pytest.fixture
+async def demo_tenant_slug(demo_tenant_account) -> str:
+    return demo_tenant_account["slug"]
+
+
+@pytest.fixture
+async def authed_client(demo_tenant_account):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=demo_tenant_account["headers"],
+    ) as test_client:
+        yield test_client
 
 
 # ---------------------------------------------------------------------------

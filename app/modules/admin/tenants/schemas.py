@@ -154,6 +154,15 @@ class NextOpeningResponse(BaseModel):
     next_opening: str | None
 
 
+class TenantEstablishmentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    timezone: str
+    is_active: bool
+
+
 class TenantClosureToggle(BaseModel):
     """Payload pour PATCH /tenant/toggle-closure (endpoint dédié rate-limité)."""
 

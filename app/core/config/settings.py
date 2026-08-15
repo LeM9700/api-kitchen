@@ -122,5 +122,18 @@ class Settings(BaseSettings):
     # pos_hub_snapshot_staleness_minutes (qui sert quand meme + resynchronise).
     pos_hub_snapshot_hard_expiry_hours: int = 24
 
+    # Hub POS — transmission des commandes (sortant) et reconciliation. Chaine
+    # vide = feature desactivee, meme pattern que pos_hub_catalog_url ci-dessus.
+    # [HYPOTHESE NON CONFIRMEE] URL, format de payload et de signature a
+    # confirmer avec le vrai fournisseur — voir app/modules/orders/hub_client.py
+    # et app/modules/pos/webhook_service.py.
+    pos_hub_order_push_url: str = ""
+    pos_hub_order_status_url: str = ""
+    pos_hub_order_webhook_secret: str = ""
+    # Delai au-dela duquel une commande jamais acquittee par le hub declenche
+    # une alerte staff (une seule fois, cf. order_hub_transmissions.alerted_at).
+    pos_hub_order_ack_timeout_minutes: int = 30
+    pos_hub_order_status_rate_limit_per_minute: int = 10
+
 
 settings = Settings()

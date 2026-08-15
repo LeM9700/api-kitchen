@@ -25,6 +25,7 @@ from app.modules.admin.tenants.schemas import (
     TenantConfigUpdate,
     TenantStatusResponse,
 )
+from app.modules.hr.models import EmployeeProfile, Establishment
 from app.modules.orders.models import Order
 
 _ACTIVE_ORDER_STATUSES = ("confirmed", "in_preparation")
@@ -83,7 +84,7 @@ async def _write_audit(
         user_email: Email de l'utilisateur au moment de la modification (optionnel).
     """
     audit = TenantConfigAudit(
-        changed_by_user_id=user_id,
+        changed_by_user_id=int(user_id),
         field_name=field_name,
         old_value=old_value,
         new_value=new_value,
@@ -115,6 +116,38 @@ async def get_or_create_config(session: AsyncSession) -> TenantConfig:
         await session.commit()
         await session.refresh(config)
     return config
+
+
+async def list_accessible_establishments(session: AsyncSession, current_user: dict) -> list[Establishment]:
+    """Return establishments visible to the current authenticated tenant user."""
+    role = current_user.get("role")
+    if role == "admin":
+        result = await session.execute(
+            select(Establishment).order_by(Establishment.is_active.desc(), Establishment.name.asc())
+        )
+        return list(result.scalars().all())
+
+    if role != "staff":
+        return []
+
+    try:
+        user_id = int(current_user.get("id"))
+    except (TypeError, ValueError):
+        return []
+
+    profile = await session.scalar(
+        select(EmployeeProfile).where(
+            EmployeeProfile.user_id == user_id,
+            EmployeeProfile.is_active.is_(True),
+        )
+    )
+    if profile is None:
+        return []
+
+    establishment = await session.get(Establishment, profile.establishment_id)
+    if establishment is None or not establishment.is_active:
+        return []
+    return [establishment]
 
 
 async def update_config(

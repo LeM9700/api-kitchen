@@ -283,6 +283,7 @@ async def set_product_allergen_manual(
     user_id: int = 0,
     ip_address: str | None = None,
     reason: str | None = None,
+    tenant_slug: str | None = None,
 ) -> ProductAllergen:
     """Upsert une déclaration manuelle d'allergène sur un produit.
 
@@ -299,6 +300,7 @@ async def set_product_allergen_manual(
         user_id: ID de l'utilisateur auteur du changement.
         ip_address: IP de la requête entrante (traçabilité).
         reason: Justification optionnelle.
+        tenant_slug: Slug tenant utilise pour router la notification client.
 
     Returns:
         Instance ProductAllergen persistée.
@@ -366,7 +368,7 @@ async def set_product_allergen_manual(
             for uid in affected_user_ids:
                 await notify_user(
                     session=session,
-                    tenant_slug="",   # le caller peut passer tenant_slug via kwargs si besoin
+                    tenant_slug=tenant_slug or "default",
                     user_id=uid,
                     event="allergen_update",
                     title="Information allergènes mise à jour",

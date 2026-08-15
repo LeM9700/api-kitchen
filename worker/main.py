@@ -7,6 +7,7 @@ from app.core.config import settings
 from worker.tasks.catalog_sync import sync_catalog_from_hub, sync_stale_catalog_connections
 from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
+from worker.tasks.order_hub import process_hub_order_callback, push_order_to_hub, reconcile_hub_orders
 from worker.tasks.scheduled_closures import process_scheduled_closures
 from worker.tasks.stats import aggregate_live_stats, aggregate_monthly_stats
 from worker.tasks.stock_snapshot import aggregate_stock_snapshot
@@ -32,6 +33,9 @@ class WorkerSettings:
         aggregate_stock_snapshot,
         sync_catalog_from_hub,
         sync_stale_catalog_connections,
+        push_order_to_hub,
+        process_hub_order_callback,
+        reconcile_hub_orders,
     ]
     # Cron jobs ARQ : les fonctions recoivent uniquement ctx (pas de parametres dynamiques).
     cron_jobs: ClassVar[list] = [
@@ -55,6 +59,10 @@ class WorkerSettings:
         # complement du webhook et de la resynchronisation paresseuse sur
         # snapshot perime (HubCatalogProvider.get_catalog).
         cron(sync_stale_catalog_connections, hour=set(range(24)), minute={0}),
+        # Reconciliation des commandes transmises au hub POS jamais acquittees —
+        # toutes les 5 minutes, respecte la limite de requetes/minute par
+        # connexion (sync_guards) et n'alerte staff qu'une seule fois par commande.
+        cron(reconcile_hub_orders, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
     ]
     redis_settings = get_redis_settings()
     on_startup = None

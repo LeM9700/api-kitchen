@@ -919,7 +919,7 @@ INSERT INTO users (
 )
 VALUES
     ('pizza@test.com', '$2b$12$e4ja2MjZ9yZnpMR5FpuKtu4mDXjvL9QWP76ZjAdsCGno5MzT4dpXO', 'Momo', '+33600000001', 'admin', '["*"]'::json, TRUE, NOW(), FALSE, FALSE),
-    ('staff.cuisine@test.com', '$2b$12$e4ja2MjZ9yZnpMR5FpuKtu4mDXjvL9QWP76ZjAdsCGno5MzT4dpXO', 'Sam Cuisine', '+33600000002', 'staff', '["orders:read","orders:write","stock:read","stock:write","catalog:read"]'::json, TRUE, NOW(), FALSE, FALSE),
+    ('staff.cuisine@test.com', '$2b$12$e4ja2MjZ9yZnpMR5FpuKtu4mDXjvL9QWP76ZjAdsCGno5MzT4dpXO', 'Sam Cuisine', '+33600000002', 'staff', '["orders:read","orders:write","orders:preparation","stock:read","stock:write","catalog:read"]'::json, TRUE, NOW(), FALSE, FALSE),
     ('staff.livraison@test.com', '$2b$12$e4ja2MjZ9yZnpMR5FpuKtu4mDXjvL9QWP76ZjAdsCGno5MzT4dpXO', 'Lina Livraison', '+33600000003', 'staff', '["orders:read","orders:write","delivery:read"]'::json, TRUE, NOW(), FALSE, FALSE),
     ('client.alice@test.com', '$2b$12$e4ja2MjZ9yZnpMR5FpuKtu4mDXjvL9QWP76ZjAdsCGno5MzT4dpXO', 'Alice Martin', '+33600000011', 'customer', NULL, TRUE, NOW(), FALSE, FALSE),
     ('client.yanis@test.com', '$2b$12$e4ja2MjZ9yZnpMR5FpuKtu4mDXjvL9QWP76ZjAdsCGno5MzT4dpXO', 'Yanis Petit', '+33600000012', 'customer', NULL, TRUE, NOW(), FALSE, FALSE),
@@ -934,6 +934,303 @@ SET password_hash = EXCLUDED.password_hash,
     email_verified_at = EXCLUDED.email_verified_at,
     must_change_password = EXCLUDED.must_change_password,
     mfa_enabled = EXCLUDED.mfa_enabled;
+
+-- HR demo data used by Admin Planning and Staff shell.
+-- This block is defensive because the seed can be run on a fresh local database
+-- before tenant-scoped HR migrations have created tables for tenant_pizza_test.
+CREATE TABLE IF NOT EXISTS establishments (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    timezone VARCHAR(64) NOT NULL DEFAULT 'Europe/Paris',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS employee_profiles (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    establishment_id INTEGER NOT NULL REFERENCES establishments(id),
+    hourly_rate_cents INTEGER,
+    weekly_hours_contract INTEGER NOT NULL DEFAULT 35,
+    hire_date DATE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_employee_profiles_user_id
+ON employee_profiles (user_id);
+
+CREATE INDEX IF NOT EXISTS ix_employee_profiles_establishment_id
+ON employee_profiles (establishment_id);
+
+CREATE TABLE IF NOT EXISTS shifts (
+    id SERIAL PRIMARY KEY,
+    employee_id INTEGER NOT NULL REFERENCES employee_profiles(id),
+    establishment_id INTEGER NOT NULL REFERENCES establishments(id),
+    starts_at TIMESTAMPTZ NOT NULL,
+    ends_at TIMESTAMPTZ NOT NULL,
+    break_minutes INTEGER NOT NULL DEFAULT 0,
+    status VARCHAR(16) NOT NULL DEFAULT 'scheduled',
+    created_by_user_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_shifts_employee_start
+ON shifts (employee_id, starts_at);
+
+CREATE INDEX IF NOT EXISTS ix_shifts_establishment_start
+ON shifts (establishment_id, starts_at);
+
+CREATE TABLE IF NOT EXISTS time_clock_entries (
+    id SERIAL PRIMARY KEY,
+    employee_id INTEGER NOT NULL REFERENCES employee_profiles(id),
+    establishment_id INTEGER NOT NULL REFERENCES establishments(id),
+    shift_id INTEGER REFERENCES shifts(id),
+    clock_in_at TIMESTAMPTZ NOT NULL,
+    clock_out_at TIMESTAMPTZ,
+    method VARCHAR(16) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'open',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_time_clock_entries_employee_clock_in
+ON time_clock_entries (employee_id, clock_in_at);
+
+CREATE TABLE IF NOT EXISTS time_clock_corrections (
+    id SERIAL PRIMARY KEY,
+    entry_id INTEGER NOT NULL REFERENCES time_clock_entries(id),
+    corrected_by_user_id INTEGER NOT NULL,
+    old_clock_in_at TIMESTAMPTZ,
+    old_clock_out_at TIMESTAMPTZ,
+    new_clock_in_at TIMESTAMPTZ,
+    new_clock_out_at TIMESTAMPTZ,
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS hr_alerts (
+    id SERIAL PRIMARY KEY,
+    employee_id INTEGER REFERENCES employee_profiles(id),
+    establishment_id INTEGER REFERENCES establishments(id),
+    type VARCHAR(32) NOT NULL,
+    severity VARCHAR(16) NOT NULL DEFAULT 'warning',
+    payload JSON NOT NULL DEFAULT '{}',
+    triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    last_alert_sent_at TIMESTAMPTZ
+);
+
+ALTER TABLE hr_alerts ALTER COLUMN employee_id DROP NOT NULL;
+ALTER TABLE hr_alerts ADD COLUMN IF NOT EXISTS establishment_id INTEGER REFERENCES establishments(id);
+
+CREATE INDEX IF NOT EXISTS ix_hr_alerts_employee_type
+ON hr_alerts (employee_id, type);
+
+CREATE INDEX IF NOT EXISTS ix_hr_alerts_establishment_type
+ON hr_alerts (establishment_id, type);
+
+CREATE TABLE IF NOT EXISTS establishment_hr_config (
+    id SERIAL PRIMARY KEY,
+    establishment_id INTEGER NOT NULL UNIQUE REFERENCES establishments(id),
+    weekly_hours_legal_threshold INTEGER NOT NULL DEFAULT 35,
+    late_tolerance_minutes INTEGER NOT NULL DEFAULT 10,
+    alert_cooldown_hours INTEGER NOT NULL DEFAULT 4,
+    labor_cost_target_ratio NUMERIC(4,3) NOT NULL DEFAULT 0.300
+);
+
+DO $$
+DECLARE
+    v_establishment_id INTEGER;
+    v_admin_id INTEGER;
+BEGIN
+    SELECT id INTO v_establishment_id
+    FROM establishments
+    WHERE is_active = TRUE
+    ORDER BY id
+    LIMIT 1;
+
+    IF v_establishment_id IS NULL THEN
+        INSERT INTO establishments (name, timezone, is_active)
+        VALUES ('Etablissement principal', 'Europe/Paris', TRUE)
+        RETURNING id INTO v_establishment_id;
+    ELSE
+        UPDATE establishments
+        SET name = 'Etablissement principal',
+            timezone = 'Europe/Paris',
+            is_active = TRUE
+        WHERE id = v_establishment_id;
+    END IF;
+
+    INSERT INTO establishment_hr_config (
+        establishment_id,
+        weekly_hours_legal_threshold,
+        late_tolerance_minutes,
+        alert_cooldown_hours,
+        labor_cost_target_ratio
+    )
+    VALUES (v_establishment_id, 35, 10, 4, 0.300)
+    ON CONFLICT (establishment_id) DO UPDATE
+    SET weekly_hours_legal_threshold = EXCLUDED.weekly_hours_legal_threshold,
+        late_tolerance_minutes = EXCLUDED.late_tolerance_minutes,
+        alert_cooldown_hours = EXCLUDED.alert_cooldown_hours,
+        labor_cost_target_ratio = EXCLUDED.labor_cost_target_ratio;
+
+    INSERT INTO employee_profiles (
+        user_id,
+        establishment_id,
+        hourly_rate_cents,
+        weekly_hours_contract,
+        hire_date,
+        is_active
+    )
+    SELECT u.id,
+           v_establishment_id,
+           CASE u.email
+               WHEN 'pizza@test.com' THEN 0
+               WHEN 'staff.cuisine@test.com' THEN 1450
+               WHEN 'staff.livraison@test.com' THEN 1350
+               ELSE NULL
+           END,
+           CASE u.email
+               WHEN 'pizza@test.com' THEN 39
+               ELSE 35
+           END,
+           (CURRENT_DATE - INTERVAL '14 months')::date,
+           TRUE
+    FROM users u
+    WHERE u.email IN ('pizza@test.com', 'staff.cuisine@test.com', 'staff.livraison@test.com')
+    ON CONFLICT (user_id) DO UPDATE
+    SET establishment_id = EXCLUDED.establishment_id,
+        hourly_rate_cents = EXCLUDED.hourly_rate_cents,
+        weekly_hours_contract = EXCLUDED.weekly_hours_contract,
+        hire_date = EXCLUDED.hire_date,
+        is_active = TRUE,
+        updated_at = NOW();
+
+    SELECT id INTO v_admin_id
+    FROM users
+    WHERE email = 'pizza@test.com';
+
+    DELETE FROM shifts
+    WHERE created_by_user_id = v_admin_id
+      AND starts_at >= date_trunc('day', NOW()) - INTERVAL '1 day'
+      AND starts_at < date_trunc('day', NOW()) + INTERVAL '8 days';
+
+    INSERT INTO shifts (
+        employee_id,
+        establishment_id,
+        starts_at,
+        ends_at,
+        break_minutes,
+        status,
+        created_by_user_id
+    )
+    SELECT ep.id,
+           v_establishment_id,
+           date_trunc('day', NOW()) + INTERVAL '10 hours',
+           date_trunc('day', NOW()) + INTERVAL '15 hours',
+           30,
+           'scheduled',
+           v_admin_id
+    FROM employee_profiles ep
+    JOIN users u ON u.id = ep.user_id
+    WHERE u.email = 'staff.cuisine@test.com'
+    UNION ALL
+    SELECT ep.id,
+           v_establishment_id,
+           date_trunc('day', NOW()) + INTERVAL '1 day 18 hours',
+           date_trunc('day', NOW()) + INTERVAL '1 day 22 hours',
+           20,
+           'scheduled',
+           v_admin_id
+    FROM employee_profiles ep
+    JOIN users u ON u.id = ep.user_id
+    WHERE u.email = 'staff.livraison@test.com'
+    UNION ALL
+    SELECT ep.id,
+           v_establishment_id,
+           date_trunc('day', NOW()) + INTERVAL '2 days 11 hours',
+           date_trunc('day', NOW()) + INTERVAL '2 days 15 hours',
+           30,
+           'scheduled',
+           v_admin_id
+    FROM employee_profiles ep
+    JOIN users u ON u.id = ep.user_id
+    WHERE u.email = 'staff.cuisine@test.com'
+    UNION ALL
+    SELECT ep.id,
+           v_establishment_id,
+           date_trunc('day', NOW()) + INTERVAL '3 days 12 hours',
+           date_trunc('day', NOW()) + INTERVAL '3 days 15 hours',
+           0,
+           'cancelled',
+           v_admin_id
+    FROM employee_profiles ep
+    JOIN users u ON u.id = ep.user_id
+    WHERE u.email = 'staff.livraison@test.com';
+
+    DELETE FROM hr_alerts
+    WHERE type = 'seed_late_clock_in'
+      AND payload::text LIKE '%seed_rc1%';
+
+    INSERT INTO hr_alerts (
+        employee_id,
+        establishment_id,
+        type,
+        severity,
+        payload,
+        triggered_at
+    )
+    SELECT ep.id,
+           v_establishment_id,
+           'seed_late_clock_in',
+           'warning',
+           '{"source":"seed_rc1","minutes":12}'::json,
+           NOW() - INTERVAL '30 minutes'
+    FROM employee_profiles ep
+    JOIN users u ON u.id = ep.user_id
+    WHERE u.email = 'staff.cuisine@test.com';
+
+    UPDATE employee_profiles
+    SET establishment_id = v_establishment_id,
+        updated_at = NOW()
+    WHERE establishment_id IN (
+        SELECT id
+        FROM establishments
+        WHERE id <> v_establishment_id
+          AND name LIKE '%tablissement principal'
+    );
+
+    DELETE FROM hr_alerts
+    WHERE establishment_id IN (
+        SELECT id
+        FROM establishments
+        WHERE id <> v_establishment_id
+          AND name LIKE '%tablissement principal'
+    );
+
+    DELETE FROM shifts
+    WHERE establishment_id IN (
+        SELECT id
+        FROM establishments
+        WHERE id <> v_establishment_id
+          AND name LIKE '%tablissement principal'
+    );
+
+    DELETE FROM establishment_hr_config
+    WHERE establishment_id IN (
+        SELECT id
+        FROM establishments
+        WHERE id <> v_establishment_id
+          AND name LIKE '%tablissement principal'
+    );
+
+    DELETE FROM establishments
+    WHERE id <> v_establishment_id
+      AND name LIKE '%tablissement principal';
+END $$;
 
 DROP TABLE IF EXISTS _seed_hours;
 CREATE TEMP TABLE _seed_hours (
@@ -1705,7 +2002,7 @@ BEGIN
         is_stackable, email_verified_required
     )
     VALUES
-        ('PIZZA10', '10 pourcent sur les pizzas rouges', 'percent', 10.00, 15.00, NOW() - INTERVAL '1 day', NOW() + INTERVAL '30 days', TRUE, 100, 1, 0, FALSE, v_campaign_id, NULL, TRUE, FALSE, FALSE),
+        ('PIZZA10', '10 pourcent sur les pizzas rouges', 'percent', 10.00, 15.00, NOW() - INTERVAL '1 day', NOW() + INTERVAL '30 days', TRUE, 100, 10, 0, FALSE, v_campaign_id, NULL, TRUE, FALSE, FALSE),
         ('WELCOME5', '5 EUR sur une premiere commande', 'fixed', 5.00, 20.00, NOW() - INTERVAL '1 day', NOW() + INTERVAL '60 days', TRUE, 100, 1, 0, TRUE, v_campaign_id, NULL, TRUE, FALSE, TRUE)
     ON CONFLICT (code) DO UPDATE
     SET description = EXCLUDED.description,
@@ -2321,6 +2618,12 @@ SELECT 'stock_counts' AS check_name,
        (SELECT COUNT(*) FROM extra_ingredients) AS extra_recipes,
        (SELECT COUNT(*) FROM stock_movements) AS stock_movements,
        (SELECT COUNT(*) FROM ingredients WHERE current_qty < alert_threshold) AS low_stock_alerts;
+
+SELECT 'hr_counts' AS check_name,
+       (SELECT COUNT(*) FROM establishments WHERE is_active) AS active_establishments,
+       (SELECT COUNT(*) FROM employee_profiles WHERE is_active) AS active_employee_profiles,
+       (SELECT COUNT(*) FROM shifts WHERE starts_at >= date_trunc('day', NOW()) - INTERVAL '1 day') AS demo_shifts,
+       (SELECT COUNT(*) FROM shifts WHERE status = 'cancelled') AS cancelled_shifts;
 
 SELECT 'orders_by_status' AS check_name, status, payment_status, COUNT(*) AS count
 FROM orders

@@ -152,6 +152,7 @@ async def patch_product_allergen(
             user_id=current_user["id"],
             ip_address=ip_address,
             reason=body.reason,
+            tenant_slug=current_user["tenant_slug"],
         )
         from app.modules.catalog.allergen.allergen_models import AllergenDefinition
         ad = await session.get(AllergenDefinition, allergen_id)

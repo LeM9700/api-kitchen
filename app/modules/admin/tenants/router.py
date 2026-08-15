@@ -17,9 +17,11 @@ Routes admin :
 from math import ceil
 
 from fastapi import APIRouter, Depends, Query, Request, status
+from sqlalchemy import text
 
-from app.core.database import get_tenant_session
+from app.core.database import get_public_session, get_tenant_session, tenant_schema_name
 from app.core.http.deps import get_arq_pool, get_client_ip, require_permission, require_role
+from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse
 from app.core.services.cache import get_cached_json, set_cached_json
@@ -35,6 +37,7 @@ from app.modules.admin.tenants.schemas import (
     TenantClosureToggle,
     TenantConfigAuditResponse,
     TenantConfigResponse,
+    TenantEstablishmentResponse,
     TenantPrintConfigResponse,
     TenantPrintConfigUpdate,
     TenantScheduledClosureRequest,
@@ -43,6 +46,17 @@ from app.modules.admin.tenants.schemas import (
 )
 
 router = APIRouter()
+
+
+async def _ensure_tenant_exists(tenant_slug: str) -> None:
+    tenant_schema_name(tenant_slug)
+    async with get_public_session() as session:
+        tenant_id = await session.scalar(
+            text("SELECT id FROM public.tenants WHERE slug = :slug"),
+            {"slug": tenant_slug},
+        )
+    if tenant_id is None:
+        raise AppError("TENANT_NOT_FOUND", "Tenant not found", 404, "tenant_slug")
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +89,7 @@ async def get_tenant_branding(
     Returns:
         TenantBrandingResponse (5 champs branding, tous nullable).
     """
+    await _ensure_tenant_exists(tenant_slug)
     async with get_tenant_session(tenant_slug) as session:
         return await tenant_service.get_branding(session)
 
@@ -157,6 +172,21 @@ async def list_business_hours(
     """
     async with get_tenant_session(tenant_slug) as session:
         return await tenant_service.get_business_hours(session)
+
+
+# ---------------------------------------------------------------------------
+# Routes authentifiees -- contexte tenant
+# ---------------------------------------------------------------------------
+
+
+@router.get("/establishments", response_model=list[TenantEstablishmentResponse])
+async def list_accessible_establishments(
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> list[TenantEstablishmentResponse]:
+    """Retourne les etablissements accessibles dans le schema tenant courant."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        establishments = await tenant_service.list_accessible_establishments(session, current_user)
+        return [TenantEstablishmentResponse.model_validate(item) for item in establishments]
 
 
 # ---------------------------------------------------------------------------

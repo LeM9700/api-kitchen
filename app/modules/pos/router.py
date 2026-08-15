@@ -240,3 +240,44 @@ async def catalog_webhook(request: Request) -> PosCatalogWebhookResponse:
     await redis.enqueue_job("sync_catalog_from_hub", connection_id=connection_id)
     logger.info("POS catalog webhook accepted: connection_id=%s", connection_id)
     return PosCatalogWebhookResponse(accepted=True)
+
+
+class PosOrderWebhookResponse(BaseModel):
+    """Confirmation de mise en file du callback commande (jamais de traitement synchrone)."""
+
+    accepted: bool
+
+
+@webhook_router.post("/order-webhook", response_model=PosOrderWebhookResponse, status_code=202)
+async def order_webhook(request: Request) -> PosOrderWebhookResponse:
+    """Webhook entrant du hub POS : callback de statut sur une commande transmise.
+
+    [SECURITE] Contrairement a ``catalog_webhook`` ci-dessus, le corps n'est
+    JAMAIS parse en JSON ici, meme apres verification de signature -- il est
+    mis en file tel quel (bytes bruts) et seul le job asynchrone
+    (``process_hub_order_callback``) le parse. Deviation volontaire imposee
+    par le design : aucun traitement, y compris le parsing, avant la mise en
+    file (voir docs/superpowers/specs/2026-08-13-pos-order-transmission-design.md).
+
+    Args:
+        request: Requete FastAPI (corps brut lu pour la verification de signature).
+
+    Returns:
+        PosOrderWebhookResponse(accepted=True) des que le job est enqueue.
+
+    Raises:
+        AppError: POS_ORDER_WEBHOOK_NOT_CONFIGURED (503) si non configure.
+        AppError: POS_ORDER_WEBHOOK_INVALID_SIGNATURE (401) si la signature est invalide.
+    """
+    if not webhook_service.is_order_webhook_configured():
+        raise AppError("POS_ORDER_WEBHOOK_NOT_CONFIGURED", "Le webhook commandes POS n'est pas configure.", 503)
+
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature")
+    if not webhook_service.verify_order_signature(raw_body, signature):
+        raise AppError("POS_ORDER_WEBHOOK_INVALID_SIGNATURE", "Signature webhook invalide.", 401)
+
+    redis: ArqRedis = get_arq_pool(request)
+    await redis.enqueue_job("process_hub_order_callback", raw_body=raw_body.decode("utf-8"))
+    logger.info("POS order webhook accepted")
+    return PosOrderWebhookResponse(accepted=True)

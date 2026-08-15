@@ -90,6 +90,11 @@ async def create_order(
             user_id,
             tenant_slug=tenant_slug,
             idempotency_key=idempotency_key,
+            # [NOTE] Recupere directement sur app.state (pas via Depends) --
+            # meme raison que pos/router.py::catalog_webhook : ne doit jamais
+            # empecher la creation de la commande si le pool arq n'est pas
+            # encore initialise (ex: tests sans lifespan complet).
+            arq_pool=getattr(request.app.state, "arq_pool", None),
         )
 
 

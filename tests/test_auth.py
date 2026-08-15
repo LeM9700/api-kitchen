@@ -39,21 +39,25 @@ async def test_me_requires_auth(client):
     assert response.json()["code"] == "UNAUTHORIZED"
 
 
-async def test_me_returns_email_verified_field(client):
+async def test_me_returns_email_verified_field(client, unique_slug):
     # Register + login to get a token
+    email = f"me-{unique_slug}@test.com"
     reg = await client.post("/api/v1/auth/register", json={
-        "tenant_slug": "testme",
+        "tenant_slug": unique_slug,
         "tenant_name": "Test Me",
-        "email": "me@test.com",
+        "email": email,
         "password": "Valid1!aa",
     })
     assert reg.status_code == 201
     token = reg.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}", "X-Tenant-Slug": "testme"}
+    headers = {"Authorization": f"Bearer {token}", "X-Tenant-Slug": unique_slug}
 
     resp = await client.get("/api/v1/auth/me", headers=headers)
     assert resp.status_code == 200
     data = resp.json()
+    assert data["email"] == email
+    assert data["phone"] is None
+    assert data["permissions"] is None
     assert "email_verified" in data
     assert data["email_verified"] is False  # not verified yet at registration
     assert "must_change_password" in data
@@ -171,18 +175,19 @@ async def test_get_sessions_requires_auth(client):
     assert resp.status_code == 401
 
 
-async def test_get_sessions_returns_list(client):
+async def test_get_sessions_returns_list(client, unique_slug):
     # register + get token
+    email = f"sess-{unique_slug}@test.com"
     reg = await client.post("/api/v1/auth/register", json={
-        "tenant_slug": "sesstest",
+        "tenant_slug": unique_slug,
         "tenant_name": "Sess Test",
-        "email": "sess@test.com",
+        "email": email,
         "password": "Valid1!aa",
     })
     assert reg.status_code == 201
     token = reg.json()["access_token"]
     session_id = reg.json()["session_id"]
-    headers = {"Authorization": f"Bearer {token}", "X-Tenant-Slug": "sesstest"}
+    headers = {"Authorization": f"Bearer {token}", "X-Tenant-Slug": unique_slug}
 
     resp = await client.get(f"/api/v1/auth/sessions?current_session_id={session_id}", headers=headers)
     assert resp.status_code == 200

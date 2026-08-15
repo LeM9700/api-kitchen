@@ -227,7 +227,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
 
 
 async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db_session, monkeypatch):
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
 
     import sqlalchemy as sa
 

@@ -37,8 +37,12 @@ async def _provision_tenant_schema(conn, slug: str) -> None:
         slug: Slug tenant valide, utilise pour construire le nom du schema.
     """
     schema = tenant_schema_name(slug)
+    await conn.run_sync(
+        lambda sync_conn: Base.metadata.create_all(
+            sync_conn.execution_options(schema_translate_map={None: schema})
+        )
+    )
     await conn.execute(text(f'SET search_path TO "{schema}", public'))
-    await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn))
     await conn.execute(
         text(
             """INSERT INTO establishments (name, timezone)

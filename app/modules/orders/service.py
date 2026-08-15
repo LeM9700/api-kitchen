@@ -365,6 +365,7 @@ async def create_order(
     customer_phone: str | None = None,
     commit: bool = True,
     skip_idempotency_lookup: bool = False,
+    arq_pool: ArqRedis | None = None,
 ) -> Order:
     """Cree une commande avec pricing et discount calcules exclusivement cote serveur.
 
@@ -566,6 +567,13 @@ async def create_order(
     if commit:
         await session.commit()
         await session.refresh(order)
+        # [PROD] Transmission hub jamais dans le chemin critique -- enqueue
+        # post-commit, best-effort, ne bloque jamais la reponse utilisateur.
+        if arq_pool is not None:
+            try:
+                await arq_pool.enqueue_job("push_order_to_hub", order_id=order.id, tenant_slug=tenant_slug)
+            except Exception:
+                logger.warning("create_order: echec enqueue push_order_to_hub order_id=%s", order.id, exc_info=True)
 
     # Enregistre l'utilisation du code promo apres creation de la commande.
     if commit and body.promo_code and user_id is not None:
@@ -661,6 +669,14 @@ async def create_manual_order(
     except Exception:
         await session.rollback()
         raise
+
+    # [PROD] Transmission hub jamais dans le chemin critique -- enqueue
+    # post-commit, best-effort, ne bloque jamais la reponse staff.
+    if arq_pool is not None:
+        try:
+            await arq_pool.enqueue_job("push_order_to_hub", order_id=order.id, tenant_slug=tenant_slug)
+        except Exception:
+            logger.warning("create_manual_order: echec enqueue push_order_to_hub order_id=%s", order.id, exc_info=True)
 
     await session.refresh(order)
     await session.refresh(payment)
