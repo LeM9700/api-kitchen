@@ -4,6 +4,7 @@ import contextlib
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from app.core.http.errors import AppError
 from app.modules.kds import service
@@ -98,6 +99,33 @@ def test_kds_screen_schema_rejects_blank_station():
         KdsScreenCreate(name="X", screen_key="x", station="   ")
 
 
+def test_kds_screen_update_rejects_null_name():
+    with pytest.raises(ValidationError):
+        KdsScreenUpdate(name=None)
+
+
+def test_kds_screen_update_rejects_null_station():
+    with pytest.raises(ValidationError):
+        KdsScreenUpdate(station=None)
+
+
+def test_kds_screen_update_rejects_null_is_active():
+    with pytest.raises(ValidationError):
+        KdsScreenUpdate(is_active=None)
+
+
+def test_kds_screen_update_allows_empty_patch():
+    body = KdsScreenUpdate()
+
+    assert body.model_dump(exclude_unset=True) == {}
+
+
+def test_kds_screen_update_accepts_valid_name():
+    body = KdsScreenUpdate(name="Nouvelle cuisine")
+
+    assert body.model_dump(exclude_unset=True) == {"name": "Nouvelle cuisine"}
+
+
 def test_kds_pair_request_keeps_code_as_six_digit_string():
     body = KdsPairRequest(code="004281", device_label=" iPhone Malik ")
 
@@ -181,6 +209,20 @@ async def test_update_screen_rejects_duplicate_screen_key():
     assert exc_info.value.code == "KDS_SCREEN_KEY_ALREADY_EXISTS"
 
 
+async def test_update_screen_reraises_unexpected_integrity_error():
+    integrity_error = IntegrityError("UPDATE kds_screens", {}, Exception("not-null"))
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=_screen())
+    session.commit = AsyncMock(side_effect=integrity_error)
+    session.rollback = AsyncMock()
+    session.scalar = AsyncMock(return_value=None)
+
+    with pytest.raises(IntegrityError):
+        await service.update_screen(session, 12, KdsScreenUpdate(name="Cuisine 2"))
+
+    session.rollback.assert_awaited_once()
+
+
 async def test_staff_without_admin_cannot_create_screen(client):
     from app.core.http.deps import get_current_user
     from app.main import app
@@ -195,6 +237,31 @@ async def test_staff_without_admin_cannot_create_screen(client):
         app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == 403
+
+
+async def test_patch_screen_rejects_explicit_null_name_http(client, monkeypatch):
+    from app.core.http.deps import get_current_user
+    from app.main import app
+    from app.modules.kds import router as kds_router
+
+    async def _admin():
+        return {"id": "7", "tenant_slug": "acme", "role": "admin", "permissions": []}
+
+    @contextlib.asynccontextmanager
+    async def _tenant_session(_tenant_slug):
+        yield object()
+
+    update_mock = AsyncMock()
+    monkeypatch.setattr(kds_router, "get_tenant_session", _tenant_session)
+    monkeypatch.setattr(kds_router.service, "update_screen", update_mock)
+    app.dependency_overrides[get_current_user] = _admin
+    try:
+        response = await client.patch("/api/v1/kds/screens/12", json={"name": None})
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 422
+    update_mock.assert_not_awaited()
 
 
 async def test_staff_preparation_can_list_screens(client, monkeypatch):

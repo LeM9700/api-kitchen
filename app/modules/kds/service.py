@@ -157,7 +157,18 @@ async def update_screen(session: AsyncSession, screen_id: int, data: KdsScreenUp
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise AppError("KDS_SCREEN_KEY_ALREADY_EXISTS", "screen_key already exists", 409, "screen_key") from exc
+        if next_key:
+            existing = await session.scalar(
+                select(KdsScreen.id).where(KdsScreen.screen_key == next_key, KdsScreen.id != screen_id)
+            )
+            if existing is not None:
+                raise AppError(
+                    "KDS_SCREEN_KEY_ALREADY_EXISTS",
+                    "screen_key already exists",
+                    409,
+                    "screen_key",
+                ) from exc
+        raise
     await session.refresh(screen)
     return screen
 

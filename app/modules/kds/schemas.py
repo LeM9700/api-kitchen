@@ -1,10 +1,21 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 KdsScreenMode = Literal["kitchen", "counter", "service"]
 KdsInteractionMode = Literal["wall", "touch"]
+KDS_SCREEN_PATCH_NON_NULL_FIELDS = frozenset(
+    {
+        "name",
+        "screen_key",
+        "mode",
+        "station",
+        "interaction_mode",
+        "tickets_per_page",
+        "is_active",
+    }
+)
 
 
 class KdsScreenBase(BaseModel):
@@ -50,6 +61,19 @@ class KdsScreenUpdate(BaseModel):
     interaction_mode: KdsInteractionMode | None = None
     tickets_per_page: int | None = Field(None, ge=1, le=8)
     is_active: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_null_values(cls, data: object) -> object:
+        if isinstance(data, dict):
+            null_fields = sorted(
+                field
+                for field in KDS_SCREEN_PATCH_NON_NULL_FIELDS
+                if field in data and data[field] is None
+            )
+            if null_fields:
+                raise ValueError(f"KDS screen patch fields cannot be null: {', '.join(null_fields)}")
+        return data
 
     @field_validator("name", "screen_key", "station", mode="before")
     @classmethod
