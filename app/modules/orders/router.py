@@ -28,6 +28,7 @@ from app.modules.orders.schemas import (
     OrderListOut,
     OrderOut,
     OrderReceiptOut,
+    OrderStationPreparationUpdate,
     OrderStatusUpdate,
     ReorderOut,
 )
@@ -243,4 +244,23 @@ async def update_item_preparation(
             body.status,
             body.note,
             actor_user_id=int(current_user["id"]),
+        )
+
+
+@router.patch("/{order_id}/stations/{station}/preparation", response_model=OrderDetailOut)
+async def update_station_preparation(
+    order_id: int,
+    station: str,
+    body: OrderStationPreparationUpdate,
+    current_user=Depends(require_permission("orders:preparation", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.update_station_preparation(
+            session,
+            order_id,
+            station,
+            body.status,
+            body.note,
+            actor_user_id=int(current_user["id"]),
+            tenant_slug=current_user["tenant_slug"],
         )

@@ -90,6 +90,11 @@ class OrderItemPreparationUpdate(BaseModel):
     note: str | None = Field(None, max_length=512)
 
 
+class OrderStationPreparationUpdate(BaseModel):
+    status: PreparationStatus
+    note: str | None = Field(None, max_length=512)
+
+
 class OrderListOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

@@ -17,6 +17,7 @@ Creation et cycle de vie des commandes : pricing serveur-side, application des p
 | GET | `/api/v1/orders/{order_id}/receipt` | Bearer JWT | staff, admin | `OrderReceiptOut` |
 | PATCH | `/api/v1/orders/{order_id}/status` | Bearer JWT | staff, admin | `OrderOut` |
 | PATCH | `/api/v1/orders/{order_id}/items/{item_id}/preparation` | Bearer JWT | staff, admin | `OrderItemOut` |
+| PATCH | `/api/v1/orders/{order_id}/stations/{station}/preparation` | Bearer JWT | staff, admin | `OrderDetailOut` |
 
 ## Query params
 
@@ -130,6 +131,24 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - `OrderDetailOut.station_summary` expose un resume par station : `station`, `total_items`, `ready_items`, `all_ready`.
 - Le statut global de commande reste pilote par `PATCH /orders/{id}/status`.
 
+**Preparation par station -- bulk (LOT 12, `PATCH /orders/{order_id}/stations/{station}/preparation`)**
+
+- Body : `{ "status": "preparing" | "ready", "note": "..." }` (`note` optionnelle, 512 caracteres max).
+- `station` vient du path (`kitchen`, `counter`, ou toute valeur presente en base -- pas d'enum fermee).
+- Applique le statut a **tous** les `OrderItem` de la commande appartenant a cette station, dans une seule transaction (un seul `commit`, jamais un commit par item).
+- Verrouille la commande et les items de la station via `SELECT ... FOR UPDATE` pour rendre deterministe une double mutation quasi simultanee (ecran mural + telephone remote).
+- Transitions item autorisees : `pending -> preparing`, `pending -> ready`, `preparing -> ready`, `ready -> preparing`. Toute autre transition leve `INVALID_PREPARATION_TRANSITION` (422).
+- `ready -> preparing` (relance operationnelle) n'existe que sur cet endpoint : `VALID_TRANSITIONS` (statut global) et `PATCH /orders/{id}/status` continuent de refuser `ready -> preparing`.
+- Idempotent : si tous les items de la station sont deja dans le statut demande, retourne l'etat courant sans ecrire de nouvelle transition ni d'historique.
+- Refuse si `order.status` n'est pas dans `{confirmed, preparing, ready}` -- `ORDER_NOT_PREPARABLE` (409). Une commande `queued` ne peut pas etre preparee.
+- Refuse `ORDER_STATION_NOT_FOUND` (404) si aucun item de la commande n'appartient a la station demandee.
+- Synchronisation du statut global :
+  - Toutes les stations `ready` et `order.status == preparing` -> `order.status = ready` (avec entree `OrderStatusHistory`, `authority=internal`).
+  - Une station repasse `preparing` alors que `order.status == ready` -> `order.status = preparing` (note par defaut `"KDS station reopened"` si non fournie).
+  - Aucune entree d'historique globale n'est ecrite si le statut global ne change pas (mutation partielle d'une station parmi plusieurs).
+- Notifications : emet `order.preparation_updated` (staff uniquement, pas de son specifique) apres chaque mutation reussie ; si le statut global bascule `preparing -> ready`, reutilise la notification client existante (`order.ready`, "Prete a recuperer") pour ne pas regresser sur ce point.
+- Partage `_apply_preparation_status` (statut + `prepared_at` + `prepared_by_user_id`) avec `update_item_preparation` : toute transition hors `ready` efface desormais `prepared_at`/`prepared_by_user_id` sur les deux endpoints, pour permettre un vrai undo.
+
 **Historique client (`GET /orders/me`)**
 
 - Retourne uniquement les commandes du `user_id` courant.
@@ -195,6 +214,7 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - `apply_promo` masque les erreurs derriere `INVALID_PROMO`.
 - `PATCH /orders/{id}/status` reserve staff/admin.
 - `PATCH /orders/{id}/items/{item_id}/preparation` reserve staff/admin.
+- `PATCH /orders/{id}/stations/{station}/preparation` reserve staff/admin (`orders:preparation`), bulk atomique verrouille (`FOR UPDATE`).
 - `GET /orders/{id}` protege contre l'IDOR client : un client ne voit que ses commandes.
 - Isolation tenant via `get_tenant_session(current_user["tenant_slug"])`.
 - Atomicite stock/statut : `deduct_for_order` s'execute dans la transaction de `update_status`.
@@ -303,3 +323,22 @@ PYTHONPATH=. pytest tests/test_order_type.py tests/test_orders.py tests/test_cat
 ```
 
 Note locale : les tests d'integration PostgreSQL doivent etre rejoues apres `alembic upgrade head`, car les modeles ORM incluent les colonnes ajoutees par `0035_admin_staff_api_contracts.py`.
+
+**LOT 12 (bulk station preparation)**
+
+```text
+uv run ruff check app/modules/orders tests/test_kds_station_preparation.py
+[]
+
+uv run pytest tests/test_orders.py tests/test_kds.py tests/test_kds_station_preparation.py -q
+82 passed
+```
+
+Suite complete (`uv run pytest -q`) : 553 passed, 25 failed, 1 skipped -- les 25 echecs sont
+pre-existants (confirmes par `git stash` sur la meme suite avant ce LOT) : etat DB locale non
+reinitialise entre executions (`409` sur re-inscription `test_auth*`, `test_p1_fixes.py`), schema
+tenant non migre pour certains tests d'integration directe (`relation "orders" does not exist`,
+`test_stock*`, `test_catalog.py::test_delete_extra_blocked_while_linked_to_product`), et un mismatch
+de mode d'integration (`test_catalog_provider.py::test_load_integration_mode_reads_real_tenant_row`).
+Aucun ne touche `orders`/`kds`/preparation. `tests/test_tenant_branding.py` echoue independamment
+(fixture `demo_tenant_slug` jamais definie, pre-existant, hors perimetre LOT 12).

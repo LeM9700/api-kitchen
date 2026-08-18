@@ -87,6 +87,20 @@ ACTIVE_PREPARATION_ORDER_STATUSES = {"pending", "confirmed", "queued", "preparin
 PREPARATION_STATUSES = {"pending", "preparing", "ready"}
 MANUAL_PAYMENT_PROVIDERS = {"cash", "external_terminal", "cash_register"}
 
+# LOT 12: transitions autorisees pour une mutation de preparation par station.
+# ready -> preparing existe uniquement ici (correction operationnelle KDS) et ne
+# doit jamais etre ajoute a VALID_TRANSITIONS (statut global) ni accepte par
+# l'endpoint generique PATCH /orders/{id}/status.
+VALID_PREPARATION_TRANSITIONS: dict[str, set[str]] = {
+    "pending": {"preparing", "ready"},
+    "preparing": {"ready"},
+    "ready": {"preparing"},
+}
+# Statuts de commande pour lesquels une mutation de station a du sens. "queued"
+# est volontairement exclu : une commande en file d'attente n'est pas encore en
+# preparation.
+STATION_PREPARABLE_ORDER_STATUSES = {"confirmed", "preparing", "ready"}
+
 
 def _money(value) -> float:
     return round(float(value or 0), 2)
@@ -671,6 +685,23 @@ async def create_manual_order(
     }
 
 
+def _apply_preparation_status(item: OrderItem, status: str, actor_user_id: int | None) -> None:
+    """Applique un statut de preparation a un item et synchronise prepared_at/prepared_by_user_id.
+
+    Partagee par update_item_preparation et update_station_preparation (LOT 12)
+    pour eviter deux regles de timestamp divergentes -- cf. AGENTS.md LOT 12 A16.
+    Tout statut different de "ready" efface les champs d'audit : c'est
+    indispensable pour un vrai undo ready -> preparing (A8).
+    """
+    item.preparation_status = status
+    if status == "ready":
+        item.prepared_at = datetime.now(timezone.utc)
+        item.prepared_by_user_id = actor_user_id
+    else:
+        item.prepared_at = None
+        item.prepared_by_user_id = None
+
+
 async def update_item_preparation(
     session: AsyncSession,
     order_id: int,
@@ -691,13 +722,7 @@ async def update_item_preparation(
     if item is None or item.order_id != order_id:
         raise AppError("ORDER_ITEM_NOT_FOUND", "Order item not found", 404)
 
-    item.preparation_status = status
-    if status == "ready":
-        item.prepared_at = datetime.now(timezone.utc)
-        item.prepared_by_user_id = actor_user_id
-    elif status == "pending":
-        item.prepared_at = None
-        item.prepared_by_user_id = None
+    _apply_preparation_status(item, status, actor_user_id)
 
     if note:
         session.add(
@@ -725,6 +750,156 @@ async def update_item_preparation(
         "prepared_at": item.prepared_at,
         "prepared_by_user_id": item.prepared_by_user_id,
     }
+
+
+async def update_station_preparation(
+    session: AsyncSession,
+    order_id: int,
+    station: str,
+    status: str,
+    note: str | None = None,
+    actor_user_id: int | None = None,
+    tenant_slug: str | None = None,
+) -> dict:
+    """Applique un statut de preparation a tous les items d'une station, atomiquement.
+
+    Reutilise _apply_preparation_status (partage avec update_item_preparation)
+    pour la partie item, puis synchronise le statut GLOBAL de la commande :
+
+    - preparing -> ready (station) + toutes les stations ready + order.status
+      == "preparing" => order.status devient "ready".
+    - ready -> preparing (station, correction operationnelle) + order.status
+      == "ready" => order.status revient a "preparing". Ce retour arriere est
+      gere ici, en interne, et ne doit JAMAIS etre ajoute a VALID_TRANSITIONS :
+      l'endpoint generique PATCH /orders/{id}/status doit continuer a refuser
+      ready -> preparing (cf. AGENTS.md LOT 12 A10).
+
+    Verrouille la commande et les items de la station via SELECT ... FOR UPDATE
+    pour rendre deterministe une double mutation quasi simultanee sur la meme
+    station (ex. ecran mural + telephone remote) -- une seule transaction,
+    un seul commit, jamais de commit par item (A5/A6).
+
+    Idempotent (A13) : si tous les items de la station sont deja dans le statut
+    demande, retourne l'etat actuel sans ecrire de nouvelle transition ni
+    d'historique.
+
+    Raises:
+        AppError: INVALID_PREPARATION_STATUS (422) si status est invalide.
+        AppError: ORDER_NOT_FOUND (404) si la commande n'existe pas.
+        AppError: ORDER_NOT_PREPARABLE (409) si la commande n'est pas dans un
+            statut ou la preparation a un sens (cf. STATION_PREPARABLE_ORDER_STATUSES).
+        AppError: ORDER_STATION_NOT_FOUND (404) si aucun item de la commande
+            n'appartient a cette station.
+        AppError: INVALID_PREPARATION_TRANSITION (422) si un item de la station
+            ne peut pas atteindre `status` depuis son statut courant.
+    """
+    if status not in PREPARATION_STATUSES:
+        raise AppError("INVALID_PREPARATION_STATUS", "Invalid preparation status", 422, "status")
+
+    order = await session.scalar(select(Order).where(Order.id == order_id).with_for_update())
+    if order is None:
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if order.status not in STATION_PREPARABLE_ORDER_STATUSES:
+        raise AppError(
+            "ORDER_NOT_PREPARABLE",
+            "Cannot update station preparation for this order status",
+            409,
+            "status",
+        )
+
+    items_result = await session.execute(
+        select(OrderItem)
+        .where(OrderItem.order_id == order_id, OrderItem.preparation_station == station)
+        .with_for_update()
+    )
+    items = list(items_result.scalars().all())
+    if not items:
+        raise AppError("ORDER_STATION_NOT_FOUND", "No items found for this station", 404, "station")
+
+    current_statuses = {item.preparation_status for item in items}
+    if current_statuses == {status}:
+        # Deja dans l'etat demande pour toute la station : idempotent, pas de mutation.
+        return await _serialize_order_detail(session, order)
+
+    for item in items:
+        if item.preparation_status == status:
+            continue
+        allowed = VALID_PREPARATION_TRANSITIONS.get(item.preparation_status, set())
+        if status not in allowed:
+            raise AppError(
+                "INVALID_PREPARATION_TRANSITION",
+                f"Cannot move item from {item.preparation_status} to {status}",
+                422,
+                "status",
+            )
+
+    for item in items:
+        _apply_preparation_status(item, status, actor_user_id)
+
+    previous_order_status = order.status
+    global_changed = False
+
+    if status == "ready" and previous_order_status == "preparing":
+        remaining_result = await session.execute(
+            select(OrderItem.preparation_status).where(OrderItem.order_id == order_id)
+        )
+        remaining_statuses = [row[0] for row in remaining_result.all()]
+        if remaining_statuses and all(item_status == "ready" for item_status in remaining_statuses):
+            order.status = "ready"
+            global_changed = True
+            global_note = note
+    elif status == "preparing" and previous_order_status == "ready":
+        order.status = "preparing"
+        global_changed = True
+        global_note = note or "KDS station reopened"
+
+    if global_changed:
+        session.add(
+            OrderStatusHistory(
+                order_id=order.id,
+                status=order.status,
+                note=global_note,
+                authority=TransitionAuthority.INTERNAL.value,
+            )
+        )
+
+    await session.commit()
+    await session.refresh(order)
+
+    _effective_tenant = tenant_slug or "default"
+    try:
+        await notify_staff(
+            session=session,
+            tenant_slug=_effective_tenant,
+            event="order.preparation_updated",
+            title="Preparation mise a jour",
+            body=f"Commande #{order_id} : poste {station} -> {status}",
+            data={"order_id": order_id},
+        )
+    except Exception as exc:
+        logger.error(
+            "notify_staff failed for order_id=%s station=%s status=%s: %s",
+            order_id,
+            station,
+            status,
+            exc,
+        )
+
+    if global_changed and order.status == "ready" and order.user_id is not None:
+        try:
+            await notify_user(
+                session=session,
+                tenant_slug=_effective_tenant,
+                user_id=order.user_id,
+                event="order.ready",
+                title="Prete a recuperer",
+                body=f"Votre commande #{order_id} est prete !",
+                data={"order_id": order_id},
+            )
+        except Exception as exc:
+            logger.error("notify_user failed for order_id=%s: %s", order_id, exc)
+
+    return await _serialize_order_detail(session, order)
 
 
 async def list_orders(
