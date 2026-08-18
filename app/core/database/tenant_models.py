@@ -15,6 +15,7 @@ from app.modules.catalog.image import image_model as catalog_image_model  # noqa
 from app.modules.catalog import models as catalog_models  # noqa: F401
 from app.modules.delivery import models as delivery_models  # noqa: F401
 from app.modules.hr import models as hr_models  # noqa: F401
+from app.modules.kds import models as kds_models  # noqa: F401
 from app.modules.loyalty.account import models as loyalty_account_models  # noqa: F401
 from app.modules.loyalty.config import models as loyalty_config_models  # noqa: F401
 from app.modules.notifications import models as notifications_models  # noqa: F401

@@ -212,6 +212,7 @@ def create_app() -> FastAPI:
             "stripe-signature",
             "Idempotency-Key",
             "X-Request-ID",
+            "X-KDS-Session",
         ],
         expose_headers=["X-Request-ID"],
     )
@@ -267,6 +268,7 @@ def create_app() -> FastAPI:
     from app.modules.promotions.router import router as promotions_router
     from app.modules.delivery.router import router as delivery_router
     from app.modules.hr.router import router as hr_router
+    from app.modules.kds.router import router as kds_router
     from app.modules.admin.router import router as admin_router
     from app.modules.admin.tenants.router import router as tenant_router
     from app.modules.customer.router import router as customer_router
@@ -286,6 +288,7 @@ def create_app() -> FastAPI:
     app.include_router(promotions_router, prefix=prefix + "/promotions", tags=["promotions"])
     app.include_router(delivery_router, prefix=prefix + "/delivery", tags=["delivery"])
     app.include_router(hr_router, prefix=prefix + "/hr", tags=["hr"])
+    app.include_router(kds_router, prefix=prefix + "/kds", tags=["kds"])
     app.include_router(admin_router, prefix=prefix + "/admin")
     app.include_router(tenant_router, prefix=prefix + "/tenant", tags=["tenant"])
     app.include_router(notifications_router, prefix=prefix + "/notifications", tags=["notifications"])
