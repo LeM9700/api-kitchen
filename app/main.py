@@ -283,6 +283,7 @@ def create_app() -> FastAPI:
     from app.modules.admin.router import router as admin_router
     from app.modules.admin.tenants.router import router as tenant_router
     from app.modules.customer.router import router as customer_router
+    from app.modules.super_admin.router import router as super_admin_router
 
     prefix = "/api/v1"
     app.include_router(auth_router, prefix=prefix + "/auth", tags=["auth"])
@@ -305,6 +306,7 @@ def create_app() -> FastAPI:
     app.include_router(notifications_router, prefix=prefix + "/notifications", tags=["notifications"])
     app.include_router(notifications_ws_router, prefix=prefix, tags=["notifications-ws"])
     app.include_router(customer_router, prefix=prefix + "/customer", tags=["customer"])
+    app.include_router(super_admin_router, prefix=prefix + "/super-admin", tags=["super-admin"])
 
     # ---------------------------------------------------------------------------
     # Health check — utilisé par Railway pour la liveness probe.

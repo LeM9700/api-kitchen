@@ -1,7 +1,8 @@
+import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 
 from app.core.database import get_public_session, get_tenant_session
@@ -13,6 +14,7 @@ from app.modules.admin.tenants.schemas import (
     TenantResponse,
     TenantSuspendRequest,
 )
+from app.modules.admin.users.schemas import AdminUserCreate
 
 router = APIRouter()
 
@@ -21,6 +23,17 @@ class TenantCreate(BaseModel):
     slug: str
     name: str
     plan: str = "starter"
+    admin_email: EmailStr
+    admin_password: str | None = None
+
+
+class TenantCreateResponse(BaseModel):
+    id: int
+    slug: str
+    name: str
+    plan: str
+    admin_email: str
+    temporary_password: str
 
 
 @router.get("/tenants")
@@ -36,20 +49,79 @@ async def list_tenants(current_user=Depends(require_role("super-admin"))):
         return [dict(row._mapping) for row in result]
 
 
-@router.post("/tenants", status_code=201)
-async def create_tenant(body: TenantCreate, current_user=Depends(require_role("super-admin"))):
+@router.post("/tenants", response_model=TenantCreateResponse, status_code=201)
+async def create_tenant(
+    body: TenantCreate,
+    current_user=Depends(require_role("super-admin")),
+):
+    """Crée un tenant (schéma Postgres) et son premier utilisateur admin.
+
+    [🔒 SÉCURITÉ] La temporary_password n'est retournée qu'une seule fois dans
+    cette réponse — elle doit être transmise à l'administrateur hors-bande.
+    Le compte est marqué must_change_password=True.
+
+    Args:
+        body: Slug, name, plan, admin_email, admin_password (optionnel).
+        current_user: Super-admin injecté par dépendance.
+
+    Returns:
+        TenantCreateResponse avec le mot de passe temporaire de l'admin.
+    """
+    # Génère le mot de passe si non fourni
+    temp_password = body.admin_password or secrets.token_urlsafe(12)
+
+    # 1. Crée la ligne dans public.tenants
     async with get_public_session() as session:
         result = await session.execute(
             text(
                 "INSERT INTO public.tenants (slug, name, plan) "
                 "VALUES (:slug, :name, :plan) RETURNING id, slug"
             ),
-            body.model_dump(),
+            {"slug": body.slug, "name": body.name, "plan": body.plan},
         )
         row = result.fetchone()
         await session.commit()
-    await create_tenant_schema(body.slug)
-    return {"id": row.id, "slug": row.slug}
+        tenant_id = row.id
+        tenant_slug = row.slug
+
+    # 2. Crée le schéma Postgres + toutes les tables du tenant
+    await create_tenant_schema(tenant_slug)
+
+    # 3. Crée le premier admin dans le schéma tenant
+    from app.modules.admin.users import service as users_service
+
+    admin_body = AdminUserCreate(
+        email=str(body.admin_email),
+        full_name=None,
+        role="admin",
+    )
+    # On force le mot de passe généré via une version interne de create_user
+    from datetime import datetime, timezone
+    from app.core.database import get_tenant_session
+    from app.core.auth.security import get_password_hash
+    from app.modules.auth.models import User
+
+    async with get_tenant_session(tenant_slug) as session:
+        user = User(
+            email=str(body.admin_email),
+            full_name=None,
+            password_hash=get_password_hash(temp_password),
+            role="admin",
+            permissions=None,
+            must_change_password=True,
+            email_verified_at=datetime.now(timezone.utc),
+        )
+        session.add(user)
+        await session.commit()
+
+    return TenantCreateResponse(
+        id=tenant_id,
+        slug=tenant_slug,
+        name=body.name,
+        plan=body.plan,
+        admin_email=str(body.admin_email),
+        temporary_password=temp_password,
+    )
 
 
 @router.patch("/tenants/{tenant_id}/suspend", response_model=TenantResponse)
