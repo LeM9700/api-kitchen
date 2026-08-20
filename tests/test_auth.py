@@ -1,4 +1,5 @@
 import pytest
+from app.core.auth.security import create_access_token
 from app.core.database import tenant_schema_name
 from app.core.http.errors import AppError
 from app.modules.auth.schemas import LoginRequest, RegisterRequest, UserOut
@@ -57,6 +58,37 @@ async def test_me_returns_email_verified_field(client):
     assert "email_verified" in data
     assert data["email_verified"] is False  # not verified yet at registration
     assert "must_change_password" in data
+
+
+async def test_must_change_password_shortcircuit_keeps_cors_header(client):
+    """TenantMiddleware court-circuite les requetes must_change_password=True
+    directement (403), sans passer par call_next. CORSMiddleware doit rester
+    plus exterieur que TenantMiddleware dans app/main.py pour que cette
+    reponse recoive quand meme Access-Control-Allow-Origin -- sinon le
+    navigateur la bloque comme une violation CORS opaque et le frontend ne
+    peut jamais lire le code PASSWORD_CHANGE_REQUIRED pour rediriger vers
+    l'ecran dedie (au lieu de retomber sur l'ecran de connexion).
+    """
+    token = create_access_token(
+        {
+            "sub": "1",
+            "tenant_id": 1,
+            "tenant_slug": "acme",
+            "role": "admin",
+            "email": "a@b.com",
+            "must_change_password": True,
+        }
+    )
+    response = await client.get(
+        "/api/v1/auth/me",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Origin": "http://localhost:5173",
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["code"] == "PASSWORD_CHANGE_REQUIRED"
+    assert "access-control-allow-origin" in response.headers
 
 
 def test_user_model_has_auth_extension_columns():

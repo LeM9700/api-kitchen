@@ -192,13 +192,29 @@ def create_app() -> FastAPI:
     app.add_exception_handler(TimeoutError, _database_unavailable_handler)
     app.add_exception_handler(SQLAlchemyTimeoutError, _database_unavailable_handler)
 
-    # Ordre d'enregistrement = ordre LIFO d'execution dans Starlette.
-    # CORSMiddleware en premier (dernier dans la chaine) pour traiter les preflight avant tout.
+    # Ordre d'enregistrement = ordre LIFO d'execution dans Starlette : le
+    # DERNIER add_middleware() devient le PLUS EXTERIEUR (il voit la requete
+    # en premier, la reponse en dernier).
+    #
+    # CORSMiddleware doit etre le plus exterieur de tous. SecurityHeaders,
+    # Tenant et RequestSizeLimit peuvent chacun court-circuiter la requete
+    # (return direct sans call_next : 403 must_change_password, 413 payload
+    # trop gros...). Si CORSMiddleware est plus interieur qu'eux, ces
+    # reponses n'ont jamais l'en-tete Access-Control-Allow-Origin : le
+    # navigateur les bloque comme une violation CORS opaque au lieu de
+    # laisser le client lire le vrai code d'erreur (ex: le flux
+    # "mot de passe a changer" devient invisible cote frontend et retombe
+    # sur l'ecran de connexion au lieu de l'ecran dedie).
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(TenantMiddleware)
+    # [🔒 SÉCURITÉ] Limite la taille des requêtes HTTP à 1 Mo.
+    app.add_middleware(_RequestSizeLimitMiddleware)
     local_cors_regex = (
         r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$"
         if not is_production
         else None
     )
+    # Doit rester le DERNIER add_middleware() de ce bloc (le plus exterieur).
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -216,11 +232,6 @@ def create_app() -> FastAPI:
         ],
         expose_headers=["X-Request-ID"],
     )
-    app.add_middleware(SecurityHeadersMiddleware)
-    app.add_middleware(TenantMiddleware)
-    # [🔒 SÉCURITÉ] Limite la taille des requêtes HTTP à 1 Mo.
-    # Doit être en dernier dans add_middleware (premier exécuté en LIFO Starlette).
-    app.add_middleware(_RequestSizeLimitMiddleware)
 
     @app.middleware("http")
     async def _log_request_duration(request: Request, call_next):
