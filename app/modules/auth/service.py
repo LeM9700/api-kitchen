@@ -37,7 +37,12 @@ async def _provision_tenant_schema(conn, slug: str) -> None:
         slug: Slug tenant valide, utilise pour construire le nom du schema.
     """
     schema = tenant_schema_name(slug)
-    await conn.execute(text(f'SET search_path TO "{schema}", public'))
+    # Pas de fallback ", public" ici : Base.metadata.create_all(checkfirst=True)
+    # resout les noms de table non qualifies via le search_path. public contient
+    # des tables historiques homonymes (users, orders, products...) -- cf.
+    # migration 0002 -- donc un fallback public ferait croire a tort que les
+    # tables du tenant existent deja et create_all() ne les creerait jamais.
+    await conn.execute(text(f'SET search_path TO "{schema}"'))
     await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn))
     await conn.execute(
         text(
