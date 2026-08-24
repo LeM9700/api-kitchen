@@ -103,7 +103,8 @@ async def bootstrap_test_tenants(db_engine):
                     """
                     INSERT INTO users (email, password_hash, full_name, role, is_active)
                     VALUES (:email, :password_hash, :full_name, 'admin', true)
-                    ON CONFLICT (email) DO NOTHING
+                    ON CONFLICT (email) DO UPDATE
+                    SET role = 'admin', is_active = true
                     """
                 ),
                 {
@@ -164,20 +165,26 @@ async def authed_client(db_engine, demo_tenant_slug: str):
                 {"slug": demo_tenant_slug},
             )
         ).scalar_one()
+        admin_email = f"admin@{demo_tenant_slug}.test"
         schema = tenant_schema_name(demo_tenant_slug)
         await conn.execute(text(f'SET search_path TO "{schema}", public'))
         admin_user = (
-            await conn.execute(text("SELECT id, email FROM users ORDER BY id LIMIT 1"))
-        ).first()
+            await conn.execute(
+                text("SELECT id, email FROM users WHERE email = :email LIMIT 1"),
+                {"email": admin_email},
+            )
+        ).mappings().first()
+        if admin_user is None:
+            raise RuntimeError(f"Admin user not found for tenant {demo_tenant_slug}")
         await conn.execute(text("SET search_path TO public"))
 
     token = create_access_token(
         {
-            "sub": str(admin_user.id),
+            "sub": str(admin_user["id"]),
             "tenant_id": tenant_id,
             "tenant_slug": demo_tenant_slug,
             "role": "admin",
-            "email": admin_user.email,
+            "email": admin_user["email"],
         }
     )
     transport = ASGITransport(app=app)
