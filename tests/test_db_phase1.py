@@ -25,13 +25,13 @@ async def test_check_constraint_rejects_negative_qty(db_session):
 
     RED until migration 0024 is applied.
     """
-    await db_session.execute(
-        sa.text(
-            "INSERT INTO ingredients (name, unit, current_qty, alert_threshold) "
-            "VALUES ('test_neg', 'kg', -1, 0)"
-        )
-    )
     with pytest.raises(IntegrityError):
+        await db_session.execute(
+            sa.text(
+                "INSERT INTO ingredients (name, unit, current_qty, alert_threshold) "
+                "VALUES ('test_neg', 'kg', -1, 0)"
+            )
+        )
         await db_session.commit()
 
 

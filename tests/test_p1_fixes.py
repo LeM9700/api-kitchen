@@ -71,8 +71,9 @@ async def test_must_change_password_blocks_route_unit():
 
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="fake")
 
-    with pytest.raises(AppError) as exc:
-        await get_current_user(mock_request, credentials)
+    with patch("app.core.tenancy.tenant.user_belongs_to_tenant", new_callable=AsyncMock, return_value=True):
+        with pytest.raises(AppError) as exc:
+            await get_current_user(mock_request, credentials)
 
     assert exc.value.code == "MUST_CHANGE_PASSWORD"
     assert exc.value.status_code == 403
@@ -112,8 +113,9 @@ async def test_must_change_password_allows_change_password_path():
     mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
     mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.core.database.get_public_session", return_value=mock_cm):
-        user = await get_current_user(mock_request, credentials)
+    with patch("app.core.tenancy.tenant.user_belongs_to_tenant", new_callable=AsyncMock, return_value=True):
+        with patch("app.core.database.get_public_session", return_value=mock_cm):
+            user = await get_current_user(mock_request, credentials)
 
     assert user["must_change_password"] is True
     assert user["role"] == "customer"
@@ -235,6 +237,7 @@ async def test_guest_order_missing_tenant_slug_returns_400(client):
         json={
             "items": [{"product_id": 1, "quantity": 1}],
             "customer_email": "guest@test.com",
+            "delivery_address": "1 rue de la Paix",
         },
     )
     assert response.status_code == 400
@@ -245,7 +248,10 @@ async def test_guest_order_missing_customer_email_returns_422(client):
     """POST /orders avec X-Tenant-Slug mais sans customer_email -> 422 CUSTOMER_EMAIL_REQUIRED."""
     response = await client.post(
         "/api/v1/orders",
-        json={"items": [{"product_id": 1, "quantity": 1}]},
+        json={
+            "items": [{"product_id": 1, "quantity": 1}],
+            "delivery_address": "1 rue de la Paix",
+        },
         headers={"x-tenant-slug": "acme"},
     )
     assert response.status_code == 422

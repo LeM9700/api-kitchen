@@ -25,7 +25,8 @@ _REQUIRED_KWARGS = {
 
 
 def _settings(**overrides) -> Settings:
-    return Settings(_env_file=None, **{**_REQUIRED_KWARGS, **overrides})
+    values = {**_REQUIRED_KWARGS, "test_database_url": "", **overrides}
+    return Settings(_env_file=None, **values)
 
 
 def test_plain_postgresql_scheme_gets_asyncpg_driver():

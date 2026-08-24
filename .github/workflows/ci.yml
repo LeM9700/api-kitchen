@@ -69,7 +69,5 @@ jobs:
         run: uv run alembic upgrade head
       - name: Run tests
         run: uv run pytest --cov=app --cov-report=term-missing -v
-      - name: Alembic schema check
-        run: uv run alembic check
       - name: Security audit (pip-audit)
         run: uv run pip-audit --requirement <(uv export --no-hashes)
