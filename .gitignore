@@ -21,6 +21,8 @@ htmlcov/
 /audit
 /seed-images/
 /scripts/_tmp_*.py
+/backups/
+*.dump
 
 # OS / editor cruft
 .DS_Store

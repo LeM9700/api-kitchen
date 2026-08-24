@@ -86,6 +86,9 @@ async def get_tenant_branding(
 
     Returns:
         TenantBrandingResponse (5 champs branding, tous nullable).
+
+    Raises:
+        AppError: TENANT_NOT_FOUND (404) si le slug est inconnu.
     """
     await _assert_tenant_exists(tenant_slug)
     async with get_tenant_session(tenant_slug) as session:
