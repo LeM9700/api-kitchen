@@ -30,6 +30,7 @@ from app.core.auth.token_revocation import is_jti_revoked, is_user_disabled
 from app.core.auth.security import decode_token
 from app.core.database import get_public_session
 from app.core.http.deps import get_client_ip_ws
+from app.core.tenancy.tenant import user_belongs_to_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -535,6 +536,18 @@ async def notifications_ws(
             "type": "error",
             "code": "unauthorized",
             "reason": "Account disabled",
+        })
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
+    # [SECURITE] Revalide que le sub appartient bien au tenant reclame -- meme
+    # controle que app.core.http.deps.get_current_user, necessaire ici car ce
+    # handler WS ne passe pas par get_current_user (voir user_belongs_to_tenant).
+    if payload_tenant and not await user_belongs_to_tenant(user_id, payload_tenant, payload.get("email")):
+        await websocket.send_json({
+            "type": "error",
+            "code": "unauthorized",
+            "reason": "Unauthorized",
         })
         await websocket.close(code=4001, reason="Unauthorized")
         return

@@ -70,6 +70,16 @@ async def get_current_user(
     if redis and user_id_str and await is_user_disabled(redis, int(user_id_str), tenant_slug):
         raise AppError("UNAUTHORIZED", "Account is disabled", 401)
 
+    # [SECURITE] Revalide que le sub appartient bien au tenant reclame par le JWT --
+    # le payload seul ne suffit pas pour choisir le schema Postgres (voir
+    # user_belongs_to_tenant). Sans ce controle, un token dont le sub et le
+    # tenant_slug sont incoherents resoudrait vers l'utilisateur reel portant
+    # cet id dans le tenant reclame (les ids repartent a 1 par schema).
+    if user_id_str and tenant_slug:
+        from app.core.tenancy.tenant import user_belongs_to_tenant
+        if not await user_belongs_to_tenant(int(user_id_str), tenant_slug, payload.get("email")):
+            raise AppError("UNAUTHORIZED", "Invalid token", 401)
+
     user = {
         "id": payload.get("sub"),
         "tenant_id": payload.get("tenant_id"),

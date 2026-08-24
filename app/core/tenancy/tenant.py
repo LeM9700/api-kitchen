@@ -64,3 +64,28 @@ async def create_tenant_schema(tenant_slug: str) -> None:
     schema = tenant_schema_name(tenant_slug)
     async with engine.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+
+
+async def user_belongs_to_tenant(user_id: int, tenant_slug: str, email: str | None) -> bool:
+    """Verifie que ``user_id`` appartient bien au tenant ``tenant_slug`` ET que
+    son email correspond au claim ``email`` du JWT.
+
+    [SECURITE] Defense en profondeur : un JWT valide (signature correcte) peut
+    porter un ``sub`` et un ``tenant_slug`` incoherents entre eux (bug de mint,
+    token rejoue apres un changement de contexte serveur...). Les ids
+    utilisateur repartant a 1 par schema tenant, une simple verification
+    d'existence de ``user_id`` dans le schema ne suffit PAS : un id=1 existe
+    presque toujours (le premier utilisateur de n'importe quel tenant), donc
+    un token mint pour le tenant A mais reclamant le tenant B passerait quand
+    meme ce controle en resolvant vers le VRAI utilisateur 1 de B. Comparer
+    l'email du claim (toujours present sur un access token legitime, voir
+    ``issue_tokens`` dans app/modules/auth/service.py, et unique par tenant)
+    a l'email reel de l'utilisateur cible ferme ce trou. Ce check doit etre
+    appele avant toute utilisation de ``current_user`` issue d'un JWT.
+    """
+    from app.core.database import get_tenant_session
+    from app.modules.auth.models import User
+
+    async with get_tenant_session(tenant_slug) as session:
+        user = await session.get(User, user_id)
+        return user is not None and email is not None and user.email == email
