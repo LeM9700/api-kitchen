@@ -14,11 +14,15 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.pool import NullPool
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
+from app.core.auth.security import create_access_token
 from app.core.config import settings
+from app.core.database import tenant_schema_name
 from app.main import app
+from app.modules.auth.service import _provision_tenant_schema
 
 
 @pytest.fixture(scope="session")
@@ -70,6 +74,47 @@ async def db_session(db_engine):
             await conn.rollback()
 
 
+@pytest.fixture(scope="session", autouse=True)
+async def bootstrap_test_tenants(db_engine):
+    """Provisionne les schemas tenants utilises par la suite de tests."""
+    tenant_specs = (
+        ("default", "Default Tenant"),
+        ("pizza_test", "Pizza Test Tenant"),
+        ("test", "Test Tenant"),
+    )
+    async with db_engine.begin() as conn:
+        for slug, name in tenant_specs:
+            schema = tenant_schema_name(slug)
+            await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO public.tenants (slug, name, plan)
+                    VALUES (:slug, :name, 'starter')
+                    ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+                    """
+                ),
+                {"slug": slug, "name": name},
+            )
+            await _provision_tenant_schema(conn, slug)
+            await conn.execute(text(f'SET search_path TO "{schema}", public'))
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO users (email, password_hash, full_name, role, is_active)
+                    VALUES (:email, :password_hash, :full_name, 'admin', true)
+                    ON CONFLICT (email) DO NOTHING
+                    """
+                ),
+                {
+                    "email": f"admin@{slug}.test",
+                    "password_hash": "not-used-in-tests",
+                    "full_name": f"Admin {slug}",
+                },
+            )
+            await conn.execute(text("SET search_path TO public"))
+
+
 @pytest.fixture
 async def public_session(db_session):
     """Alias retrocompatible de ``db_session`` pour les tests du schema public.
@@ -103,3 +148,42 @@ def unique_slug() -> str:
     (409 sur re-inscription, schema tenant fige avant une migration recente).
     """
     return uuid.uuid4().hex[:8]
+
+
+@pytest.fixture
+def demo_tenant_slug() -> str:
+    return "default"
+
+
+@pytest.fixture
+async def authed_client(db_engine, demo_tenant_slug: str):
+    async with db_engine.connect() as conn:
+        tenant_id = (
+            await conn.execute(
+                text("SELECT id FROM public.tenants WHERE slug = :slug"),
+                {"slug": demo_tenant_slug},
+            )
+        ).scalar_one()
+        schema = tenant_schema_name(demo_tenant_slug)
+        await conn.execute(text(f'SET search_path TO "{schema}", public'))
+        admin_user = (
+            await conn.execute(text("SELECT id, email FROM users ORDER BY id LIMIT 1"))
+        ).first()
+        await conn.execute(text("SET search_path TO public"))
+
+    token = create_access_token(
+        {
+            "sub": str(admin_user.id),
+            "tenant_id": tenant_id,
+            "tenant_slug": demo_tenant_slug,
+            "role": "admin",
+            "email": admin_user.email,
+        }
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": " ".join(("Bearer", token))},
+    ) as test_client:
+        yield test_client
