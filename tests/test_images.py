@@ -122,16 +122,16 @@ _CLOUD_DATA_SERVICE: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def staff_token() -> str:
+def staff_token(bootstrap_default_tenant) -> str:
     """JWT access token avec rôle 'staff' pour les tests router.
 
     Returns:
         Chaîne JWT signée avec les claims nécessaires.
     """
     return create_access_token({
-        "sub": "user-1",
-        "tenant_id": "tenant-abc",
-        "tenant_slug": "test",
+        "sub": str(bootstrap_default_tenant["staff_user_id"]),
+        "tenant_id": bootstrap_default_tenant["tenant_id"],
+        "tenant_slug": bootstrap_default_tenant["tenant_slug"],
         "role": "staff",
         "email": "staff@test.com",
     })
@@ -151,16 +151,16 @@ def staff_headers(staff_token: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def client_token() -> str:
+def client_token(bootstrap_default_tenant) -> str:
     """JWT access token avec rôle 'client' (non autorisé sur les mutations).
 
     Returns:
         Chaîne JWT signée avec le rôle client.
     """
     return create_access_token({
-        "sub": "user-2",
-        "tenant_id": "tenant-abc",
-        "tenant_slug": "test",
+        "sub": str(bootstrap_default_tenant["client_user_id"]),
+        "tenant_id": bootstrap_default_tenant["tenant_id"],
+        "tenant_slug": bootstrap_default_tenant["tenant_slug"],
         "role": "client",
         "email": "client@test.com",
     })
@@ -551,6 +551,10 @@ class TestImageService:
             db_product: Product persisté dans la transaction de test.
             mock_cloudinary_upload: Mock de cloudinary_service.upload_image.
         """
+        mock_cloudinary_upload.return_value = {
+            **_CLOUD_DATA_SERVICE,
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/abc123",
+        }
         image = await image_service.upload_entity_image(
             session=db_session,
             tenant_slug="test",
@@ -577,6 +581,10 @@ class TestImageService:
             db_product: Product persisté dans la transaction de test.
             mock_cloudinary_upload: Mock de cloudinary_service.upload_image.
         """
+        mock_cloudinary_upload.return_value = {
+            **_CLOUD_DATA_SERVICE,
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/abc123",
+        }
         first = await image_service.upload_entity_image(
             session=db_session,
             tenant_slug="test",
@@ -591,7 +599,7 @@ class TestImageService:
         # Cloudinary mock retourne un public_id différent pour le deuxième appel
         mock_cloudinary_upload.return_value = {
             **_CLOUD_DATA_SERVICE,
-            "cloudinary_public_id": "pizza/test/products/1/def456",
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/def456",
             "url": "https://res.cloudinary.com/demo/image/upload/v1/def456",
         }
 
@@ -657,6 +665,10 @@ class TestImageService:
             mock_cloudinary_upload: Mock de cloudinary_service.upload_image.
             mock_cloudinary_delete: Mock de cloudinary_service.delete_image.
         """
+        mock_cloudinary_upload.return_value = {
+            **_CLOUD_DATA_SERVICE,
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/abc123",
+        }
         image = await image_service.upload_entity_image(
             session=db_session,
             tenant_slug="test",
@@ -691,7 +703,7 @@ class TestImageService:
         """
         mock_cloudinary_upload.return_value = {
             **_CLOUD_DATA_SERVICE,
-            "cloudinary_public_id": "pizza/test/products/1/primary",
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/primary",
         }
         primary = await image_service.upload_entity_image(
             session=db_session,
@@ -705,7 +717,7 @@ class TestImageService:
 
         mock_cloudinary_upload.return_value = {
             **_CLOUD_DATA_SERVICE,
-            "cloudinary_public_id": "pizza/test/products/1/secondary",
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/secondary",
             "url": "https://res.cloudinary.com/demo/image/upload/v1/secondary",
         }
         secondary = await image_service.upload_entity_image(
@@ -738,7 +750,7 @@ class TestImageService:
         """
         mock_cloudinary_upload.return_value = {
             **_CLOUD_DATA_SERVICE,
-            "cloudinary_public_id": "pizza/test/products/1/img_a",
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/img_a",
         }
         first = await image_service.upload_entity_image(
             session=db_session,
@@ -752,7 +764,7 @@ class TestImageService:
 
         mock_cloudinary_upload.return_value = {
             **_CLOUD_DATA_SERVICE,
-            "cloudinary_public_id": "pizza/test/products/1/img_b",
+            "cloudinary_public_id": f"pizza/test/products/{db_product.id}/img_b",
             "url": "https://res.cloudinary.com/demo/image/upload/v1/img_b",
         }
         second = await image_service.upload_entity_image(
