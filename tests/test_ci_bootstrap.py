@@ -12,5 +12,5 @@ async def test_db_session_defaults_to_seeded_tenant(db_session):
     schema = await db_session.scalar(sa.text("SELECT current_schema()"))
     establishment_count = await db_session.scalar(sa.text("SELECT COUNT(*) FROM establishments"))
 
-    assert schema == "tenant_pizza_test"
+    assert schema == "tenant_test"
     assert establishment_count >= 1

@@ -80,8 +80,9 @@ async def get_current_user(
         if not await user_belongs_to_tenant(int(user_id_str), tenant_slug, payload.get("email")):
             raise AppError("UNAUTHORIZED", "Invalid token", 401)
 
+    raw_user_id = payload.get("sub")
     user = {
-        "id": payload.get("sub"),
+        "id": int(raw_user_id) if raw_user_id is not None and str(raw_user_id).isdigit() else raw_user_id,
         "tenant_id": payload.get("tenant_id"),
         "tenant_slug": tenant_slug,
         "role": payload.get("role"),

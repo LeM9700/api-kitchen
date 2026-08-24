@@ -27,6 +27,8 @@ from app.modules.auth.service import _provision_tenant_schema
 
 NEW_TENANT_SLUG = "ddlparitytest"
 BOOTSTRAP_TEST_SCHEMA = "tenant_pizza_test"
+BOOTSTRAP_DEFAULT_SCHEMA = "tenant_test"
+BOOTSTRAP_INTEGRATION_SCHEMA = "tenant_default"
 
 # Tables intentionnellement absentes du provisioning neuf : legacy en cours de
 # depreciation via une initiative independante de ce fix (voir
@@ -104,10 +106,14 @@ async def test_new_tenant_schema_matches_fully_migrated_tenant(db_engine):
             await conn.execute(
                 text(
                     "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'tenant\\_%' ESCAPE '\\' "
-                    "AND nspname <> :bootstrap_schema "
+                    "AND nspname NOT IN (:bootstrap_schema, :default_schema, :integration_schema) "
                     "ORDER BY nspname LIMIT 1"
                 ),
-                {"bootstrap_schema": BOOTSTRAP_TEST_SCHEMA},
+                {
+                    "bootstrap_schema": BOOTSTRAP_TEST_SCHEMA,
+                    "default_schema": BOOTSTRAP_DEFAULT_SCHEMA,
+                    "integration_schema": BOOTSTRAP_INTEGRATION_SCHEMA,
+                },
             )
         ).scalar()
     assert reference_schema, (

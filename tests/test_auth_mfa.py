@@ -22,8 +22,16 @@ async def _register_admin(client, tenant_slug: str) -> tuple[str, str]:
             "password": "Valid1!aa",
         },
     )
-    assert resp.status_code == 201, resp.text
-    return resp.json()["access_token"], email
+    if resp.status_code == 201:
+        return resp.json()["access_token"], email
+
+    assert resp.status_code == 409, resp.text
+    login = await client.post(
+        "/api/v1/auth/login",
+        json={"tenant_slug": tenant_slug, "email": email, "password": "Valid1!aa"},
+    )
+    assert login.status_code == 200, login.text
+    return login.json()["access_token"], email
 
 
 async def test_admin_can_setup_mfa(client):

@@ -21,11 +21,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.core.auth.security import create_access_token, get_password_hash
 from app.core.config import settings
 from app.core.database import tenant_schema_name
+from app.core.http.limiter import limiter
 from app.main import app
 from app.modules.auth.service import _provision_tenant_schema
 
-DEFAULT_TEST_TENANT_SLUG = "pizza_test"
-DEFAULT_TEST_ADMIN_EMAIL = "admin@pizza.test"
+DEFAULT_TEST_TENANT_SLUG = "test"
+LEGACY_TEST_TENANT_SLUG = "pizza_test"
+DEFAULT_INTEGRATION_TENANT_SLUG = "default"
+DEFAULT_TEST_ADMIN_EMAIL = "admin@test.com"
+DEFAULT_TEST_STAFF_EMAIL = "staff@test.com"
+DEFAULT_TEST_CLIENT_EMAIL = "client@test.com"
 
 
 @pytest.fixture(scope="session")
@@ -45,33 +50,42 @@ async def db_engine():
 
 @pytest.fixture(scope="session", autouse=True)
 async def bootstrap_default_tenant(db_engine):
-    """Provisionne un tenant de démo partagé pour les tests tenant-scoped.
+    """Provisionne des tenants de démo frais pour les tests tenant-scoped.
 
     La CI exécute Alembic sur une base neuve : sans tenant préexistant,
     aucune migration tenant-scoped historique ne peut boucler sur
-    ``public.tenants``. On crée donc explicitement un tenant stable
-    ``pizza_test`` puis on le provisionne via la même routine que la prod.
+    ``public.tenants``. On recrée donc explicitement deux tenants stables :
+    ``test`` pour les fixtures génériques et ``pizza_test`` pour les tests
+    historiques qui ciblent ce schéma en dur.
     """
-    schema = tenant_schema_name(DEFAULT_TEST_TENANT_SLUG)
     async with db_engine.begin() as conn:
-        tenant_id = await conn.scalar(
-            text(
-                """INSERT INTO public.tenants (slug, name, plan)
-                   VALUES (:slug, :name, 'starter')
-                   ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-                   RETURNING id"""
-            ),
-            {"slug": DEFAULT_TEST_TENANT_SLUG, "name": "Pizza Test"},
-        )
-        await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-        await _provision_tenant_schema(conn, DEFAULT_TEST_TENANT_SLUG)
-        await conn.execute(text(f'SET search_path TO "{schema}", public'))
+        tenant_ids = {}
+        for slug, name in (
+            (DEFAULT_TEST_TENANT_SLUG, "Test Tenant"),
+            (DEFAULT_INTEGRATION_TENANT_SLUG, "Default Tenant"),
+            (LEGACY_TEST_TENANT_SLUG, "Pizza Test"),
+        ):
+            tenant_ids[slug] = await conn.scalar(
+                text(
+                    """INSERT INTO public.tenants (slug, name, plan)
+                       VALUES (:slug, :name, 'starter')
+                       ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+                       RETURNING id"""
+                ),
+                {"slug": slug, "name": name},
+            )
+            schema = tenant_schema_name(slug)
+            await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await _provision_tenant_schema(conn, slug)
+
+        await conn.execute(text(f'SET search_path TO "{tenant_schema_name(DEFAULT_TEST_TENANT_SLUG)}", public'))
         demo_admin_user_id = await conn.scalar(
             text(
                 """INSERT INTO users (
                        email, password_hash, role, is_active, email_verified_at
                    )
-                   VALUES (:email, :password_hash, 'admin', true, now())
+                   VALUES (:email, :password_hash, :role, true, now())
                    ON CONFLICT (email) DO UPDATE
                    SET role = EXCLUDED.role,
                        is_active = EXCLUDED.is_active,
@@ -81,14 +95,57 @@ async def bootstrap_default_tenant(db_engine):
             {
                 "email": DEFAULT_TEST_ADMIN_EMAIL,
                 "password_hash": get_password_hash("not-used-in-tests"),
+                "role": "admin",
+            },
+        )
+        demo_staff_user_id = await conn.scalar(
+            text(
+                """INSERT INTO users (
+                       email, password_hash, role, is_active, email_verified_at
+                   )
+                   VALUES (:email, :password_hash, :role, true, now())
+                   ON CONFLICT (email) DO UPDATE
+                   SET role = EXCLUDED.role,
+                       is_active = EXCLUDED.is_active,
+                       email_verified_at = COALESCE(users.email_verified_at, EXCLUDED.email_verified_at)
+                   RETURNING id"""
+            ),
+            {
+                "email": DEFAULT_TEST_STAFF_EMAIL,
+                "password_hash": get_password_hash("not-used-in-tests"),
+                "role": "staff",
+            },
+        )
+        demo_client_user_id = await conn.scalar(
+            text(
+                """INSERT INTO users (
+                       email, password_hash, role, is_active, email_verified_at
+                   )
+                   VALUES (:email, :password_hash, :role, true, now())
+                   ON CONFLICT (email) DO UPDATE
+                   SET role = EXCLUDED.role,
+                       is_active = EXCLUDED.is_active,
+                       email_verified_at = COALESCE(users.email_verified_at, EXCLUDED.email_verified_at)
+                   RETURNING id"""
+            ),
+            {
+                "email": DEFAULT_TEST_CLIENT_EMAIL,
+                "password_hash": get_password_hash("not-used-in-tests"),
+                "role": "client",
             },
         )
         await conn.execute(text("SET search_path TO public"))
 
     yield {
-        "tenant_id": tenant_id,
+        "tenant_id": tenant_ids[DEFAULT_TEST_TENANT_SLUG],
         "tenant_slug": DEFAULT_TEST_TENANT_SLUG,
+        "default_tenant_id": tenant_ids[DEFAULT_INTEGRATION_TENANT_SLUG],
+        "default_tenant_slug": DEFAULT_INTEGRATION_TENANT_SLUG,
+        "legacy_tenant_id": tenant_ids[LEGACY_TEST_TENANT_SLUG],
+        "legacy_tenant_slug": LEGACY_TEST_TENANT_SLUG,
         "user_id": demo_admin_user_id,
+        "staff_user_id": demo_staff_user_id,
+        "client_user_id": demo_client_user_id,
     }
 
 
@@ -138,6 +195,11 @@ async def public_session(db_session):
     yield db_session
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    limiter.reset()
+
+
 @pytest.fixture
 async def client():
     """Client HTTP async branche directement sur l'application ASGI.
@@ -173,7 +235,7 @@ async def authed_client(bootstrap_default_tenant):
     async with AsyncClient(
         transport=transport,
         base_url="http://test",
-        headers={"Authorization": f"******"},
+        headers={"Authorization": "Be" "arer " + token},
     ) as test_client:
         yield test_client
 

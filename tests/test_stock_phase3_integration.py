@@ -17,6 +17,7 @@ async def integration_db_session():
     try:
         async with engine.connect() as conn:
             await conn.begin()
+            await conn.execute(sa.text('SET search_path TO "tenant_default", public'))
             session = AsyncSession(
                 bind=conn,
                 expire_on_commit=False,
