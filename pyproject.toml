@@ -32,7 +32,8 @@ dependencies = [
     "openpyxl>=3.1",
     "weasyprint>=62.0",
     "jinja2>=3.1",
-    "cryptography>=42",
+    "cryptography>=50.0.0",
+    "h2>=4.4.1",
 ]
 
 [project.optional-dependencies]
