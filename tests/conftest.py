@@ -235,7 +235,7 @@ async def authed_client(bootstrap_default_tenant):
     async with AsyncClient(
         transport=transport,
         base_url="http://test",
-        headers={"Authorization": "Be" "arer " + token},
+        headers={"Authorization": "Bearer " + token},
     ) as test_client:
         yield test_client
 

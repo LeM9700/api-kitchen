@@ -26,8 +26,8 @@ from app.core.database import tenant_schema_name
 from app.modules.auth.service import _provision_tenant_schema
 
 NEW_TENANT_SLUG = "ddlparitytest"
-BOOTSTRAP_TEST_SCHEMA = "tenant_pizza_test"
-BOOTSTRAP_DEFAULT_SCHEMA = "tenant_test"
+BOOTSTRAP_LEGACY_SCHEMA = "tenant_pizza_test"
+BOOTSTRAP_TEST_SCHEMA = "tenant_test"
 BOOTSTRAP_INTEGRATION_SCHEMA = "tenant_default"
 
 # Tables intentionnellement absentes du provisioning neuf : legacy en cours de
@@ -110,8 +110,8 @@ async def test_new_tenant_schema_matches_fully_migrated_tenant(db_engine):
                     "ORDER BY nspname LIMIT 1"
                 ),
                 {
-                    "bootstrap_schema": BOOTSTRAP_TEST_SCHEMA,
-                    "default_schema": BOOTSTRAP_DEFAULT_SCHEMA,
+                    "bootstrap_schema": BOOTSTRAP_LEGACY_SCHEMA,
+                    "default_schema": BOOTSTRAP_TEST_SCHEMA,
                     "integration_schema": BOOTSTRAP_INTEGRATION_SCHEMA,
                 },
             )
