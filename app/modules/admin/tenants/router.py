@@ -18,8 +18,9 @@ from math import ceil
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
-from app.core.database import get_tenant_session
+from app.core.database import get_public_session, get_tenant_session
 from app.core.http.deps import get_arq_pool, get_client_ip, require_permission, require_role
+from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse
 from app.core.services.cache import get_cached_json, set_cached_json
@@ -74,7 +75,20 @@ async def get_tenant_branding(
 
     Returns:
         TenantBrandingResponse (5 champs branding, tous nullable).
+
+    Raises:
+        AppError: TENANT_NOT_FOUND (404) si le slug est inconnu.
     """
+    from sqlalchemy import text
+
+    async with get_public_session() as pub:
+        result = await pub.execute(
+            text("SELECT id FROM public.tenants WHERE slug = :slug"),
+            {"slug": tenant_slug},
+        )
+        if result.scalar_one_or_none() is None:
+            raise AppError("TENANT_NOT_FOUND", "Tenant not found", 404, "tenant_slug")
+
     async with get_tenant_session(tenant_slug) as session:
         return await tenant_service.get_branding(session)
 
