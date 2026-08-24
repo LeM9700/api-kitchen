@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Rapport HACCP — {{ restaurant_name }}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 20mm 15mm 20mm 15mm;
+    @top-center {
+      content: "HACCP — {{ restaurant_name }}";
+      font-size: 9pt;
+      color: #888;
+    }
+    @bottom-right {
+      content: "Page " counter(page) " / " counter(pages);
+      font-size: 9pt;
+      color: #888;
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 10pt;
+    color: #1a1a1a;
+    line-height: 1.4;
+  }
+
+  /* ── En-tête ─────────────────────────────────────────────── */
+  .header {
+    border-bottom: 3px solid #1a73e8;
+    padding-bottom: 10px;
+    margin-bottom: 16px;
+  }
+  .header h1 {
+    font-size: 18pt;
+    color: #1a73e8;
+    font-weight: 700;
+  }
+  .header .meta {
+    font-size: 9pt;
+    color: #555;
+    margin-top: 4px;
+  }
+  .header .period {
+    font-size: 11pt;
+    font-weight: 600;
+    color: #333;
+    margin-top: 2px;
+  }
+
+  /* ── Sections ────────────────────────────────────────────── */
+  .section {
+    margin-bottom: 20px;
+    page-break-inside: avoid;
+  }
+  .section-title {
+    font-size: 12pt;
+    font-weight: 700;
+    color: #1a73e8;
+    border-left: 4px solid #1a73e8;
+    padding-left: 8px;
+    margin-bottom: 8px;
+  }
+  .section-empty {
+    font-size: 9pt;
+    color: #888;
+    font-style: italic;
+    padding: 6px 0;
+  }
+
+  /* ── Tableaux ────────────────────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 9pt;
+    margin-bottom: 8px;
+  }
+  thead th {
+    background: #1a73e8;
+    color: #fff;
+    padding: 5px 7px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 8.5pt;
+  }
+  tbody tr:nth-child(even) { background: #f4f8ff; }
+  tbody td {
+    padding: 4px 7px;
+    border-bottom: 1px solid #e0e0e0;
+    vertical-align: top;
+  }
+
+  /* ── Badges conformité ───────────────────────────────────── */
+  .ok    { color: #1e8e3e; font-weight: 700; }
+  .nc    { color: #d93025; font-weight: 700; }
+  .warn  { color: #f29900; font-weight: 700; }
+
+  /* ── Résumé sessions ─────────────────────────────────────── */
+  .session-box {
+    display: inline-block;
+    width: 48%;
+    border: 1px solid #c5d5f0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    vertical-align: top;
+    margin-bottom: 8px;
+  }
+  .session-box + .session-box { margin-left: 2%; }
+  .session-box .label {
+    font-size: 9pt;
+    color: #555;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .session-box .value {
+    font-size: 11pt;
+    font-weight: 700;
+    margin-top: 2px;
+  }
+
+  /* ── NC ──────────────────────────────────────────────────── */
+  .nc-row td:first-child { color: #d93025; }
+
+  /* ── Pied de page légal ──────────────────────────────────── */
+  .legal-footer {
+    margin-top: 30px;
+    padding-top: 10px;
+    border-top: 1px solid #e0e0e0;
+    font-size: 8pt;
+    color: #888;
+  }
+</style>
+</head>
+<body>
+
+<!-- EN-TÊTE -->
+<div class="header">
+  <h1>📋 Rapport HACCP — PMS Digital</h1>
+  <div class="period">{{ from_date }} → {{ to_date }}</div>
+  <div class="meta">
+    Établissement : <strong>{{ restaurant_name }}</strong> &nbsp;|&nbsp;
+    Généré le {{ generated_at }} &nbsp;|&nbsp;
+    {{ total_days }} jour(s) couverts
+  </div>
+</div>
+
+<!-- 1. RÉSUMÉ SESSIONS -->
+<div class="section">
+  <div class="section-title">1. Sessions de contrôle (ouverture / fermeture)</div>
+  {% if sessions %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Type</th>
+        <th>Statut</th>
+        <th>Complété par</th>
+        <th>Heure</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td>{{ s.date }}</td>
+        <td>{{ "Ouverture" if s.session_type == "opening" else "Fermeture" }}</td>
+        <td>
+          {% if s.status == "complete" %}<span class="ok">✓ Validé</span>
+          {% elif s.status == "incomplete_validated" %}<span class="warn">⚠ Validé avec réserves</span>
+          {% elif s.status == "in_progress" %}<span class="warn">En cours</span>
+          {% else %}<span class="nc">Non démarré</span>{% endif %}
+        </td>
+        <td>{{ s.completed_by or "—" }}</td>
+        <td>{{ s.completed_at or "—" }}</td>
+        <td>{{ s.notes or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucune session enregistrée sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 2. RELEVÉS DE TEMPÉRATURE -->
+<div class="section">
+  <div class="section-title">2. Relevés de température</div>
+  {% if temperature_logs %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date / Heure</th>
+        <th>Session</th>
+        <th>Équipement</th>
+        <th>T° mesurée</th>
+        <th>Plage cible</th>
+        <th>Conformité</th>
+        <th>Action corrective</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in temperature_logs %}
+      <tr {% if not t.is_compliant %}class="nc-row"{% endif %}>
+        <td>{{ t.logged_at }}</td>
+        <td>{{ t.session_label }}</td>
+        <td>{{ t.equipment_name }}</td>
+        <td><strong>{{ t.measured_temp }}°C</strong></td>
+        <td>{{ t.target_range }}</td>
+        <td>{% if t.is_compliant %}<span class="ok">✓</span>{% else %}<span class="nc">✗ NC</span>{% endif %}</td>
+        <td>{{ t.corrective_action or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucun relevé de température sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 3. VÉRIFICATIONS DLC -->
+<div class="section">
+  <div class="section-title">3. Vérifications DLC</div>
+  {% if dlc_checks %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date / Heure</th>
+        <th>Ingrédient</th>
+        <th>Niveau DLC</th>
+        <th>Date DLC</th>
+        <th>Conformité</th>
+        <th>Action corrective</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in dlc_checks %}
+      <tr {% if not d.is_compliant %}class="nc-row"{% endif %}>
+        <td>{{ d.logged_at }}</td>
+        <td>{{ d.ingredient_name }}</td>
+        <td>{{ d.level_label }}</td>
+        <td>{{ d.dlc_date }}</td>
+        <td>{% if d.is_compliant %}<span class="ok">✓</span>{% else %}<span class="nc">✗ NC</span>{% endif %}</td>
+        <td>{{ d.corrective_action or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucune vérification DLC sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 4. NETTOYAGE / DÉSINFECTION -->
+<div class="section">
+  <div class="section-title">4. Plan de nettoyage / désinfection</div>
+  {% if cleaning_logs %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date / Heure</th>
+        <th>Session</th>
+        <th>Tâche</th>
+        <th>Zone</th>
+        <th>Conformité</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in cleaning_logs %}
+      <tr {% if not c.is_compliant %}class="nc-row"{% endif %}>
+        <td>{{ c.completed_at }}</td>
+        <td>{{ c.session_label }}</td>
+        <td>{{ c.task_name }}</td>
+        <td>{{ c.zone }}</td>
+        <td>{% if c.is_compliant %}<span class="ok">✓</span>{% else %}<span class="nc">✗ NC</span>{% endif %}</td>
+        <td>{{ c.notes or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucune tâche de nettoyage enregistrée sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 5. NON-CONFORMITÉS -->
+<div class="section">
+  <div class="section-title">5. Non-conformités et actions correctives</div>
+  {% if non_conformities %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Source</th>
+        <th>Description</th>
+        <th>Statut</th>
+        <th>Action corrective</th>
+        <th>Clôturée le</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for nc in non_conformities %}
+      <tr {% if nc.status == "open" %}class="nc-row"{% endif %}>
+        <td>{{ nc.created_at }}</td>
+        <td>{{ nc.source_label }}</td>
+        <td>{{ nc.description }}</td>
+        <td>
+          {% if nc.status == "closed" %}<span class="ok">Clôturée</span>
+          {% elif nc.status == "in_progress" %}<span class="warn">En cours</span>
+          {% else %}<span class="nc">Ouverte</span>{% endif %}
+        </td>
+        <td>{{ nc.corrective_action or "—" }}</td>
+        <td>{{ nc.validated_at or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucune non-conformité sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 6. CONTRÔLES RÉCEPTION -->
+<div class="section">
+  <div class="section-title">6. Contrôles à la réception</div>
+  {% if reception_controls %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date livraison</th>
+        <th>Fournisseur</th>
+        <th>T° réception</th>
+        <th>Emballage</th>
+        <th>Étiquetage</th>
+        <th>DLC</th>
+        <th>Accepté</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in reception_controls %}
+      <tr {% if not r.is_accepted %}class="nc-row"{% endif %}>
+        <td>{{ r.delivery_date }}</td>
+        <td>{{ r.supplier_name }}</td>
+        <td>{{ r.temperature_on_arrival ~ "°C" if r.temperature_on_arrival else "—" }}</td>
+        <td>{% if r.packaging_ok %}<span class="ok">✓</span>{% else %}<span class="nc">✗</span>{% endif %}</td>
+        <td>{% if r.labeling_ok %}<span class="ok">✓</span>{% else %}<span class="nc">✗</span>{% endif %}</td>
+        <td>{% if r.dlc_ok %}<span class="ok">✓</span>{% else %}<span class="nc">✗</span>{% endif %}</td>
+        <td>{% if r.is_accepted %}<span class="ok">✓</span>{% else %}<span class="nc">✗ Refusé{% if r.refusal_reason %} — {{ r.refusal_reason }}{% endif %}</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucun contrôle de réception sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 7. REFROIDISSEMENT RAPIDE -->
+<div class="section">
+  <div class="section-title">7. Refroidissement rapide (objectif ≤ 10°C en 2h)</div>
+  {% if cooling_logs %}
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Produit</th>
+        <th>T° initiale</th>
+        <th>T° finale</th>
+        <th>Durée (min)</th>
+        <th>Conformité</th>
+        <th>Action corrective</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for cl in cooling_logs %}
+      <tr {% if not cl.is_compliant %}class="nc-row"{% endif %}>
+        <td>{{ cl.started_at }}</td>
+        <td>{{ cl.product_name }}</td>
+        <td>{{ cl.temp_start }}°C</td>
+        <td>{{ cl.temp_final ~ "°C" if cl.temp_final else "En cours" }}</td>
+        <td>{{ cl.duration_minutes or "—" }}</td>
+        <td>{% if cl.temp_final is none %}<span class="warn">En cours</span>
+            {% elif cl.is_compliant %}<span class="ok">✓</span>
+            {% else %}<span class="nc">✗ NC</span>{% endif %}</td>
+        <td>{{ cl.corrective_action or "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucun suivi de refroidissement sur cette période.</p>
+  {% endif %}
+</div>
+
+<!-- 8. FORMATIONS -->
+<div class="section">
+  <div class="section-title">8. Registre de formation hygiène</div>
+  {% if training_records %}
+  <table>
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Date formation</th>
+        <th>Date expiration</th>
+        <th>Formateur</th>
+        <th>Réf. certificat</th>
+        <th>Statut</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for tr in training_records %}
+      <tr>
+        <td>{{ tr.training_type_label }}</td>
+        <td>{{ tr.training_date }}</td>
+        <td>{{ tr.expiry_date or "—" }}</td>
+        <td>{{ tr.provider or "—" }}</td>
+        <td>{{ tr.certificate_ref or "—" }}</td>
+        <td>
+          {% if tr.is_expired %}<span class="nc">Expirée</span>
+          {% elif tr.expires_soon %}<span class="warn">Expire bientôt</span>
+          {% else %}<span class="ok">Valide</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="section-empty">Aucune formation enregistrée.</p>
+  {% endif %}
+</div>
+
+<!-- PIED DE PAGE LÉGAL -->
+<div class="legal-footer">
+  Ce document constitue le registre numérique HACCP au titre du Règlement CE 852/2004
+  (hygiène des denrées alimentaires) et de l'arrêté du 12 février 2024 relatif à la
+  formation en hygiène alimentaire. À conserver 5 ans. Présentable lors d'une inspection DDPP/DGAL.
+  <br>Généré automatiquement par API Kitchen — {{ generated_at }}.
+</div>
+
+</body>
+</html>

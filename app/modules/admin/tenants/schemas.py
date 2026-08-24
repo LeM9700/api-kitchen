@@ -24,6 +24,7 @@ class TenantConfigUpdate(BaseModel):
     overhead_per_order_minutes: int | None = Field(None, ge=0, le=60)
     timezone: str | None = None
     large_stock_adjustment_threshold: float | None = Field(None, ge=0)
+    haccp_frying_oil_enabled: bool | None = None
 
     @field_validator("temporary_closure_message", "default_closure_message", mode="before")
     @classmethod
@@ -62,6 +63,7 @@ class TenantConfigResponse(BaseModel):
     large_stock_adjustment_threshold: float
     print_enabled: bool = False
     print_config: dict | None = None
+    haccp_frying_oil_enabled: bool = False
     updated_at: datetime
     scheduled_close_at: datetime | None
 

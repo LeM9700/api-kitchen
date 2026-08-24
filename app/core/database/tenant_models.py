@@ -23,3 +23,4 @@ from app.modules.orders import models as orders_models  # noqa: F401
 from app.modules.payments import models as payments_models  # noqa: F401
 from app.modules.promotions import models as promotions_models  # noqa: F401
 from app.modules.stock import models as stock_models  # noqa: F401
+from app.modules.haccp import models as haccp_models  # noqa: F401

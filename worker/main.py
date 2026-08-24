@@ -5,6 +5,7 @@ from arq.connections import RedisSettings
 
 from app.core.config import settings
 from worker.tasks.catalog_sync import sync_catalog_from_hub, sync_stale_catalog_connections
+from worker.tasks.haccp_alerts import check_haccp_cooling_alerts, check_haccp_nc_alerts
 from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
 from worker.tasks.scheduled_closures import process_scheduled_closures
@@ -47,6 +48,13 @@ class WorkerSettings:
         cron(aggregate_stock_snapshot, hour=set(range(24)), minute={0}),
         cron(check_weekly_overtime, hour=2, minute=0),
         cron(check_labor_cost_risk, hour=3, minute=0),
+        # HACCP : alerte refroidissement toutes les 15 min (seuil légal 2h).
+        cron(
+            check_haccp_cooling_alerts,
+            minute={0, 15, 30, 45},
+        ),
+        # HACCP : alerte NC en retard — 8h00 quotidien (début de service).
+        cron(check_haccp_nc_alerts, hour=8, minute=0),
         cron(
             process_scheduled_closures,
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},

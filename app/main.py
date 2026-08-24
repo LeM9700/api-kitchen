@@ -284,6 +284,9 @@ def create_app() -> FastAPI:
     from app.modules.admin.tenants.router import router as tenant_router
     from app.modules.customer.router import router as customer_router
     from app.modules.super_admin.router import router as super_admin_router
+    from app.modules.haccp.router import router as haccp_router
+    from app.modules.haccp.export_router import router as haccp_export_router
+    from app.modules.haccp.stats_router import router as haccp_stats_router
 
     prefix = "/api/v1"
     app.include_router(auth_router, prefix=prefix + "/auth", tags=["auth"])
@@ -296,6 +299,9 @@ def create_app() -> FastAPI:
     app.include_router(pos_router, prefix=prefix + "/pos/connect", tags=["pos-connect"])
     app.include_router(pos_webhook_router, prefix=prefix + "/pos", tags=["pos-webhook"])
     app.include_router(stock_router, prefix=prefix + "/stock", tags=["stock"])
+    app.include_router(haccp_router, prefix=prefix + "/haccp", tags=["haccp"])
+    app.include_router(haccp_export_router, prefix=prefix + "/haccp", tags=["haccp-export"])
+    app.include_router(haccp_stats_router, prefix=prefix + "/haccp", tags=["haccp-stats"])
     app.include_router(loyalty_router, prefix=prefix + "/loyalty")
     app.include_router(promotions_router, prefix=prefix + "/promotions", tags=["promotions"])
     app.include_router(delivery_router, prefix=prefix + "/delivery", tags=["delivery"])
