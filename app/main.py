@@ -267,6 +267,7 @@ def create_app() -> FastAPI:
     from app.modules.catalog.allergen.allergen_router import router as allergen_router
     from app.modules.catalog.image.image_router import router as image_router
     from app.modules.catalog.router import router as catalog_router
+    from app.modules.favorites.router import router as favorites_router
     from app.modules.notifications.router import router as notifications_router
     from app.modules.notifications.ws_router import router as notifications_ws_router
     from app.modules.orders.router import router as orders_router
@@ -312,6 +313,7 @@ def create_app() -> FastAPI:
     app.include_router(notifications_router, prefix=prefix + "/notifications", tags=["notifications"])
     app.include_router(notifications_ws_router, prefix=prefix, tags=["notifications-ws"])
     app.include_router(customer_router, prefix=prefix + "/customer", tags=["customer"])
+    app.include_router(favorites_router, prefix=prefix + "/favorites", tags=["favorites"])
     app.include_router(super_admin_router, prefix=prefix + "/super-admin", tags=["super-admin"])
 
     # ---------------------------------------------------------------------------

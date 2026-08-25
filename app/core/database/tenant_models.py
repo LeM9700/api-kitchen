@@ -14,6 +14,7 @@ from app.modules.catalog.allergen import allergen_models as catalog_allergen_mod
 from app.modules.catalog.image import image_model as catalog_image_model  # noqa: F401
 from app.modules.catalog import models as catalog_models  # noqa: F401
 from app.modules.delivery import models as delivery_models  # noqa: F401
+from app.modules.favorites import models as favorites_models  # noqa: F401
 from app.modules.hr import models as hr_models  # noqa: F401
 from app.modules.kds import models as kds_models  # noqa: F401
 from app.modules.loyalty.account import models as loyalty_account_models  # noqa: F401
