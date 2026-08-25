@@ -79,6 +79,14 @@ async def get_current_user(
         from app.core.tenancy.tenant import user_belongs_to_tenant
         if not await user_belongs_to_tenant(int(user_id_str), tenant_slug, payload.get("email")):
             raise AppError("UNAUTHORIZED", "Invalid token", 401)
+    # [SECURITE] Meme controle pour le flux super-admin independant (pas de
+    # tenant_slug -- voir app.modules.super_admin.router.super_admin_login) :
+    # revalide que le sub correspond a un compte reel et actif de
+    # public.super_admins, plutot que de faire confiance au seul claim role.
+    elif user_id_str and payload.get("role") == "super-admin":
+        from app.core.auth.super_admin import super_admin_exists
+        if not await super_admin_exists(int(user_id_str), payload.get("email")):
+            raise AppError("UNAUTHORIZED", "Invalid token", 401)
 
     raw_user_id = payload.get("sub")
     user = {

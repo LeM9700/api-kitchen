@@ -439,10 +439,18 @@ async def test_status_super_admin_can_query_other_tenant(client, unique_slug):
         "charges_enabled": True,
         "onboarding_complete": True,
     }
-    with patch(
-        "app.modules.payments.connect_router.connect_service.get_connect_status",
-        new=AsyncMock(return_value=fake_status),
-    ) as get_status:
+    with (
+        patch(
+            "app.modules.payments.connect_router.connect_service.get_connect_status",
+            new=AsyncMock(return_value=fake_status),
+        ) as get_status,
+        # Identite super-admin verifiee separement (voir tests/test_super_admin_auth.py) --
+        # ce test porte sur la frontiere d'autorisation Connect, pas sur cette verification.
+        patch(
+            "app.core.auth.super_admin.super_admin_exists",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
         resp = await client.get(
             "/api/v1/payments/connect/status",
             params={"tenant_slug": slug},
