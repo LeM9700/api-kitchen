@@ -86,20 +86,29 @@ class Settings(BaseSettings):
     fcm_project_id: str | None = None
     fcm_service_account_json: str | None = None
 
-    # Hub POS OAuth 2.0 — generique/configurable, aucun fournisseur reel choisi
-    # pour l'instant. Chaine vide = feature desactivee (comme smtp_host,
-    # stripe_webhook_connect_secret).
-    pos_hub_provider_name: str = "generic_hub"
+    # Resend — provider email transactionnel.
+    # Vide = envoi désactivé (graceful degradation).
+    resend_api_key: str = ""
+    resend_from_email: str = "Super Admin <noreply@pizza-platform.com>"
+    # URL publique du super-admin (utilisée dans les liens d'email).
+    super_admin_base_url: str = "http://localhost:3001"
+
+    # Hub POS OAuth 2.0 — HubRise (https://www.hubrise.com/developers). Chaine
+    # vide sur client_id = feature desactivee (comme smtp_host,
+    # stripe_webhook_connect_secret) ; URLs/champs ci-dessous ont leurs
+    # valeurs HubRise par defaut mais restent overridables (multi-fournisseur).
+    pos_hub_provider_name: str = "hubrise"
     pos_hub_client_id: str = ""
     pos_hub_client_secret: str = ""
-    pos_hub_authorize_url: str = ""
-    pos_hub_token_url: str = ""
+    pos_hub_authorize_url: str = "https://manager.hubrise.com/oauth2/v1/authorize"
+    pos_hub_token_url: str = "https://manager.hubrise.com/oauth2/v1/token"
     pos_hub_revoke_url: str = ""
+    pos_hub_api_base_url: str = "https://api.hubrise.com/v1"
     pos_hub_redirect_uri: str = ""
     pos_hub_default_scopes: str = ""
     # Nom de la cle dans la reponse JSON du token endpoint qui porte
-    # l'identifiant d'etablissement cote POS. A confirmer avec le vrai fournisseur.
-    pos_hub_establishment_id_field: str = "establishment_id"
+    # l'identifiant d'etablissement cote POS (HubRise : "location_id").
+    pos_hub_establishment_id_field: str = "location_id"
     # Cle Fernet pour chiffrer les tokens OAuth au repos (app.core.services.crypto).
     pos_token_encryption_key: str = ""
     # Page frontend vers laquelle /pos/connect/callback redirige toujours
@@ -108,12 +117,9 @@ class Settings(BaseSettings):
 
     # Hub POS — recuperation catalogue (synchro en cache local). Chaine vide =
     # feature desactivee, meme pattern que pos_hub_client_id ci-dessus.
-    # [HYPOTHESE NON CONFIRMEE] URL et format de reponse a confirmer avec le
-    # vrai fournisseur — voir app/modules/catalog/hub_client.py.
+    # HubRise : GET https://api.hubrise.com/v1/catalogs/:id -- voir
+    # app/modules/catalog/hub_client.py.
     pos_hub_catalog_url: str = ""
-    # [HYPOTHESE NON CONFIRMEE] Format de signature a confirmer — voir
-    # app/modules/pos/webhook_service.py.
-    pos_hub_webhook_secret: str = ""
     pos_hub_catalog_rate_limit_per_minute: int = 10
     pos_hub_snapshot_staleness_minutes: int = 60
     # Au-dela de ce seuil (mesure depuis catalog_snapshots.synced_at), un

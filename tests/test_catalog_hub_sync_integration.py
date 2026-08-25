@@ -5,7 +5,7 @@
     ProductSummaryOut.
 
 Every other test in this plan mocks the adjacent layer only: webhook tests
-(tests/test_pos_catalog_webhook.py) mock resolve_connection_id/redis and never touch
+(tests/test_pos_catalog_webhook.py) mock is_connection_active/redis and never touch
 the worker task; provider tests (tests/test_hub_catalog_provider.py) seed
 catalog_snapshots directly via snapshot_repository, never going through the sync
 task; worker task tests (tests/test_worker_catalog_sync.py) mock the HTTP client and
@@ -68,11 +68,18 @@ async def test_hub_sync_chain_connects_worker_snapshot_and_provider(db_session, 
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
 
     fake_hub_payload = {
-        "products": [
-            {"id": "ext-1", "name": "Regina", "price": 11.5, "tax_rate": 0.1, "is_active": True},
-            {"id": "ext-2", "name": "Margherita", "price": 8.9, "tax_rate": 0.055, "is_active": True},
-            {"id": "ext-3", "name": "Discontinued Special", "price": 99.0, "tax_rate": 0.2, "is_active": False},
-        ]
+        "data": {
+            "products": [
+                {"id": "ext-1", "name": "Regina", "skus": [{"price": 11.5}], "tax_rate": 0.1},
+                {"id": "ext-2", "name": "Margherita", "skus": [{"price": 8.9}], "tax_rate": 0.055},
+                {
+                    "id": "ext-3",
+                    "name": "Discontinued Special",
+                    "skus": [{"price": 99.0, "restrictions": {"enabled": False}}],
+                    "tax_rate": 0.2,
+                },
+            ]
+        }
     }
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
@@ -134,9 +141,11 @@ async def test_hub_synced_product_can_be_ordered_via_real_product_id(db_session,
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
 
     fake_hub_payload = {
-        "products": [
-            {"id": "ext-order-1", "name": "Quattro Stagioni", "price": 12.9, "tax_rate": 0.1, "is_active": True},
-        ]
+        "data": {
+            "products": [
+                {"id": "ext-order-1", "name": "Quattro Stagioni", "skus": [{"price": 12.9}], "tax_rate": 0.1},
+            ]
+        }
     }
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,

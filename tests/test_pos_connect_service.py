@@ -107,6 +107,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._scalar
 
+    def scalar_one(self):
+        return self._scalar
+
     def mappings(self):
         return self
 
@@ -196,8 +199,11 @@ class _FakeResponse:
 
 
 class _FakeAsyncClient:
-    def __init__(self, response):
+    last_init_kwargs: dict | None = None
+
+    def __init__(self, response, **init_kwargs):
         self._response = response
+        _FakeAsyncClient.last_init_kwargs = init_kwargs
 
     async def __aenter__(self):
         return self
@@ -210,7 +216,9 @@ class _FakeAsyncClient:
 
 
 def _patch_httpx_post(monkeypatch, response):
-    monkeypatch.setattr(service.httpx, "AsyncClient", lambda *a, **kw: _FakeAsyncClient(response))
+    monkeypatch.setattr(
+        service.httpx, "AsyncClient", lambda *a, **kw: _FakeAsyncClient(response, **kw)
+    )
 
 
 async def test_exchange_code_for_tokens_returns_parsed_data(monkeypatch):
@@ -235,6 +243,19 @@ async def test_exchange_code_for_tokens_returns_parsed_data(monkeypatch):
         "external_establishment_id": "store-9",
         "scope": "orders.read orders.write",
     }
+
+
+async def test_exchange_code_for_tokens_uses_http_basic_auth_not_body_credentials(monkeypatch):
+    """[HubRise] client_id/client_secret vont en HTTP Basic Auth, pas dans le
+    corps du formulaire -- voir https://www.hubrise.com/developers/api/authentication."""
+    _patch_httpx_post(
+        monkeypatch,
+        _FakeResponse(200, {"access_token": "tok", "establishment_id": "store-9"}),
+    )
+
+    await service.exchange_code_for_tokens("auth-code")
+
+    assert _FakeAsyncClient.last_init_kwargs["auth"] == ("client-123", "secret-abc")
 
 
 async def test_exchange_code_for_tokens_raises_on_http_error(monkeypatch):
@@ -281,7 +302,11 @@ async def test_get_active_connection_returns_none_when_absent(monkeypatch):
 
 
 async def test_save_connection_encrypts_tokens_and_extracts_establishment_id(monkeypatch):
-    session = _patch_session(monkeypatch, [_Result(scalar=42), _Result(), _Result()])
+    session = _patch_session(
+        monkeypatch, [_Result(scalar=42), _Result(scalar=99), _Result()]
+    )
+    register_callback = AsyncMock()
+    monkeypatch.setattr(service, "register_hub_callback", register_callback)
     token_data = {
         "access_token": "plain-access",
         "refresh_token": "plain-refresh",
@@ -294,6 +319,7 @@ async def test_save_connection_encrypts_tokens_and_extracts_establishment_id(mon
 
     insert_stmt, insert_params = session.executed[1]
     assert "INSERT INTO public.pos_connections" in insert_stmt
+    assert "RETURNING id" in insert_stmt
     assert insert_params["tenant_id"] == 42
     assert insert_params["provider"] == "generic_hub"
     assert insert_params["external_establishment_id"] == "store-1"
@@ -306,6 +332,60 @@ async def test_save_connection_encrypts_tokens_and_extracts_establishment_id(mon
     assert "UPDATE public.tenants" in update_stmt
     assert "integration_mode = 'connected'" in update_stmt
     assert update_params["slug"] == "acme"
+
+    # Le callback HubRise est enregistre avec l'id de connexion fraichement
+    # cree et le token EN CLAIR (pas la version chiffree stockee en base).
+    register_callback.assert_called_once_with(99, "plain-access")
+
+
+# ---------------------------------------------------------------------------
+# register_hub_callback
+# ---------------------------------------------------------------------------
+
+
+async def test_register_hub_callback_posts_connection_scoped_url_with_access_token(monkeypatch):
+    monkeypatch.setattr(settings, "app_base_url", "https://api.example.com")
+    monkeypatch.setattr(settings, "pos_hub_api_base_url", "https://api.hubrise.com/v1")
+    fake_response = _FakeResponse(200, {})
+    captured: dict = {}
+
+    class _CapturingClient(_FakeAsyncClient):
+        async def post(self, url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return fake_response
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", lambda *a, **kw: _CapturingClient(fake_response))
+
+    await service.register_hub_callback(99, "plain-access")
+
+    assert captured["url"] == "https://api.hubrise.com/v1/callback"
+    assert captured["json"] == {
+        "url": "https://api.example.com/api/v1/pos/catalog-webhook/99",
+        "events": {"catalog": "update"},
+    }
+    assert captured["headers"]["X-Access-Token"] == "plain-access"
+
+
+async def test_register_hub_callback_is_best_effort_on_failure(monkeypatch):
+    """Un echec d'enregistrement du callback ne doit jamais faire planter
+    l'activation de la connexion -- sync_stale_catalog_connections reste un
+    filet de securite meme sans callback actif."""
+
+    class _RaisingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectTimeout("boom")
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", lambda *a, **kw: _RaisingClient())
+
+    await service.register_hub_callback(99, "plain-access")  # ne doit pas lever
 
 
 async def test_save_connection_raises_when_tenant_not_found(monkeypatch):

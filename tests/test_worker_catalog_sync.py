@@ -60,7 +60,9 @@ async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
-        AsyncMock(return_value={"products": [{"id": "ext-1", "name": "Regina", "price": 11.5}]}),
+        AsyncMock(
+            return_value={"data": {"products": [{"id": "ext-1", "name": "Regina", "skus": [{"price": 11.5}]}]}}
+        ),
     )
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90001)
@@ -201,7 +203,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
 
     secret_marker = "not-a-list-and-also-not-secret-but-must-not-leak"
-    malformed_payload = {"products": secret_marker}
+    malformed_payload = {"data": {"products": secret_marker}}
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
@@ -227,7 +229,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
 
 
 async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db_session, monkeypatch):
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timezone
 
     import sqlalchemy as sa
 
@@ -435,7 +437,7 @@ async def test_sync_catalog_from_hub_rejects_empty_catalog_overwriting_existing_
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
-        AsyncMock(return_value={"products": []}),
+        AsyncMock(return_value={"data": {"products": []}}),
     )
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90008)
@@ -469,7 +471,7 @@ async def test_sync_catalog_from_hub_allows_empty_catalog_on_first_sync(db_sessi
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
-        AsyncMock(return_value={"products": []}),
+        AsyncMock(return_value={"data": {"products": []}}),
     )
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90009)
@@ -514,9 +516,11 @@ async def test_sync_catalog_from_hub_inserts_new_product(db_session, monkeypatch
         "fetch_catalog",
         AsyncMock(
             return_value={
-                "products": [
-                    {"id": "ext-new-1", "name": "Regina", "price": 11.5, "tax_rate": 0.1, "is_active": True}
-                ]
+                "data": {
+                    "products": [
+                        {"id": "ext-new-1", "name": "Regina", "skus": [{"price": 11.5}], "tax_rate": 0.1}
+                    ]
+                }
             }
         ),
     )
@@ -559,7 +563,13 @@ async def test_sync_catalog_from_hub_updates_existing_product(db_session, monkey
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
         AsyncMock(
-            return_value={"products": [{"id": "ext-upd-1", "name": "New Name", "price": 13.0, "tax_rate": 0.2}]}
+            return_value={
+                "data": {
+                    "products": [
+                        {"id": "ext-upd-1", "name": "New Name", "skus": [{"price": 13.0}], "tax_rate": 0.2}
+                    ]
+                }
+            }
         ),
     )
 
@@ -598,7 +608,11 @@ async def test_sync_catalog_from_hub_deactivates_product_removed_from_hub(db_ses
     monkeypatch.setattr(
         catalog_sync.HttpHubCatalogClient,
         "fetch_catalog",
-        AsyncMock(return_value={"products": [{"id": "ext-still-here", "name": "Still Here", "price": 5.0}]}),
+        AsyncMock(
+            return_value={
+                "data": {"products": [{"id": "ext-still-here", "name": "Still Here", "skus": [{"price": 5.0}]}]}
+            }
+        ),
     )
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90203)
@@ -640,7 +654,7 @@ async def test_sync_catalog_from_hub_empty_catalog_does_not_deactivate_existing_
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
     monkeypatch.setattr(catalog_sync, "check_rate_limit", AsyncMock(return_value=True))
     monkeypatch.setattr(
-        catalog_sync.HttpHubCatalogClient, "fetch_catalog", AsyncMock(return_value={"products": []})
+        catalog_sync.HttpHubCatalogClient, "fetch_catalog", AsyncMock(return_value={"data": {"products": []}})
     )
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90204)
@@ -674,10 +688,12 @@ async def test_sync_catalog_from_hub_duplicate_external_id_in_same_batch_does_no
         "fetch_catalog",
         AsyncMock(
             return_value={
-                "products": [
-                    {"id": "ext-dup-1", "name": "Regina", "price": 11.0},
-                    {"id": "ext-dup-1", "name": "Regina (updated)", "price": 12.0},
-                ]
+                "data": {
+                    "products": [
+                        {"id": "ext-dup-1", "name": "Regina", "skus": [{"price": 11.0}]},
+                        {"id": "ext-dup-1", "name": "Regina (updated)", "skus": [{"price": 12.0}]},
+                    ]
+                }
             }
         ),
     )

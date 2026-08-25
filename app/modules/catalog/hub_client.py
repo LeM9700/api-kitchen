@@ -1,9 +1,9 @@
-"""Client HTTP pour recuperer le catalogue depuis le hub POS.
+"""Client HTTP pour recuperer le catalogue depuis le hub POS (HubRise).
 
-[HYPOTHESE NON CONFIRMEE] Le format de l'appel (GET, Authorization: Bearer
-<access_token dechiffre>) est une hypothese placeholder -- a confirmer avec le
-vrai fournisseur du hub. Isole ici pour qu'un vrai contrat ne necessite de
-modifier que ce fichier.
+HubRise authentifie les appels API via un header ``X-Access-Token`` (pas
+``Authorization: Bearer``) -- voir https://www.hubrise.com/developers/api/authentication.
+Isole ici pour qu'un changement de fournisseur ne necessite de modifier
+que ce fichier.
 """
 from typing import Protocol
 
@@ -52,7 +52,7 @@ class HttpHubCatalogClient:
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 settings.pos_hub_catalog_url,
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"X-Access-Token": access_token},
                 timeout=15.0,
             )
         response.raise_for_status()

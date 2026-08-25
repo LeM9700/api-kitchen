@@ -55,7 +55,9 @@ class _FakeAsyncClient:
         return self._response
 
 
-async def test_fetch_catalog_calls_configured_url_with_bearer_token(monkeypatch):
+async def test_fetch_catalog_calls_configured_url_with_access_token_header(monkeypatch):
+    """HubRise authentifie via X-Access-Token, pas Authorization: Bearer --
+    voir https://www.hubrise.com/developers/api/authentication."""
     from app.core.config import settings
     from app.core.services import crypto
     from app.modules.catalog import hub_client
@@ -72,4 +74,5 @@ async def test_fetch_catalog_calls_configured_url_with_bearer_token(monkeypatch)
 
     assert result == {"products": []}
     assert fake_client.last_call["url"] == "https://hub.example.com/catalog"
-    assert fake_client.last_call["headers"]["Authorization"] == "Bearer plain-token"
+    assert fake_client.last_call["headers"]["X-Access-Token"] == "plain-token"
+    assert "Authorization" not in fake_client.last_call["headers"]

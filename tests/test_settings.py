@@ -57,17 +57,17 @@ def test_empty_test_database_url_is_left_untouched():
     assert s.test_database_url == ""
 
 
-def test_pos_oauth_settings_default_to_empty_and_disabled():
+def test_pos_oauth_settings_default_to_hubrise():
     s = _settings(database_url="postgresql+asyncpg://user:pass@host:5432/db")
-    assert s.pos_hub_provider_name == "generic_hub"
+    assert s.pos_hub_provider_name == "hubrise"
     assert s.pos_hub_client_id == ""
     assert s.pos_hub_client_secret == ""
-    assert s.pos_hub_authorize_url == ""
-    assert s.pos_hub_token_url == ""
+    assert s.pos_hub_authorize_url == "https://manager.hubrise.com/oauth2/v1/authorize"
+    assert s.pos_hub_token_url == "https://manager.hubrise.com/oauth2/v1/token"
     assert s.pos_hub_revoke_url == ""
     assert s.pos_hub_redirect_uri == ""
     assert s.pos_hub_default_scopes == ""
-    assert s.pos_hub_establishment_id_field == "establishment_id"
+    assert s.pos_hub_establishment_id_field == "location_id"
     assert s.pos_token_encryption_key == ""
     assert s.pos_oauth_frontend_return_url == ""
 
@@ -82,7 +82,6 @@ def test_hub_catalog_sync_settings_have_safe_defaults():
     from app.core.config import settings
 
     assert settings.pos_hub_catalog_url == ""
-    assert settings.pos_hub_webhook_secret == ""
     assert settings.pos_hub_catalog_rate_limit_per_minute == 10
     assert settings.pos_hub_snapshot_staleness_minutes == 60
 

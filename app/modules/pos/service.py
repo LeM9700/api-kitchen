@@ -122,6 +122,10 @@ def build_authorization_url(state: str) -> str:
 async def exchange_code_for_tokens(code: str) -> dict:
     """Echange un code d'autorisation contre des tokens aupres du hub POS.
 
+    [HubRise] Le client_id/client_secret sont passes en HTTP Basic Auth sur
+    POST /oauth2/v1/token, pas dans le corps du formulaire -- voir
+    https://www.hubrise.com/developers/api/authentication.
+
     Args:
         code: Code d'autorisation recu sur le callback OAuth.
 
@@ -138,11 +142,11 @@ async def exchange_code_for_tokens(code: str) -> dict:
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": settings.pos_hub_redirect_uri,
-        "client_id": settings.pos_hub_client_id,
-        "client_secret": settings.pos_hub_client_secret,
     }
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(
+            auth=(settings.pos_hub_client_id, settings.pos_hub_client_secret)
+        ) as client:
             response = await client.post(settings.pos_hub_token_url, data=payload, timeout=10.0)
         response.raise_for_status()
         data = response.json()
@@ -198,8 +202,43 @@ async def get_active_connection(tenant_slug: str) -> dict | None:
         return dict(row) if row else None
 
 
+async def register_hub_callback(connection_id: int, access_token: str) -> None:
+    """Enregistre l'URL de callback HubRise pour cette connexion.
+
+    [HubRise] Un callback est specifique a une connexion (une seule URL par
+    connexion, portee par le token utilise pour l'enregistrer) -- voir
+    https://www.hubrise.com/developers/api/callbacks. Le payload webhook ne
+    contenant aucun identifiant de location, c'est cette URL par connexion
+    (connection_id dans le chemin) qui permet a /pos/catalog-webhook/{id} de
+    savoir a quel tenant l'evenement appartient.
+
+    Best-effort : un echec est logue mais ne bloque jamais l'activation de la
+    connexion -- sync_stale_catalog_connections (cron) reste un filet de
+    securite qui resynchronise meme sans callback actif.
+
+    Args:
+        connection_id: Id de la ligne public.pos_connections fraichement creee.
+        access_token: Token OAuth en clair de cette connexion (non chiffre).
+    """
+    target_url = f"{settings.app_base_url}/api/v1/pos/catalog-webhook/{connection_id}"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.pos_hub_api_base_url}/callback",
+                json={"url": target_url, "events": {"catalog": "update"}},
+                headers={"X-Access-Token": access_token},
+                timeout=10.0,
+            )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        logger.warning(
+            "POS hub callback registration failed: connection_id=%s", connection_id, exc_info=True
+        )
+
+
 async def save_connection(tenant_slug: str, token_data: dict) -> None:
-    """Chiffre les tokens et upsert la connexion POS active pour ce tenant.
+    """Chiffre les tokens, upsert la connexion POS active pour ce tenant, et
+    enregistre le callback HubRise correspondant.
 
     Passe egalement public.tenants.integration_mode a 'connected'.
 
@@ -228,7 +267,7 @@ async def save_connection(tenant_slug: str, token_data: dict) -> None:
         if tenant_id is None:
             raise AppError("POS_OAUTH_EXCHANGE_FAILED", "Tenant introuvable.", 404)
 
-        await session.execute(
+        connection_result = await session.execute(
             text(
                 "INSERT INTO public.pos_connections "
                 "(tenant_id, provider, external_establishment_id, access_token_encrypted, "
@@ -243,7 +282,8 @@ async def save_connection(tenant_slug: str, token_data: dict) -> None:
                 " scopes = EXCLUDED.scopes, "
                 " status = 'active', "
                 " connected_at = now(), "
-                " token_expires_at = EXCLUDED.token_expires_at"
+                " token_expires_at = EXCLUDED.token_expires_at "
+                "RETURNING id"
             ),
             {
                 "tenant_id": tenant_id,
@@ -257,11 +297,14 @@ async def save_connection(tenant_slug: str, token_data: dict) -> None:
                 "token_expires_at": expires_at,
             },
         )
+        connection_id = connection_result.scalar_one()
         await session.execute(
             text("UPDATE public.tenants SET integration_mode = 'connected' WHERE slug = :slug"),
             {"slug": tenant_slug},
         )
         await session.commit()
+
+    await register_hub_callback(connection_id, token_data["access_token"])
 
 
 async def disconnect(tenant_slug: str) -> None:
