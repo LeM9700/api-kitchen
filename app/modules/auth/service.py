@@ -9,8 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app.core.config import settings
-from app.core.database import Base, engine, get_public_session, get_tenant_session, tenant_schema_name
-from app.core.database import tenant_models  # noqa: F401
+from app.core.database import get_public_session, get_tenant_session
 from app.core.http.deps import get_client_ip
 from app.core.http.errors import AppError
 from app.core.auth.security import (
@@ -22,53 +21,8 @@ from app.core.auth.security import (
     get_password_hash,
     verify_password,
 )
-from app.core.tenancy.tenant import create_tenant_schema_on
+from app.core.tenancy.provisioning import provision_tenant
 from app.modules.auth.models import RefreshToken, User
-
-
-async def _provision_tenant_schema(conn, slug: str) -> None:
-    """Cree toutes les tables applicatives dans le schema tenant depuis les
-    modeles SQLAlchemy (``Base.metadata``) — meme source de verite que les
-    migrations Alembic (voir ``app.core.database.tenant_models``) — puis
-    seed les donnees applicatives minimales (etablissement HR par defaut).
-
-    Args:
-        conn: Connexion SQLAlchemy async deja ouverte (dans une transaction).
-        slug: Slug tenant valide, utilise pour construire le nom du schema.
-    """
-    schema = tenant_schema_name(slug)
-    # Pas de fallback ", public" ici : Base.metadata.create_all(checkfirst=True)
-    # resout les noms de table non qualifies via le search_path. public contient
-    # des tables historiques homonymes (users, orders, products...) -- cf.
-    # migration 0002 -- donc un fallback public ferait croire a tort que les
-    # tables du tenant existent deja et create_all() ne les creerait jamais.
-    await conn.execute(text(f'SET search_path TO "{schema}"'))
-    await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn))
-    await conn.execute(
-        text(
-            """INSERT INTO establishments (name, timezone)
-               SELECT 'Établissement principal', 'Europe/Paris'
-               WHERE NOT EXISTS (SELECT 1 FROM establishments)"""
-        )
-    )
-    await conn.execute(
-        text(
-            """INSERT INTO establishment_hr_config (establishment_id)
-               SELECT id FROM establishments
-               WHERE id NOT IN (SELECT establishment_id FROM establishment_hr_config)"""
-        )
-    )
-    await conn.execute(text("SET search_path TO public"))
-
-
-async def _create_tenant_tables(tenant_slug: str) -> None:
-    """Wrapper transactionnel autour de _provision_tenant_schema.
-
-    Args:
-        tenant_slug: Slug tenant dont le schema doit etre provisionne.
-    """
-    async with engine.begin() as conn:
-        await _provision_tenant_schema(conn, tenant_slug)
 
 
 async def register(body, arq_pool=None) -> tuple[User, str, str, int]:
@@ -76,6 +30,14 @@ async def register(body, arq_pool=None) -> tuple[User, str, str, int]:
 
     Genere un token de verification email (UUID4, expiry 24h) et enqueue
     send_verification_email si arq_pool est fourni.
+
+    [SECURITE] Delegue TOUT le provisioning (ligne public.tenants, schema,
+    tables, donnees minimales, ce premier admin) a
+    ``provision_tenant()`` (app/core/tenancy/provisioning.py) -- une seule
+    transaction PostgreSQL. Un email deja pris par un AUTRE tenant n'a pas
+    besoin d'etre pre-verifie ici : le schema venant d'etre cree dans cette
+    meme transaction, sa table ``users`` est necessairement vide avant cet
+    insert, donc aucune collision d'email n'est possible pour CE tenant.
 
     Args:
         body: Payload RegisterRequest valide par Pydantic.
@@ -86,60 +48,26 @@ async def register(body, arq_pool=None) -> tuple[User, str, str, int]:
 
     Raises:
         AppError: TENANT_EXISTS (409) si le slug est deja pris.
+        AppError: TENANT_SCHEMA_COLLISION (409) si un schema du meme nom existe deja.
     """
-    async with get_public_session() as session:
-        existing = await session.scalar(
-            text("SELECT id FROM public.tenants WHERE slug = :slug"),
-            {"slug": body.tenant_slug},
-        )
-        if existing:
-            raise AppError("TENANT_EXISTS", "Tenant already exists", 409, "tenant_slug")
-        row = await session.execute(
-            text(
-                "INSERT INTO public.tenants (slug, name, plan) "
-                "VALUES (:slug, :name, 'starter') RETURNING id"
-            ),
-            {"slug": body.tenant_slug, "name": body.tenant_name},
-        )
-        tenant_id = row.scalar_one()
-        # [SECURITE] Cree le schema DANS LA MEME TRANSACTION que la ligne
-        # public.tenants ci-dessus, avant le commit : si le schema existe deja
-        # (collision de troncature, residu, creation concurrente),
-        # create_tenant_schema_on leve AppError et la sortie en exception de ce
-        # bloc `async with` annule (rollback implicite, pas de commit atteint)
-        # l'insertion -- aucune ligne orpheline dans public.tenants.
-        await create_tenant_schema_on(session, body.tenant_slug)
-        await session.commit()
-
-    await _create_tenant_tables(body.tenant_slug)
-    async with get_tenant_session(body.tenant_slug) as session:
-        from app.modules.catalog.allergen.allergen_service import seed_regulatory_allergens
-
-        await seed_regulatory_allergens(session)
-
     verification_token = str(uuid.uuid4())
     verification_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
 
-    async with get_tenant_session(body.tenant_slug) as session:
-        # Vérification email unique avant insert — la contrainte DB UNIQUE catcherait
-        # l'IntegrityError mais retournerait un 500 sans ce check explicite.
-        existing_user = await session.scalar(
-            select(User).where(User.email == body.email)
-        )
-        if existing_user is not None:
-            raise AppError("EMAIL_ALREADY_EXISTS", "Email already registered", 409, "email")
+    provisioned = await provision_tenant(
+        slug=body.tenant_slug,
+        name=body.tenant_name,
+        admin_fields={
+            "email": body.email,
+            "password_hash": get_password_hash(body.password),
+            "full_name": body.full_name,
+            "email_verification_token": verification_token,
+            "email_verification_expires_at": verification_expires_at,
+        },
+    )
+    tenant_id = provisioned.tenant_id
 
-        user = User(
-            email=body.email,
-            password_hash=get_password_hash(body.password),
-            full_name=body.full_name,
-            role="admin",
-            email_verification_token=verification_token,
-            email_verification_expires_at=verification_expires_at,
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
+    async with get_tenant_session(body.tenant_slug) as session:
+        user = await session.get(User, provisioned.admin_user_id)
         access, refresh, session_id = await issue_tokens(session, user, tenant_id, body.tenant_slug)
         await session.commit()
 

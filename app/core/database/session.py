@@ -69,7 +69,30 @@ async def get_public_session() -> AsyncIterator[AsyncSession]:
 
 @asynccontextmanager
 async def get_tenant_session(tenant_slug: str) -> AsyncIterator[AsyncSession]:
+    """Session dont le search_path pointe UNIQUEMENT sur le schema du tenant.
+
+    [SECURITE] Pas de fallback ``, public`` : ``public`` contient des tables
+    historiques homonymes des tables tenant (``users``, ``orders``,
+    ``products``... -- migration 0002, epoque pre-isolation-par-schema,
+    jamais purgee). Avec un fallback ``, public``, une requete non qualifiee
+    ciblant une table ABSENTE du schema tenant (schema incomplet suite a un
+    bug de provisioning, migration tenant non encore appliquee...) ne
+    leverait pas d'erreur -- elle resoudrait SILENCIEUSEMENT vers la table
+    homonyme de ``public``, potentiellement partagee entre TOUS les tenants.
+    C'est exactement le genre de defaut structurel que l'isolation par schema
+    est censee rendre impossible (voir CLAUDE.md, section "Hidden
+    constraints"). Sans fallback, la meme situation echoue explicitement
+    (``UndefinedTableError``) au lieu de lire/ecrire silencieusement les
+    mauvaises donnees.
+
+    Toute table reellement globale (``public.tenants``, ``public.tenant_configs``,
+    ``public.super_admins``...) doit etre referencee explicitement sous
+    ``public.nom_table`` par le code applicatif -- c'est deja systematiquement
+    le cas dans ce depot (voir les requetes texte de ``app/modules/auth/service.py``,
+    ``app/modules/payments/service.py``...). Aucune exception a ce jour ne
+    necessite un search_path multi-schema pour une session tenant.
+    """
     schema = tenant_schema_name(tenant_slug)
     async with public_session_factory() as session:
-        await session.execute(text(f'SET search_path TO "{schema}", public'))
+        await session.execute(text(f'SET search_path TO "{schema}"'))
         yield session

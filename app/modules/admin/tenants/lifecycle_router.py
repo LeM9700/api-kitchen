@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import text
 
+from app.core.auth.security import get_password_hash
 from app.core.database import (
     NEW_TENANT_SLUG_RE,
     TENANT_SLUG_MAX_LENGTH_FOR_CREATION,
@@ -12,14 +13,13 @@ from app.core.database import (
     get_tenant_session,
 )
 from app.core.http.deps import get_arq_pool, require_role
-from app.core.tenancy.tenant import create_tenant_schema_on
+from app.core.tenancy.provisioning import provision_tenant
 from app.modules.admin.tenants import service as tenant_service
 from app.modules.admin.tenants.schemas import (
     TenantConfigUpdate,
     TenantResponse,
     TenantSuspendRequest,
 )
-from app.modules.admin.users.schemas import AdminUserCreate
 
 router = APIRouter()
 
@@ -70,7 +70,10 @@ async def create_tenant(
     body: TenantCreate,
     current_user=Depends(require_role("super-admin")),
 ):
-    """Crée un tenant (schéma Postgres) et son premier utilisateur admin.
+    """Crée un tenant (schéma Postgres, tables applicatives) et son premier
+    utilisateur admin -- via le même service de provisioning atomique que
+    l'inscription standard (voir app/core/tenancy/provisioning.py), pour que
+    les deux parcours produisent des tenants structurellement identiques.
 
     [🔒 SÉCURITÉ] La temporary_password n'est retournée qu'une seule fois dans
     cette réponse — elle doit être transmise à l'administrateur hors-bande.
@@ -82,59 +85,29 @@ async def create_tenant(
 
     Returns:
         TenantCreateResponse avec le mot de passe temporaire de l'admin.
+
+    Raises:
+        AppError: TENANT_EXISTS (409) si le slug est déjà pris.
+        AppError: TENANT_SCHEMA_COLLISION (409) si un schéma du même nom existe déjà.
     """
-    # Génère le mot de passe si non fourni
     temp_password = body.admin_password or secrets.token_urlsafe(12)
 
-    # 1. Crée la ligne dans public.tenants ET le schéma Postgres dans LA MÊME
-    # transaction : si le schéma existe déjà (collision, résidu, création
-    # concurrente), create_tenant_schema_on lève AppError avant le commit —
-    # le rollback implicite annule aussi l'insertion, donc aucune ligne
-    # orpheline ne peut rester dans public.tenants.
-    async with get_public_session() as session:
-        result = await session.execute(
-            text(
-                "INSERT INTO public.tenants (slug, name, plan) "
-                "VALUES (:slug, :name, :plan) RETURNING id, slug"
-            ),
-            {"slug": body.slug, "name": body.name, "plan": body.plan},
-        )
-        row = result.fetchone()
-        tenant_id = row.id
-        tenant_slug = row.slug
-        await create_tenant_schema_on(session, tenant_slug)
-        await session.commit()
-
-    # 2. Crée le premier admin dans le schéma tenant
-    from app.modules.admin.users import service as users_service
-
-    admin_body = AdminUserCreate(
-        email=str(body.admin_email),
-        full_name=None,
-        role="admin",
+    provisioned = await provision_tenant(
+        slug=body.slug,
+        name=body.name,
+        plan=body.plan,
+        admin_fields={
+            "email": str(body.admin_email),
+            "full_name": None,
+            "password_hash": get_password_hash(temp_password),
+            "must_change_password": True,
+            "email_verified_at": datetime.now(timezone.utc),
+        },
     )
-    # On force le mot de passe généré via une version interne de create_user
-    from datetime import datetime, timezone
-    from app.core.database import get_tenant_session
-    from app.core.auth.security import get_password_hash
-    from app.modules.auth.models import User
-
-    async with get_tenant_session(tenant_slug) as session:
-        user = User(
-            email=str(body.admin_email),
-            full_name=None,
-            password_hash=get_password_hash(temp_password),
-            role="admin",
-            permissions=None,
-            must_change_password=True,
-            email_verified_at=datetime.now(timezone.utc),
-        )
-        session.add(user)
-        await session.commit()
 
     return TenantCreateResponse(
-        id=tenant_id,
-        slug=tenant_slug,
+        id=provisioned.tenant_id,
+        slug=provisioned.tenant_slug,
         name=body.name,
         plan=body.plan,
         admin_email=str(body.admin_email),

@@ -303,7 +303,7 @@ async def test_register_endpoint_collision_leaves_no_orphan_row_and_does_not_tou
     s'inscrire avec un slug frais dont le schema calcule tombe PRECISEMENT
     sur le schema physique deja occupe par A.
     """
-    from app.modules.auth.service import _provision_tenant_schema
+    from app.core.tenancy.provisioning import _provision_tenant_schema
 
     unique = uuid.uuid4().hex[:8]
     slug_a_logical = f"legacy-tenant-a-{unique}"

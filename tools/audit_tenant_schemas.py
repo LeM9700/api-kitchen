@@ -22,6 +22,11 @@ Verifie :
        a. tenants enregistres sans schema physique correspondant ;
        b. schemas ``tenant_*`` sans ligne ``public.tenants`` correspondante
           (schema orphelin).
+    4. Schemas ``tenant_*`` existants mais INCOMPLETS : tables attendues
+       (d'apres ``Base.metadata``, la meme source de verite que le
+       provisioning -- voir app/core/tenancy/provisioning.py -- et les
+       migrations Alembic) absentes du schema reel. Detecte un provisioning
+       interrompu ou une migration tenant jamais appliquee a ce schema.
 
 Sortie : code de sortie 0 si aucune anomalie, 1 si au moins une anomalie
 detectee, 2 en cas d'erreur de connexion/execution -- exploitable directement
@@ -43,9 +48,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import settings
-from app.core.database import TENANT_SCHEMA_PREFIX, TENANT_SLUG_MAX_LENGTH_FOR_CREATION
+from app.core.database import Base, TENANT_SCHEMA_PREFIX, TENANT_SLUG_MAX_LENGTH_FOR_CREATION
+from app.core.database import tenant_models  # noqa: F401 -- peuple Base.metadata (tables tenant attendues)
 
 POSTGRES_MAX_IDENTIFIER_BYTES = 63
+
+# Meme source de verite que le provisioning (app/core/tenancy/provisioning.py)
+# et Alembic (app/core/database/tenant_models.py) : la liste des tables
+# qu'un schema tenant COMPLET doit contenir.
+EXPECTED_TENANT_TABLES = frozenset(Base.metadata.tables.keys())
 
 
 @dataclass(frozen=True)
@@ -68,6 +79,12 @@ class TenantRow:
 
 
 @dataclass(frozen=True)
+class IncompleteSchema:
+    schema: str
+    missing_tables: list[str]
+
+
+@dataclass(frozen=True)
 class AuditReport:
     total_tenants: int
     total_tenant_schemas: int
@@ -75,6 +92,7 @@ class AuditReport:
     truncation_collision_groups: list[list[TenantRow]] = field(default_factory=list)
     tenants_missing_schema: list[TenantRow] = field(default_factory=list)
     orphan_schemas: list[str] = field(default_factory=list)
+    incomplete_schemas: list[IncompleteSchema] = field(default_factory=list)
 
     @property
     def has_issues(self) -> bool:
@@ -83,16 +101,32 @@ class AuditReport:
             or self.truncation_collision_groups
             or self.tenants_missing_schema
             or self.orphan_schemas
+            or self.incomplete_schemas
         )
 
 
-def build_report(tenants: list[TenantRow], existing_schemas: set[str]) -> AuditReport:
+def build_report(
+    tenants: list[TenantRow],
+    existing_schemas: set[str],
+    schema_tables: dict[str, set[str]] | None = None,
+) -> AuditReport:
     """Calcule le rapport d'audit a partir des donnees deja lues en base.
 
     Fonction pure (aucun acces DB) -- separee de ``run_audit`` pour rester
     testable unitairement sans PostgreSQL reel, en plus des tests
     d'integration qui exercent la lecture reelle.
+
+    Args:
+        tenants: Lignes ``public.tenants``.
+        existing_schemas: Noms des schemas ``tenant_*`` reellement presents.
+        schema_tables: Pour chaque schema de ``existing_schemas``, l'ensemble
+            des tables qu'il contient reellement (``information_schema.tables``).
+            ``None`` ou absence d'une entree pour un schema donne desactive le
+            check de completude pour ce schema (aucun faux-positif si
+            l'appelant n'a pas fourni cette donnee).
     """
+    schema_tables = schema_tables or {}
+
     long_slug_tenants = [
         t for t in tenants if len(t.slug) > TENANT_SLUG_MAX_LENGTH_FOR_CREATION
     ]
@@ -112,6 +146,14 @@ def build_report(tenants: list[TenantRow], existing_schemas: set[str]) -> AuditR
     matched_schemas = set(groups_by_physical_schema.keys())
     orphan_schemas = sorted(existing_schemas - matched_schemas)
 
+    incomplete_schemas = []
+    for schema in sorted(existing_schemas):
+        if schema not in schema_tables:
+            continue
+        missing = EXPECTED_TENANT_TABLES - schema_tables[schema]
+        if missing:
+            incomplete_schemas.append(IncompleteSchema(schema=schema, missing_tables=sorted(missing)))
+
     return AuditReport(
         total_tenants=len(tenants),
         total_tenant_schemas=len(existing_schemas),
@@ -119,6 +161,7 @@ def build_report(tenants: list[TenantRow], existing_schemas: set[str]) -> AuditR
         truncation_collision_groups=truncation_collision_groups,
         tenants_missing_schema=tenants_missing_schema,
         orphan_schemas=orphan_schemas,
+        incomplete_schemas=incomplete_schemas,
     )
 
 
@@ -132,6 +175,21 @@ async def _fetch_tenant_schemas(conn) -> set[str]:
         text("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'tenant\\_%' ESCAPE '\\'")
     )
     return {row.nspname for row in result}
+
+
+async def _fetch_tenant_schema_tables(conn) -> dict[str, set[str]]:
+    """Pour chaque schema ``tenant_*``, l'ensemble des tables qu'il contient
+    reellement -- une seule requete groupee plutot qu'une par schema."""
+    result = await conn.execute(
+        text(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_schema LIKE 'tenant\\_%' ESCAPE '\\'"
+        )
+    )
+    tables_by_schema: dict[str, set[str]] = {}
+    for row in result:
+        tables_by_schema.setdefault(row.table_schema, set()).add(row.table_name)
+    return tables_by_schema
 
 
 async def run_audit(database_url: str) -> AuditReport:
@@ -148,10 +206,11 @@ async def run_audit(database_url: str) -> AuditReport:
             conn = await conn.execution_options(postgresql_readonly=True)
             tenants = await _fetch_tenants(conn)
             schemas = await _fetch_tenant_schemas(conn)
+            schema_tables = await _fetch_tenant_schema_tables(conn)
     finally:
         await engine.dispose()
 
-    return build_report(tenants, schemas)
+    return build_report(tenants, schemas, schema_tables)
 
 
 def _tenant_label(t: TenantRow) -> str:
@@ -203,6 +262,14 @@ def format_report_text(report: AuditReport) -> str:
         lines.append("   OK -- aucun schema orphelin.")
     lines.append("")
 
+    lines.append("4. Schemas tenant_* incomplets (tables attendues manquantes)")
+    if report.incomplete_schemas:
+        for entry in report.incomplete_schemas:
+            lines.append(f"   [ANOMALIE] schema '{entry.schema}' -- tables manquantes : {', '.join(entry.missing_tables)}")
+    else:
+        lines.append("   OK -- tous les schemas verifies contiennent toutes les tables attendues.")
+    lines.append("")
+
     lines.append(
         "RESULTAT : " + ("ANOMALIES DETECTEES -- ne pas deployer sans investiguer." if report.has_issues else "OK, aucune anomalie.")
     )
@@ -223,6 +290,9 @@ def format_report_json(report: AuditReport) -> str:
         ],
         "tenants_missing_schema": [tenant_dict(t) for t in report.tenants_missing_schema],
         "orphan_schemas": report.orphan_schemas,
+        "incomplete_schemas": [
+            {"schema": e.schema, "missing_tables": e.missing_tables} for e in report.incomplete_schemas
+        ],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 

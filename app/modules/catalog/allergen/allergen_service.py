@@ -69,14 +69,21 @@ _LEVEL_PRIORITY: dict[str, int] = {"present": 2, "traces": 1, "absent": 0}
 # ---------------------------------------------------------------------------
 
 
-async def seed_regulatory_allergens(session: AsyncSession) -> None:
+async def seed_regulatory_allergens(executor) -> None:
     """Insère les 14 allergènes EU et les tags dietary de base si absents.
 
-    Idempotent : utilise INSERT … ON CONFLICT DO NOTHING.
-    À appeler lors du provisioning d'un nouveau tenant ou en migration.
+    Idempotent : utilise INSERT … ON CONFLICT DO NOTHING. À appeler lors du
+    provisioning d'un nouveau tenant (voir
+    ``app.core.tenancy.provisioning.provision_tenant``) ou en migration.
+
+    Ne commit PAS elle-même : ``executor`` (une ``AsyncSession`` ou une
+    ``AsyncConnection``, search_path déjà positionné sur le schéma tenant)
+    reste dans la transaction de l'appelant, pour que ce seeding puisse faire
+    partie d'un provisioning atomique plus large sans commit intermédiaire.
 
     Args:
-        session: Session tenant-scoped (search_path déjà positionné).
+        executor: Session ou connexion tenant-scoped (search_path déjà
+            positionné), dont le commit/rollback est à la charge de l'appelant.
     """
     for data in _REGULATORY_ALLERGENS:
         stmt = (
@@ -84,7 +91,7 @@ async def seed_regulatory_allergens(session: AsyncSession) -> None:
             .values(name=data["name"], slug=data["slug"], description=data["description"], is_regulatory=True)
             .on_conflict_do_nothing(index_elements=["slug"])
         )
-        await session.execute(stmt)
+        await executor.execute(stmt)
 
     for data in _DEFAULT_DIETARY_TAGS:
         stmt = (
@@ -92,9 +99,7 @@ async def seed_regulatory_allergens(session: AsyncSession) -> None:
             .values(name=data["name"], slug=data["slug"])
             .on_conflict_do_nothing(index_elements=["slug"])
         )
-        await session.execute(stmt)
-
-    await session.commit()
+        await executor.execute(stmt)
 
 
 # ---------------------------------------------------------------------------

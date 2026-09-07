@@ -236,6 +236,14 @@ le même nom de schéma physique. `app/modules/auth/schemas.py` et
 dans cet état, mais ne peuvent rien garantir sur des lignes déjà présentes en base (import de données,
 intervention manuelle, restauration d'un backup pré-correctif...).
 
+Depuis le correctif de provisioning unifié (`app/core/tenancy/provisioning.py::provision_tenant`,
+utilisé par `POST /auth/register` ET `POST /admin/tenants`), un tenant créé par n'importe quel
+parcours reçoit exactement la même structure, en une seule transaction PostgreSQL — un échec à
+n'importe quelle étape annule tout (aucune ligne `public.tenants` orpheline, aucun schéma vide ou
+partiel possible). Ce risque disparaît donc pour tout NOUVEAU tenant ; l'audit reste nécessaire pour
+les tenants déjà en base avant ce correctif, et pour toute anomalie d'origine opérationnelle (import,
+intervention manuelle, restauration).
+
 `tools/audit_tenant_schemas.py` audite `public.tenants` face aux schémas `tenant_*` réellement
 présents dans `pg_namespace`, **en lecture seule** (la connexion est ouverte avec
 `SET TRANSACTION READ ONLY` — PostgreSQL refuse lui-même toute écriture, ce n'est pas qu'une
@@ -276,6 +284,9 @@ d'erreur de connexion/exécution (à distinguer d'un vrai « OK »).
 3. Cohérence `public.tenants` ↔ `pg_namespace`, dans les deux sens :
    - tenants enregistrés sans schéma physique correspondant ;
    - schémas `tenant_*` sans ligne `public.tenants` correspondante (orphelins).
+4. Schémas `tenant_*` existants mais **incomplets** — tables attendues (d'après `Base.metadata`, la
+   même source de vérité que `provision_tenant()` et les migrations Alembic) absentes du schéma réel.
+   Signale un provisioning interrompu ou une migration tenant jamais appliquée à ce schéma précis.
 
 ### En cas d'anomalie détectée
 
@@ -290,3 +301,8 @@ Ne **jamais** corriger silencieusement en supprimant des données sans comprendr
 - **Schéma orphelin** : confirmer qu'aucun tenant actif n'en dépend avant tout `DROP SCHEMA` — un
   schéma orphelin peut aussi être un résidu d'un tenant offboardé délibérément (ligne `public.tenants`
   supprimée sans nettoyer le schéma), à ne pas confondre avec une collision.
+- **Schéma incomplet** : avec le provisioning unifié et atomique, un schéma incomplet ne peut plus
+  provenir d'un `POST /auth/register` ou `POST /admin/tenants` normal — c'est le signal d'une migration
+  tenant qui n'a pas bouclé sur ce schéma (voir `alembic/versions/00XX_*.py`, pattern `_get_tenant_slugs`)
+  ou d'une intervention manuelle (`DROP TABLE` accidentel). Rejouer la migration concernée sur ce schéma
+  précis plutôt que de recréer le tenant.

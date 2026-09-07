@@ -17,7 +17,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from app.core.database import tenant_schema_name
+from app.core.tenancy.provisioning import _provision_tenant_schema
 from tools.audit_tenant_schemas import (
+    EXPECTED_TENANT_TABLES,
     POSTGRES_MAX_IDENTIFIER_BYTES,
     TenantRow,
     build_report,
@@ -111,6 +113,49 @@ def test_build_report_does_not_confuse_two_distinct_short_slugs():
     assert report.has_issues is False
 
 
+def test_build_report_flags_incomplete_schema_with_missing_tables():
+    tenant = TenantRow(id=1, slug="incomplete", name="Incomplete")
+    schema = tenant_schema_name("incomplete")
+    # Simule un schema provisionne partiellement : il ne contient qu'UNE
+    # table attendue au lieu de toutes -- provisioning interrompu, ou
+    # migration tenant jamais appliquee a ce schema.
+    one_expected_table = next(iter(EXPECTED_TENANT_TABLES))
+    schema_tables = {schema: {one_expected_table}}
+
+    report = build_report([tenant], {schema}, schema_tables)
+
+    assert report.has_issues is True
+    assert len(report.incomplete_schemas) == 1
+    entry = report.incomplete_schemas[0]
+    assert entry.schema == schema
+    assert one_expected_table not in entry.missing_tables
+    assert set(entry.missing_tables) == EXPECTED_TENANT_TABLES - {one_expected_table}
+
+
+def test_build_report_does_not_flag_complete_schema():
+    tenant = TenantRow(id=1, slug="complete", name="Complete")
+    schema = tenant_schema_name("complete")
+    schema_tables = {schema: set(EXPECTED_TENANT_TABLES)}
+
+    report = build_report([tenant], {schema}, schema_tables)
+
+    assert report.has_issues is False
+    assert report.incomplete_schemas == []
+
+
+def test_build_report_skips_completeness_check_when_table_data_not_provided():
+    """Retro-compatibilite : un appelant qui ne fournit pas ``schema_tables``
+    (comme l'ancien contrat de ``build_report``) ne doit jamais generer de
+    faux-positif "schema incomplet" -- le check est simplement desactive
+    pour les schemas sans donnee, pas suppose incomplet par defaut."""
+    tenant = TenantRow(id=1, slug="unknown-completeness", name="Unknown")
+    schema = tenant_schema_name("unknown-completeness")
+
+    report = build_report([tenant], {schema})
+
+    assert report.incomplete_schemas == []
+
+
 def test_format_report_text_reports_ok_when_clean():
     report = build_report([TenantRow(id=1, slug="ok", name="Ok")], {tenant_schema_name("ok")})
     text_out = format_report_text(report)
@@ -183,6 +228,48 @@ async def test_run_audit_detects_injected_orphan_schema_and_missing_schema_tenan
         async with db_engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{orphan_schema}" CASCADE'))
             await conn.execute(text("DELETE FROM public.tenants WHERE slug = :s"), {"s": missing_slug})
+
+
+@pytest.mark.asyncio
+async def test_run_audit_detects_incomplete_schema(db_engine):
+    """Provisionne un tenant normalement puis supprime UNE table applicative
+    -- simule un provisioning interrompu ou une migration tenant jamais
+    appliquee -- et verifie que run_audit() detecte le schema incomplet sur
+    une vraie connexion PostgreSQL, sans faire remonter de faux-positif pour
+    les autres tenants (deja complets) de la meme base."""
+    unique = uuid.uuid4().hex[:8]
+    slug = f"incomplete-{unique}"
+    schema = tenant_schema_name(slug)
+
+    async with db_engine.begin() as conn:
+        await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await conn.execute(text("DELETE FROM public.tenants WHERE slug = :s"), {"s": slug})
+        await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        await _provision_tenant_schema(conn, slug)
+        # Retire une table applicative pour simuler un schema incomplet.
+        await conn.execute(text(f'DROP TABLE "{schema}".favorites'))
+        await conn.execute(text("SET search_path TO public"))
+        await conn.execute(
+            text(
+                "INSERT INTO public.tenants (slug, name, plan) "
+                "VALUES (:slug, :name, 'starter')"
+            ),
+            {"slug": slug, "name": "Incomplete Tenant"},
+        )
+
+    try:
+        report = await run_audit(db_engine.url.render_as_string(hide_password=False))
+
+        assert report.has_issues is True
+        matching = [e for e in report.incomplete_schemas if e.schema == schema]
+        assert len(matching) == 1
+        assert matching[0].missing_tables == ["favorites"]
+        # Pas de faux-positif sur des tenants deja complets par ailleurs.
+        assert all(e.schema == schema for e in report.incomplete_schemas)
+    finally:
+        async with db_engine.begin() as conn:
+            await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            await conn.execute(text("DELETE FROM public.tenants WHERE slug = :s"), {"s": slug})
 
 
 @pytest.mark.asyncio

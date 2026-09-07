@@ -1,7 +1,9 @@
 """Verifie que le schema d'un tenant fraichement provisionne (via
-``_provision_tenant_schema``, cf. ``app/modules/auth/service.py``) est
-strictement identique — tables, colonnes, contraintes, index — a celui
-d'un tenant existant entierement migre via Alembic.
+``_provision_tenant_schema``, cf. ``app/core/tenancy/provisioning.py`` --
+le service UNIQUE de provisioning reutilise par l'inscription standard ET
+la creation super-admin) est strictement identique — tables, colonnes,
+contraintes, index — a celui d'un tenant existant entierement migre via
+Alembic.
 
 Empeche la reapparition de la divergence P5 (audit-consolidated-plan.md) :
 avant ce test, le schema tenant etait duplique entre les migrations Alembic
@@ -23,7 +25,7 @@ import pytest
 from sqlalchemy import text
 
 from app.core.database import tenant_schema_name
-from app.modules.auth.service import _provision_tenant_schema
+from app.core.tenancy.provisioning import _provision_tenant_schema
 
 NEW_TENANT_SLUG = "ddlparitytest"
 BOOTSTRAP_LEGACY_SCHEMA = "tenant_pizza_test"
