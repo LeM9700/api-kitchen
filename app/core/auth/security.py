@@ -24,8 +24,28 @@ def get_password_hash(plain: str) -> str:
     return pwd_context.hash(plain)
 
 
-def create_access_token(data: dict) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_access_expire_minutes)
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    """Signe un access token JWT avec ``exp``/``type``/``jti`` garantis.
+
+    [SECURITE] ``jti`` est TOUJOURS genere ici -- ne jamais construire un
+    access token via ``jwt.encode`` directement ailleurs dans le code, sous
+    peine d'emettre un token non revocable via la deny-list (voir
+    app.core.auth.token_revocation.revoke_jti). C'etait le bug initial du
+    flux /super-admin/login, qui mintait son JWT a la main sans jti.
+
+    Args:
+        data: Claims metier (sub, role, tenant_slug...).
+        expires_delta: Duree de vie explicite. Par defaut,
+            ``settings.jwt_access_expire_minutes`` -- a surcharger pour les
+            tokens a portee restreinte (enrolement MFA, impersonation) qui
+            doivent expirer bien plus vite qu'une session normale.
+
+    Returns:
+        JWT signe HS256.
+    """
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=settings.jwt_access_expire_minutes)
+    )
     jti = str(uuid.uuid4())
     return jwt.encode(
         {**data, "exp": expire, "type": "access", "jti": jti},
@@ -34,9 +54,34 @@ def create_access_token(data: dict) -> str:
     )
 
 
-def create_refresh_token(data: dict) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.jwt_refresh_expire_days)
-    return jwt.encode({**data, "exp": expire, "type": "refresh"}, settings.jwt_secret, algorithm="HS256")
+def create_refresh_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    """Signe un refresh token JWT avec ``exp``/``type``/``jti`` garantis.
+
+    [SECURITE] ``jti`` est un nonce aleatoire -- sans lui, deux refresh tokens
+    mintes pour le meme utilisateur/session dans la MEME seconde (``exp`` est
+    serialise en secondes entieres par PyJWT) auraient des claims strictement
+    identiques et produiraient donc le MEME JWT (HS256 est deterministe). Un
+    schema de rotation qui compare des tokens par egalite de chaine (voir
+    ``app.modules.super_admin.service.refresh_session``) deviendrait alors
+    incapable de distinguer l'ancien token du nouveau, et le "rejeu de l'ancien
+    refresh token apres rotation" ne serait plus jamais rejete.
+
+    Args:
+        data: Claims metier (sub, role, sid...).
+        expires_delta: Duree de vie explicite ; par defaut
+            ``settings.jwt_refresh_expire_days``.
+
+    Returns:
+        JWT signe HS256.
+    """
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(days=settings.jwt_refresh_expire_days)
+    )
+    return jwt.encode(
+        {**data, "exp": expire, "type": "refresh", "jti": str(uuid.uuid4())},
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
 
 
 def decode_token(token: str) -> dict:

@@ -49,6 +49,11 @@ jobs:
       STRIPE_SECRET_KEY: sk_test_dummy
       STRIPE_WEBHOOK_SECRET: whsec_dummy
       JWT_SECRET: test-secret-32-chars-minimum-here
+      # Cle Fernet de TEST uniquement (generee pour ce depot, aucun rapport avec
+      # un secret de production) -- necessaire pour que les tests de chiffrement
+      # du secret MFA super-admin s'executent reellement plutot que d'etre
+      # skippes en mode "feature desactivee" (voir app/core/services/crypto.py).
+      SUPER_ADMIN_MFA_ENCRYPTION_KEY: 9abH0wJC2EwEdjxsRk6DrARnN3jgeczh5sSoSRw-z_Y=
       # Cloudinary — valeurs fictives suffisantes pour les tests unitaires.
       # Les tests qui font de vrais appels Cloudinary doivent être marqués @pytest.mark.integration.
       CLOUDINARY_CLOUD_NAME: test-cloud
