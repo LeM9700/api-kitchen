@@ -447,7 +447,7 @@ async def test_status_super_admin_can_query_other_tenant(client, unique_slug):
         # Identite super-admin verifiee separement (voir tests/test_super_admin_auth.py) --
         # ce test porte sur la frontiere d'autorisation Connect, pas sur cette verification.
         patch(
-            "app.core.auth.super_admin.super_admin_exists",
+            "app.core.auth.super_admin.validate_super_admin_session",
             new=AsyncMock(return_value=True),
         ),
     ):

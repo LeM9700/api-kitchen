@@ -1,10 +1,11 @@
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import text
 
+from app.core.audit.platform_audit import record_platform_audit_event
 from app.core.auth.security import get_password_hash
 from app.core.database import (
     NEW_TENANT_SLUG_RE,
@@ -12,7 +13,7 @@ from app.core.database import (
     get_public_session,
     get_tenant_session,
 )
-from app.core.http.deps import get_arq_pool, require_role
+from app.core.http.deps import get_arq_pool, get_client_ip, require_role
 from app.core.tenancy.provisioning import provision_tenant
 from app.modules.admin.tenants import service as tenant_service
 from app.modules.admin.tenants.schemas import (
@@ -67,6 +68,7 @@ async def list_tenants(current_user=Depends(require_role("super-admin"))):
 
 @router.post("/tenants", response_model=TenantCreateResponse, status_code=201)
 async def create_tenant(
+    request: Request,
     body: TenantCreate,
     current_user=Depends(require_role("super-admin")),
 ):
@@ -78,6 +80,15 @@ async def create_tenant(
     [🔒 SÉCURITÉ] La temporary_password n'est retournée qu'une seule fois dans
     cette réponse — elle doit être transmise à l'administrateur hors-bande.
     Le compte est marqué must_change_password=True.
+
+    [🔒 SÉCURITÉ] L'audit ``tenant_created`` est écrit via le paramètre
+    ``on_provisioned`` de ``provision_tenant`` -- DANS LA MÊME transaction
+    PostgreSQL que l'insertion ``public.tenants``, la création du schéma, des
+    tables et du premier admin. Si cet audit échoue, toute la transaction est
+    annulée par PostgreSQL (DDL transactionnel) : aucun tenant, aucun schéma,
+    aucun admin ne subsiste (voir tests/test_tenant_creation_audit_atomicity.py).
+    L'inscription self-service standard (``app/modules/auth/service.py::register``)
+    n'a pas d'acteur super-admin à journaliser et n'utilise jamais ce paramètre.
 
     Args:
         body: Slug, name, plan, admin_email, admin_password (optionnel).
@@ -91,6 +102,20 @@ async def create_tenant(
         AppError: TENANT_SCHEMA_COLLISION (409) si un schéma du même nom existe déjà.
     """
     temp_password = body.admin_password or secrets.token_urlsafe(12)
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "") or None
+
+    async def _audit_tenant_created(session, provisioned) -> None:
+        await record_platform_audit_event(
+            session,
+            event_type="tenant_created",
+            actor_super_admin_id=current_user["id"],
+            actor_email=current_user["email"],
+            target_type="tenant",
+            target_id=provisioned.tenant_slug,
+            ip_address=ip,
+            user_agent=user_agent,
+        )
 
     provisioned = await provision_tenant(
         slug=body.slug,
@@ -103,6 +128,7 @@ async def create_tenant(
             "must_change_password": True,
             "email_verified_at": datetime.now(timezone.utc),
         },
+        on_provisioned=_audit_tenant_created,
     )
 
     return TenantCreateResponse(
@@ -119,6 +145,7 @@ async def create_tenant(
 async def suspend_tenant(
     tenant_id: int,
     body: TenantSuspendRequest,
+    request: Request,
     current_user=Depends(require_role("super-admin")),
     arq_pool=Depends(get_arq_pool),
 ) -> TenantResponse:
@@ -141,6 +168,18 @@ async def suspend_tenant(
                 "WHERE id = :id"
             ),
             {"now": now, "msg": body.suspension_message, "id": tenant_id},
+        )
+        # [SECURITE] FAIL-CLOSED : meme transaction que l'UPDATE ci-dessus --
+        # si l'audit echoue, le rollback implicite annule aussi la suspension.
+        await record_platform_audit_event(
+            session,
+            event_type="tenant_suspended",
+            actor_super_admin_id=current_user["id"],
+            actor_email=current_user["email"],
+            target_type="tenant",
+            target_id=tenant_slug,
+            ip_address=get_client_ip(request),
+            user_agent=request.headers.get("user-agent", "") or None,
         )
         await session.commit()
 
@@ -172,6 +211,7 @@ async def suspend_tenant(
 @router.patch("/tenants/{tenant_id}/unsuspend", response_model=TenantResponse)
 async def unsuspend_tenant(
     tenant_id: int,
+    request: Request,
     current_user=Depends(require_role("super-admin")),
     arq_pool=Depends(get_arq_pool),
 ) -> TenantResponse:
@@ -192,6 +232,17 @@ async def unsuspend_tenant(
                 "WHERE id = :id"
             ),
             {"id": tenant_id},
+        )
+        # [SECURITE] FAIL-CLOSED : meme transaction que l'UPDATE ci-dessus.
+        await record_platform_audit_event(
+            session,
+            event_type="tenant_unsuspended",
+            actor_super_admin_id=current_user["id"],
+            actor_email=current_user["email"],
+            target_type="tenant",
+            target_id=tenant_slug,
+            ip_address=get_client_ip(request),
+            user_agent=request.headers.get("user-agent", "") or None,
         )
         await session.commit()
 

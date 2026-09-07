@@ -25,12 +25,13 @@ Correctif (voir app/core/database/session.py, app/core/tenancy/tenant.py) :
       explicite plutot que d'etre reutilise en silence.
 """
 
+from datetime import datetime, timedelta, timezone
 import uuid
 
 import pytest
 from sqlalchemy import text
 
-from app.core.auth.security import create_access_token
+from app.core.auth.security import compute_token_lookup, create_access_token
 from app.core.database import (
     NEW_TENANT_SLUG_RE,
     TENANT_SLUG_MAX_LENGTH_FOR_CREATION,
@@ -63,13 +64,38 @@ async def _create_super_admin(email: str) -> int:
         return admin_id
 
 
-def _super_admin_token(admin_id: int, email: str) -> str:
+async def _create_super_admin_session(admin_id: int) -> str:
+    """Insere une session public.super_admin_sessions active -- requise
+    depuis le durcissement MFA/sessions (voir app.core.auth.super_admin)."""
+    sid = str(uuid.uuid4())
+    async with get_public_session() as session:
+        await session.execute(
+            text(
+                "INSERT INTO public.super_admin_sessions "
+                "(id, super_admin_id, refresh_token_lookup, expires_at) "
+                "VALUES (:sid, :admin_id, :lookup, :expires_at)"
+            ),
+            {
+                "sid": sid,
+                "admin_id": admin_id,
+                "lookup": compute_token_lookup(f"unused-{sid}"),
+                "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+            },
+        )
+        await session.commit()
+    return sid
+
+
+async def _super_admin_token(admin_id: int, email: str) -> str:
+    sid = await _create_super_admin_session(admin_id)
     return create_access_token({
         "sub": str(admin_id),
         "email": email,
         "role": "super-admin",
         "tenant_slug": None,
         "tenant_id": None,
+        "sid": sid,
+        "auth_version": 1,
     })
 
 
@@ -405,7 +431,7 @@ async def test_super_admin_create_tenant_collision_leaves_no_orphan_row(client, 
 
     admin_email = f"super-{unique}@collision-test.com"
     admin_id = await _create_super_admin(admin_email)
-    token = _super_admin_token(admin_id, admin_email)
+    token = await _super_admin_token(admin_id, admin_email)
 
     async with db_engine.begin() as conn:
         await conn.execute(text(f'DROP SCHEMA IF EXISTS "{colliding_schema}" CASCADE'))

@@ -70,22 +70,42 @@ async def get_current_user(
     if redis and user_id_str and await is_user_disabled(redis, int(user_id_str), tenant_slug):
         raise AppError("UNAUTHORIZED", "Account is disabled", 401)
 
+    # [SECURITE] L'impersonation a son PROPRE chemin de validation, verifie en
+    # premier : son "sub" porte l'id reel de l'acteur super-admin (traçable),
+    # pas l'utilisateur cible, donc ni user_belongs_to_tenant ni
+    # super_admin_exists ne s'appliquent ici (voir app.core.auth.impersonation
+    # pour le detail du bug historique que ce branchement corrige).
+    if payload.get("impersonation") is True:
+        from app.core.auth.impersonation import validate_impersonation_token
+        if not await validate_impersonation_token(payload):
+            raise AppError("UNAUTHORIZED", "Invalid impersonation token", 401)
     # [SECURITE] Revalide que le sub appartient bien au tenant reclame par le JWT --
     # le payload seul ne suffit pas pour choisir le schema Postgres (voir
     # user_belongs_to_tenant). Sans ce controle, un token dont le sub et le
     # tenant_slug sont incoherents resoudrait vers l'utilisateur reel portant
     # cet id dans le tenant reclame (les ids repartent a 1 par schema).
-    if user_id_str and tenant_slug:
+    elif user_id_str and tenant_slug:
         from app.core.tenancy.tenant import user_belongs_to_tenant
         if not await user_belongs_to_tenant(int(user_id_str), tenant_slug, payload.get("email")):
             raise AppError("UNAUTHORIZED", "Invalid token", 401)
-    # [SECURITE] Meme controle pour le flux super-admin independant (pas de
+    # [SECURITE] Meme principe pour le flux super-admin independant (pas de
     # tenant_slug -- voir app.modules.super_admin.router.super_admin_login) :
     # revalide que le sub correspond a un compte reel et actif de
-    # public.super_admins, plutot que de faire confiance au seul claim role.
-    elif user_id_str and payload.get("role") == "super-admin":
-        from app.core.auth.super_admin import super_admin_exists
-        if not await super_admin_exists(int(user_id_str), payload.get("email")):
+    # public.super_admins, que auth_version est a jour (revocation globale) et,
+    # pour une session complete (role="super-admin"), que le sid reference une
+    # ligne super_admin_sessions active (revocation individuelle). Le role
+    # "super-admin-enrollment" (login sans MFA encore active) saute ce dernier
+    # point : il n'ouvre aucune session, voir app.modules.super_admin.service.
+    elif user_id_str and payload.get("role") in ("super-admin", "super-admin-enrollment"):
+        from app.core.auth.super_admin import validate_super_admin_session
+        valid = await validate_super_admin_session(
+            int(user_id_str),
+            payload.get("email"),
+            payload.get("auth_version"),
+            payload.get("sid"),
+            require_session=(payload.get("role") == "super-admin"),
+        )
+        if not valid:
             raise AppError("UNAUTHORIZED", "Invalid token", 401)
 
     raw_user_id = payload.get("sub")
@@ -99,6 +119,12 @@ async def get_current_user(
         "must_change_password": payload.get("must_change_password", False),
         "jti": jti,
         "exp": payload.get("exp"),
+        "sid": payload.get("sid"),
+        "auth_version": payload.get("auth_version"),
+        "is_impersonation": payload.get("impersonation", False),
+        "impersonated_by_super_admin_id": payload.get("impersonated_by_super_admin_id"),
+        "impersonated_by_email": payload.get("impersonated_by_email"),
+        "impersonation_id": payload.get("impersonation_id"),
     }
     request.state.user_id = user["id"]
     request.state.tenant_id = user["tenant_id"]
@@ -168,6 +194,22 @@ async def get_optional_user(
 def require_role(*roles: str) -> Callable:
     """Fabrique une dependance FastAPI qui verifie le role de l'utilisateur courant.
 
+    [🔒 SÉCURITÉ] DENY BY DEFAULT pour l'impersonation : un token
+    d'impersonation (``is_impersonation=True``) porte ``role="admin"`` pour
+    rester compatible avec le modele de roles tenant (voir
+    ``app.core.auth.impersonation``), mais ce role ne doit JAMAIS donner de
+    blanc-seing hors des routes explicitement prevues pour un acces restreint.
+    Une route protegee par ``require_role()`` seul n'offre aucune granularite
+    de permission -- elle est donc TOUJOURS refusee a un token d'impersonation,
+    quels que soient les roles listes ici (y compris "admin"). Seules les
+    routes qui optent explicitement pour ``require_permission(...)`` avec une
+    permission de la liste minimale ``IMPERSONATION_PERMISSIONS`` peuvent
+    accepter une impersonation (voir ``has_permission()`` ci-dessous) -- il
+    n'existe volontairement AUCUN moyen d'elargir cette regle depuis un appel
+    a ``require_role()`` (pas de flag "allow_impersonation") : ne pas en
+    ajouter un, ce serait recreer la liste permissive implicite que ce
+    controle existe pour eliminer.
+
     Args:
         *roles: Roles autorises. L'utilisateur doit posseder l'un d'eux.
 
@@ -176,6 +218,12 @@ def require_role(*roles: str) -> Callable:
         ou leve ``AppError`` FORBIDDEN (403) sinon.
     """
     async def dependency(current_user: dict = Depends(get_current_user)) -> dict:
+        if current_user.get("is_impersonation"):
+            raise AppError(
+                "FORBIDDEN",
+                "Impersonation tokens cannot access role-only routes",
+                403,
+            )
         if current_user.get("role") not in roles:
             raise AppError("FORBIDDEN", "Insufficient permissions", 403)
         return current_user
@@ -189,8 +237,24 @@ def has_permission(current_user: dict, permission: str) -> bool:
     Admin and super-admin keep full access. Staff accounts with permissions=None
     are treated as legacy unrestricted staff during rollout; once an admin stores
     an explicit list, it becomes authoritative.
+
+    [🔒 SÉCURITÉ] Exception au raccourci admin/super-admin : un token
+    d'impersonation (``is_impersonation=True``, voir
+    ``app.core.auth.impersonation.IMPERSONATION_PERMISSIONS``) ne doit jamais
+    hériter du blanc-seing du rôle "admin" qu'il porte pour la compatibilité
+    des routes existantes — sinon la liste de permissions minimales posée à
+    l'émission du token serait entièrement cosmétique. DENY BY DEFAULT : seule
+    une route gated par ``require_permission(...)`` avec une permission
+    présente dans ``IMPERSONATION_PERMISSIONS`` peut accepter une
+    impersonation ; ``require_role()`` seul refuse désormais toute
+    impersonation sans même consulter cette fonction (voir sa docstring) — il
+    n'existe donc aucune route "role-only" qui laisserait passer un token
+    d'impersonation avec la pleine capacité du rôle "admin".
     """
     role = current_user.get("role")
+    if current_user.get("is_impersonation"):
+        permissions = current_user.get("permissions") or []
+        return "*" in permissions or permission in permissions
     if role in {"admin", "super-admin"}:
         return True
     permissions = current_user.get("permissions")

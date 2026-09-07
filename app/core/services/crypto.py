@@ -55,3 +55,50 @@ def decrypt_secret(ciphertext: str) -> str:
             avec une autre cle.
     """
     return _fernet().decrypt(ciphertext.encode()).decode()
+
+
+def _super_admin_mfa_fernet() -> Fernet:
+    # [SECURITE] Cle DEDIEE, distincte de pos_token_encryption_key -- le secret
+    # TOTP d'un super-admin plateforme n'a pas le meme blast radius qu'un token
+    # OAuth POS ; partager la cle coupletait deux categories de secrets sans
+    # rapport (une rotation de l'une invaliderait silencieusement l'autre).
+    if not settings.super_admin_mfa_encryption_key:
+        raise CryptoNotConfigured(
+            "SUPER_ADMIN_MFA_ENCRYPTION_KEY n'est pas configure -- impossible de "
+            "chiffrer/dechiffrer le secret MFA super-admin."
+        )
+    return Fernet(settings.super_admin_mfa_encryption_key.encode())
+
+
+def encrypt_super_admin_mfa_secret(plaintext: str) -> str:
+    """Chiffre le secret TOTP d'un super-admin plateforme avant persistance.
+
+    Args:
+        plaintext: Secret TOTP base32 en clair (pyotp.random_base32()).
+
+    Returns:
+        Texte chiffre (str base64), pret a etre persiste dans
+        ``super_admins.mfa_secret_encrypted``.
+
+    Raises:
+        CryptoNotConfigured: si SUPER_ADMIN_MFA_ENCRYPTION_KEY est vide -- fail
+        closed : un secret MFA super-admin ne doit jamais etre persiste en clair.
+    """
+    return _super_admin_mfa_fernet().encrypt(plaintext.encode()).decode()
+
+
+def decrypt_super_admin_mfa_secret(ciphertext: str) -> str:
+    """Dechiffre le secret TOTP d'un super-admin plateforme.
+
+    Args:
+        ciphertext: Valeur stockee dans ``super_admins.mfa_secret_encrypted``.
+
+    Returns:
+        Secret TOTP en clair, pret pour ``pyotp.TOTP(secret)``.
+
+    Raises:
+        CryptoNotConfigured: si SUPER_ADMIN_MFA_ENCRYPTION_KEY est vide.
+        cryptography.fernet.InvalidToken: si le texte est corrompu ou signe
+            avec une autre cle.
+    """
+    return _super_admin_mfa_fernet().decrypt(ciphertext.encode()).decode()

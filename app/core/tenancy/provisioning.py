@@ -19,11 +19,12 @@ PostgreSQL, pas ce module, qui garantit qu'aucun etat partiel ne peut
 subsister.
 """
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import insert, text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app.core.database import Base, engine, tenant_schema_name
 from app.core.database import tenant_models  # noqa: F401 -- peuple Base.metadata (tables tenant)
@@ -101,6 +102,7 @@ async def provision_tenant(
     name: str,
     plan: str = "starter",
     admin_fields: dict[str, Any] | None = None,
+    on_provisioned: Callable[[AsyncSession, "ProvisionedTenant"], Awaitable[None]] | None = None,
 ) -> ProvisionedTenant:
     """Provisionne un tenant complet, de maniere atomique.
 
@@ -112,6 +114,7 @@ async def provision_tenant(
         3. Creation de toutes les tables/contraintes/index applicatifs +
            donnees minimales (etablissement, allergenes reglementaires).
         4. Creation du premier compte admin, si ``admin_fields`` est fourni.
+        5. ``on_provisioned``, si fourni -- voir ci-dessous.
 
     Args:
         slug: Slug deja VALIDE par le schema Pydantic de l'appelant
@@ -131,6 +134,20 @@ async def provision_tenant(
             dans la MEME transaction que le reste : un email deja pris (ou
             toute autre contrainte violee) fait echouer TOUT le provisioning,
             pas seulement la creation de l'admin.
+        on_provisioned: Callback optionnel ``(session, provisioned) -> None``
+            execute DANS LA MEME transaction, juste avant le commit -- recoit
+            une ``AsyncSession`` liee a la connexion du provisioning (pas une
+            nouvelle transaction). [SECURITE] Reserve aux appelants qui
+            doivent journaliser une action privilegiee de facon FAIL-CLOSED
+            (ex. ``tenant_created`` dans ``public.platform_audit_logs`` pour
+            la creation super-admin, voir
+            ``app/modules/admin/tenants/lifecycle_router.py::create_tenant``) :
+            si le callback leve, l'exception remonte et annule TOUT le
+            provisioning (schema, tables, admin inclus) -- aucun tenant ne
+            peut donc exister sans que son evenement d'audit soit deja ecrit.
+            L'inscription standard (``app/modules/auth/service.py::register``)
+            n'a pas d'acteur super-admin a journaliser et ne passe jamais ce
+            parametre.
 
     Returns:
         ProvisionedTenant(tenant_id, tenant_slug, admin_user_id) --
@@ -177,4 +194,15 @@ async def provision_tenant(
         # maintenant que tout le travail tenant-scope est termine.
         await conn.execute(text("SET search_path TO public"))
 
-    return ProvisionedTenant(tenant_id=tenant_id, tenant_slug=slug, admin_user_id=admin_user_id)
+        provisioned = ProvisionedTenant(tenant_id=tenant_id, tenant_slug=slug, admin_user_id=admin_user_id)
+
+        if on_provisioned is not None:
+            # [SECURITE] Session ORM liee A CETTE MEME connexion/transaction --
+            # create_savepoint isole le callback sans jamais emettre de COMMIT
+            # independant. Si le callback leve, l'exception sort du bloc
+            # ``async with engine.begin()`` : ROLLBACK de tout (tenant, schema,
+            # tables, admin) -- voir docstring du parametre ci-dessus.
+            audit_session = AsyncSession(bind=conn, join_transaction_mode="create_savepoint")
+            await on_provisioned(audit_session, provisioned)
+
+    return provisioned

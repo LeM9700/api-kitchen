@@ -47,6 +47,25 @@ class Settings(BaseSettings):
     jwt_access_expire_minutes: int = 15
     jwt_refresh_expire_days: int = 30
 
+    # Cle Fernet dediee au chiffrement au repos du secret TOTP des super-admins
+    # plateforme (app.core.services.crypto). Vide = MFA super-admin desactive --
+    # fail-closed : setup MFA refuse explicitement plutot que de stocker un
+    # secret en clair. Cle DEDIEE et distincte de pos_token_encryption_key : ne
+    # jamais reutiliser la meme cle Fernet pour deux categories de secrets sans
+    # rapport (blast radius d'une fuite de cle).
+    super_admin_mfa_encryption_key: str = ""
+    # Duree de vie des sessions/refresh tokens super-admin (public.super_admin_sessions).
+    # Distincte de jwt_refresh_expire_days (tenant) : blast radius d'un compte
+    # super-admin compromis plus eleve, rotation plus frequente attendue.
+    super_admin_refresh_expire_days: int = 7
+    # TTL du token d'enrolement MFA (role="super-admin-enrollment") delivre a un
+    # super-admin actif qui n'a pas encore de MFA -- n'autorise que
+    # POST /super-admin/mfa/setup et /mfa/confirm (voir super_admin/router.py).
+    super_admin_mfa_enrollment_token_minutes: int = 10
+    # TTL d'un token d'impersonation -- tres court, jamais renouvele (aucun
+    # refresh token n'est emis pour ce flux, voir app.core.auth.impersonation).
+    super_admin_impersonation_token_minutes: int = 5
+
     # SMTP — laisser smtp_host vide pour désactiver l'envoi (graceful degradation).
     smtp_host: str = ""
     smtp_port: int = 587
