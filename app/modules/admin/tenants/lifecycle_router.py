@@ -12,7 +12,7 @@ from app.core.database import (
     get_tenant_session,
 )
 from app.core.http.deps import get_arq_pool, require_role
-from app.core.tenancy.tenant import create_tenant_schema
+from app.core.tenancy.tenant import create_tenant_schema_on
 from app.modules.admin.tenants import service as tenant_service
 from app.modules.admin.tenants.schemas import (
     TenantConfigUpdate,
@@ -86,7 +86,11 @@ async def create_tenant(
     # Génère le mot de passe si non fourni
     temp_password = body.admin_password or secrets.token_urlsafe(12)
 
-    # 1. Crée la ligne dans public.tenants
+    # 1. Crée la ligne dans public.tenants ET le schéma Postgres dans LA MÊME
+    # transaction : si le schéma existe déjà (collision, résidu, création
+    # concurrente), create_tenant_schema_on lève AppError avant le commit —
+    # le rollback implicite annule aussi l'insertion, donc aucune ligne
+    # orpheline ne peut rester dans public.tenants.
     async with get_public_session() as session:
         result = await session.execute(
             text(
@@ -96,14 +100,12 @@ async def create_tenant(
             {"slug": body.slug, "name": body.name, "plan": body.plan},
         )
         row = result.fetchone()
-        await session.commit()
         tenant_id = row.id
         tenant_slug = row.slug
+        await create_tenant_schema_on(session, tenant_slug)
+        await session.commit()
 
-    # 2. Crée le schéma Postgres + toutes les tables du tenant
-    await create_tenant_schema(tenant_slug)
-
-    # 3. Crée le premier admin dans le schéma tenant
+    # 2. Crée le premier admin dans le schéma tenant
     from app.modules.admin.users import service as users_service
 
     admin_body = AdminUserCreate(

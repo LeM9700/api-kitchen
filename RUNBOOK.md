@@ -222,3 +222,71 @@ Avant d'activer la fonctionnalité en configurant les variables `POS_HUB_*` en p
 3. **Pas de contrainte DB empêchant plusieurs connexions actives pour un même tenant.** La règle « une seule connexion active par tenant » n'est appliquée que par une vérification applicative dans `POST /pos/connect/start` (lire-puis-décider), pas par une contrainte SQL. Deux appels concurrents à `/start` pourraient théoriquement produire deux connexions actives pour le même tenant.
 
 Avant d'activer la fonctionnalité pour un client réel, traiter au minimum le point 1 (affichage cohérent côté admin du mode « connecté » et de ses conséquences) et envisager un index unique partiel pour le point 3 (`CREATE UNIQUE INDEX ... ON public.pos_connections (tenant_id) WHERE status = 'active'`).
+
+---
+
+## 8. Audit des tenants PostgreSQL (pré-déploiement)
+
+**Contexte** : l'isolation multi-tenant repose entièrement sur le nom du schéma PostgreSQL
+(`tenant_{slug}`) — voir la section « Hidden constraints » de `CLAUDE.md`. PostgreSQL tronque
+silencieusement tout identifiant de plus de 63 octets (`NAMEDATALEN=64`) au lieu de rejeter la
+requête : un slug trop long, ou deux slugs partageant leurs 56 premiers caractères, peuvent produire
+le même nom de schéma physique. `app/modules/auth/schemas.py` et
+`app/modules/admin/tenants/lifecycle_router.py` empêchent désormais qu'un **nouveau** tenant soit créé
+dans cet état, mais ne peuvent rien garantir sur des lignes déjà présentes en base (import de données,
+intervention manuelle, restauration d'un backup pré-correctif...).
+
+`tools/audit_tenant_schemas.py` audite `public.tenants` face aux schémas `tenant_*` réellement
+présents dans `pg_namespace`, **en lecture seule** (la connexion est ouverte avec
+`SET TRANSACTION READ ONLY` — PostgreSQL refuse lui-même toute écriture, ce n'est pas qu'une
+convention de code).
+
+### Quand l'exécuter
+
+- **Avant tout déploiement** touchant à l'auth, au provisioning de tenant, ou après une restauration
+  de backup (voir section 4) — sur l'instance restaurée, avant de la promouvoir.
+- En cas de doute sur l'intégrité multi-tenant (alerte, comportement suspect signalé par un tenant).
+- Périodiquement en production (à automatiser en cron externe / GitHub Actions planifiée, même
+  logique que la recommandation de la section 4).
+
+### Exécution
+
+```bash
+# Contre la base configurée dans .env / DATABASE_URL
+uv run python tools/audit_tenant_schemas.py
+
+# Contre une base précise (ex. instance de staging ou backup restauré avant promotion)
+uv run python tools/audit_tenant_schemas.py --database-url "postgresql+asyncpg://user:pass@host/db"
+
+# Sortie JSON (intégration CI/monitoring)
+uv run python tools/audit_tenant_schemas.py --format json
+```
+
+Code de sortie : `0` si aucune anomalie, `1` si au moins une anomalie détectée (à exploiter dans un
+pipeline : `uv run python tools/audit_tenant_schemas.py || <bloquer le déploiement>`), `2` en cas
+d'erreur de connexion/exécution (à distinguer d'un vrai « OK »).
+
+### Ce que l'audit vérifie
+
+1. Tenants dont le slug dépasse 56 caractères (la limite de création, voir
+   `TENANT_SLUG_MAX_LENGTH_FOR_CREATION`).
+2. Couples de tenants dont `tenant_{slug}` partage le même préfixe de 63 octets — le nom physique que
+   PostgreSQL retiendrait réellement pour chacun, donc une collision certaine s'ils sont (ou
+   deviennent) tous les deux provisionnés.
+3. Cohérence `public.tenants` ↔ `pg_namespace`, dans les deux sens :
+   - tenants enregistrés sans schéma physique correspondant ;
+   - schémas `tenant_*` sans ligne `public.tenants` correspondante (orphelins).
+
+### En cas d'anomalie détectée
+
+Ne **jamais** corriger silencieusement en supprimant des données sans comprendre la cause :
+
+- **Slug trop long / couple en collision** : vérifier en premier si les deux tenants partagent
+  réellement le même schéma physique (`\dn tenant_*` en `psql`, ou `pg_namespace` directement) — si
+  oui, c'est un incident d'isolation actif (voir section 6) et non une simple anomalie de données.
+- **Tenant sans schéma** : le tenant est inaccessible (login impossible). Vérifier les logs applicatifs
+  autour de sa date de création (`created_at`) pour un `TENANT_SCHEMA_COLLISION` ou une erreur de
+  provisioning déjà survenue, avant de reprovisionner manuellement.
+- **Schéma orphelin** : confirmer qu'aucun tenant actif n'en dépend avant tout `DROP SCHEMA` — un
+  schéma orphelin peut aussi être un résidu d'un tenant offboardé délibérément (ligne `public.tenants`
+  supprimée sans nettoyer le schéma), à ne pas confondre avec une collision.

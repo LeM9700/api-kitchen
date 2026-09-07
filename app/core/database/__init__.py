@@ -1,6 +1,7 @@
 from app.core.database.session import (
     Base,
     NEW_TENANT_SLUG_RE,
+    TENANT_SCHEMA_PREFIX,
     TENANT_SLUG_MAX_LENGTH_FOR_CREATION,
     TENANT_SLUG_RE,
     engine,
@@ -13,6 +14,7 @@ from app.core.database.session import (
 __all__ = [
     "Base",
     "NEW_TENANT_SLUG_RE",
+    "TENANT_SCHEMA_PREFIX",
     "TENANT_SLUG_MAX_LENGTH_FOR_CREATION",
     "TENANT_SLUG_RE",
     "engine",

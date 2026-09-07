@@ -22,7 +22,7 @@ from app.core.auth.security import (
     get_password_hash,
     verify_password,
 )
-from app.core.tenancy.tenant import create_tenant_schema
+from app.core.tenancy.tenant import create_tenant_schema_on
 from app.modules.auth.models import RefreshToken, User
 
 
@@ -102,9 +102,15 @@ async def register(body, arq_pool=None) -> tuple[User, str, str, int]:
             {"slug": body.tenant_slug, "name": body.tenant_name},
         )
         tenant_id = row.scalar_one()
+        # [SECURITE] Cree le schema DANS LA MEME TRANSACTION que la ligne
+        # public.tenants ci-dessus, avant le commit : si le schema existe deja
+        # (collision de troncature, residu, creation concurrente),
+        # create_tenant_schema_on leve AppError et la sortie en exception de ce
+        # bloc `async with` annule (rollback implicite, pas de commit atteint)
+        # l'insertion -- aucune ligne orpheline dans public.tenants.
+        await create_tenant_schema_on(session, body.tenant_slug)
         await session.commit()
 
-    await create_tenant_schema(body.tenant_slug)
     await _create_tenant_tables(body.tenant_slug)
     async with get_tenant_session(body.tenant_slug) as session:
         from app.modules.catalog.allergen.allergen_service import seed_regulatory_allergens

@@ -30,10 +30,12 @@ import uuid
 import pytest
 from sqlalchemy import text
 
+from app.core.auth.security import create_access_token
 from app.core.database import (
     NEW_TENANT_SLUG_RE,
     TENANT_SLUG_MAX_LENGTH_FOR_CREATION,
     TENANT_SLUG_RE,
+    get_public_session,
     tenant_schema_name,
 )
 from app.core.http.errors import AppError
@@ -42,6 +44,33 @@ from app.modules.admin.tenants.lifecycle_router import TenantCreate
 from app.modules.auth.schemas import RegisterRequest
 
 POSTGRES_MAX_IDENTIFIER_LENGTH = 63
+
+
+async def _create_super_admin(email: str) -> int:
+    """Insere un vrai compte public.super_admins (meme pattern que
+    tests/test_super_admin_auth.py) pour authentifier les tests du parcours
+    de creation de tenant super-admin."""
+    async with get_public_session() as session:
+        result = await session.execute(
+            text(
+                "INSERT INTO public.super_admins (email, password_hash, is_active) "
+                "VALUES (:email, 'unused-hash', true) RETURNING id"
+            ),
+            {"email": email},
+        )
+        admin_id = result.scalar_one()
+        await session.commit()
+        return admin_id
+
+
+def _super_admin_token(admin_id: int, email: str) -> str:
+    return create_access_token({
+        "sub": str(admin_id),
+        "email": email,
+        "role": "super-admin",
+        "tenant_slug": None,
+        "tenant_id": None,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +273,171 @@ async def test_create_tenant_schema_raises_explicit_error_on_existing_schema(db_
     finally:
         async with db_engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+# ---------------------------------------------------------------------------
+# 4bis. Bout-en-bout (vrai endpoint HTTP + PostgreSQL reel) : pas de ligne
+#       orpheline, pas d'impact sur le tenant A deja proprietaire du schema
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_endpoint_collision_leaves_no_orphan_row_and_does_not_touch_tenant_a(
+    client, db_engine
+):
+    """Reproduction bout-en-bout (vrai endpoint HTTP ``/auth/register``,
+    PostgreSQL reel) du scenario :
+
+        1. Le tenant A possede deja un schema physique qui entre en collision
+           avec le nom calcule pour un nouveau tenant B.
+        2. La creation de B echoue avec TENANT_SCHEMA_COLLISION.
+        3. Aucune ligne orpheline ne reste dans public.tenants pour B.
+        4. Aucune donnee ni schema existant de A n'est modifie.
+
+    A est represente comme un tenant PLEINEMENT FONCTIONNEL (ligne
+    public.tenants + schema provisionne avec de vraies tables/donnees), dont
+    le schema physique ne correspond pas au nom que son slug logique
+    produirait naivement -- exactement le type d'anomalie (residu
+    historique, schema renomme manuellement, incident ops...) que
+    ``tools/audit_tenant_schemas.py`` est concu pour detecter. B tente de
+    s'inscrire avec un slug frais dont le schema calcule tombe PRECISEMENT
+    sur le schema physique deja occupe par A.
+    """
+    from app.modules.auth.service import _provision_tenant_schema
+
+    unique = uuid.uuid4().hex[:8]
+    slug_a_logical = f"legacy-tenant-a-{unique}"
+    slug_b = f"fresh-tenant-b-{unique}"
+    # Le schema physique de A ne correspond PAS a tenant_schema_name(slug_a_logical) --
+    # il occupe deja, pour une raison operationnelle quelconque, exactement le nom
+    # que B va calculer depuis son propre slug.
+    colliding_schema = tenant_schema_name(slug_b)
+    assert colliding_schema != tenant_schema_name(slug_a_logical)
+    marker = f"A-DATA-MARKER-{unique}"
+
+    async with db_engine.begin() as conn:
+        await conn.execute(text(f'DROP SCHEMA IF EXISTS "{colliding_schema}" CASCADE'))
+        await conn.execute(
+            text("DELETE FROM public.tenants WHERE slug IN (:a, :b)"),
+            {"a": slug_a_logical, "b": slug_b},
+        )
+        tenant_a_id = await conn.scalar(
+            text(
+                "INSERT INTO public.tenants (slug, name, plan) "
+                "VALUES (:slug, :name, 'starter') RETURNING id"
+            ),
+            {"slug": slug_a_logical, "name": "Legacy Tenant A"},
+        )
+        await conn.execute(text(f'CREATE SCHEMA "{colliding_schema}"'))
+        # _provision_tenant_schema(conn, slug_b) cree les tables applicatives dans
+        # tenant_schema_name(slug_b) == colliding_schema -- exactement le schema
+        # deja cree ci-dessus pour A. slug_b n'est utilise ici QUE pour calculer
+        # le nom physique cible ; A reste identifie par slug_a_logical.
+        await _provision_tenant_schema(conn, slug_b)
+        await conn.execute(text(f'SET search_path TO "{colliding_schema}"'))
+        await conn.execute(text("UPDATE establishments SET name = :name"), {"name": marker})
+        await conn.execute(text("SET search_path TO public"))
+
+    try:
+        async with db_engine.connect() as conn:
+            a_row_before = dict(
+                (
+                    await conn.execute(
+                        text("SELECT id, slug, name, plan FROM public.tenants WHERE id = :id"),
+                        {"id": tenant_a_id},
+                    )
+                ).mappings().one()
+            )
+            await conn.execute(text(f'SET search_path TO "{colliding_schema}"'))
+            a_establishment_before = await conn.scalar(text("SELECT name FROM establishments LIMIT 1"))
+        assert a_establishment_before == marker
+
+        # 1 + 2. La creation de B, via le vrai endpoint HTTP, doit echouer explicitement.
+        resp = await client.post("/api/v1/auth/register", json={
+            "tenant_slug": slug_b,
+            "tenant_name": "Fresh Tenant B",
+            "email": f"b-{unique}@collision-test.com",
+            "password": "Valid1!aa",
+        })
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["code"] == "TENANT_SCHEMA_COLLISION"
+
+        # 3. Aucune ligne orpheline pour B.
+        async with db_engine.connect() as conn:
+            b_row_count = await conn.scalar(
+                text("SELECT count(*) FROM public.tenants WHERE slug = :slug"),
+                {"slug": slug_b},
+            )
+        assert b_row_count == 0
+
+        # 4. A -- ligne public.tenants ET donnees applicatives -- est intact.
+        async with db_engine.connect() as conn:
+            a_row_after = dict(
+                (
+                    await conn.execute(
+                        text("SELECT id, slug, name, plan FROM public.tenants WHERE id = :id"),
+                        {"id": tenant_a_id},
+                    )
+                ).mappings().one()
+            )
+            await conn.execute(text(f'SET search_path TO "{colliding_schema}"'))
+            a_establishment_after = await conn.scalar(text("SELECT name FROM establishments LIMIT 1"))
+        assert a_row_after == a_row_before
+        assert a_establishment_after == marker
+    finally:
+        async with db_engine.begin() as conn:
+            await conn.execute(text(f'DROP SCHEMA IF EXISTS "{colliding_schema}" CASCADE'))
+            await conn.execute(
+                text("DELETE FROM public.tenants WHERE slug IN (:a, :b)"),
+                {"a": slug_a_logical, "b": slug_b},
+            )
+
+
+@pytest.mark.asyncio
+async def test_super_admin_create_tenant_collision_leaves_no_orphan_row(client, db_engine):
+    """Meme invariant que le test precedent, pour le SECOND parcours de
+    creation (POST /admin/tenants, super-admin) -- il partage desormais le
+    meme mecanisme atomique (``create_tenant_schema_on`` dans la transaction
+    de l'insertion ``public.tenants``, voir lifecycle_router.create_tenant)."""
+    unique = uuid.uuid4().hex[:8]
+    slug_b = f"admin-fresh-b-{unique}"
+    colliding_schema = tenant_schema_name(slug_b)
+
+    admin_email = f"super-{unique}@collision-test.com"
+    admin_id = await _create_super_admin(admin_email)
+    token = _super_admin_token(admin_id, admin_email)
+
+    async with db_engine.begin() as conn:
+        await conn.execute(text(f'DROP SCHEMA IF EXISTS "{colliding_schema}" CASCADE'))
+        await conn.execute(text("DELETE FROM public.tenants WHERE slug = :b"), {"b": slug_b})
+        # Un schema deja present sous ce nom, sans lien avec le tenant B qu'on
+        # s'apprete a creer -- residu/collision, pas de ligne public.tenants dediee.
+        await conn.execute(text(f'CREATE SCHEMA "{colliding_schema}"'))
+
+    try:
+        resp = await client.post(
+            "/api/v1/admin/tenants",
+            json={
+                "slug": slug_b,
+                "name": "Admin Fresh B",
+                "admin_email": f"admin-{unique}@collision-test.com",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["code"] == "TENANT_SCHEMA_COLLISION"
+
+        async with db_engine.connect() as conn:
+            b_row_count = await conn.scalar(
+                text("SELECT count(*) FROM public.tenants WHERE slug = :slug"),
+                {"slug": slug_b},
+            )
+        assert b_row_count == 0
+    finally:
+        async with db_engine.begin() as conn:
+            await conn.execute(text(f'DROP SCHEMA IF EXISTS "{colliding_schema}" CASCADE'))
+            await conn.execute(text("DELETE FROM public.tenants WHERE slug = :b"), {"b": slug_b})
+            await conn.execute(text("DELETE FROM public.super_admins WHERE id = :id"), {"id": admin_id})
 
 
 # ---------------------------------------------------------------------------
