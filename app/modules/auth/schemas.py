@@ -3,11 +3,17 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-TENANT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$")
+# Source de verite unique pour la forme ET la longueur maximale acceptee pour le
+# slug d'un NOUVEAU tenant (derivee de la limite d'identifiant PostgreSQL, voir
+# app/core/database/session.py) : valider ici avec une regle plus laxiste que celle
+# utilisee pour construire le nom physique du schema romprait la garantie
+# anti-collision (deux slugs proches de l'ancienne limite de 64 caracteres peuvent
+# produire, une fois tronques par PostgreSQL a 63 octets, le meme nom de schema).
+from app.core.database import NEW_TENANT_SLUG_RE, TENANT_SLUG_MAX_LENGTH_FOR_CREATION
 
 
 class RegisterRequest(BaseModel):
-    tenant_slug: str = Field(min_length=1, max_length=64)
+    tenant_slug: str = Field(min_length=1, max_length=TENANT_SLUG_MAX_LENGTH_FOR_CREATION)
     tenant_name: str = Field(min_length=1, max_length=255)
     email: EmailStr
     password: str = Field(min_length=8)
@@ -16,7 +22,7 @@ class RegisterRequest(BaseModel):
     @field_validator("tenant_slug")
     @classmethod
     def validate_tenant_slug(cls, v: str) -> str:
-        if not TENANT_SLUG_RE.fullmatch(v):
+        if not NEW_TENANT_SLUG_RE.fullmatch(v):
             raise ValueError("tenant_slug must be lowercase alphanumeric with hyphens/underscores only")
         return v
 

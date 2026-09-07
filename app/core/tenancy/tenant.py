@@ -1,12 +1,23 @@
 import jwt
 from jwt.exceptions import PyJWTError as JWTError
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.database import engine, tenant_schema_name
+from app.core.http.errors import AppError
+
+# Code SQLSTATE PostgreSQL pour "duplicate_schema" (un CREATE SCHEMA cible un nom
+# deja pris). Comparer sur ce code plutot que sur le type Python de l'exception :
+# le dialecte asyncpg de SQLAlchemy enveloppe l'exception asyncpg d'origine dans sa
+# propre classe de compatibilite DBAPI (``exc.orig`` n'est donc PAS une instance de
+# ``asyncpg.exceptions.DuplicateSchemaError``, seulement son ``__cause__`` non
+# documente) -- le SQLSTATE, lui, est un identifiant stable du protocole PostgreSQL,
+# expose de la meme facon quel que soit le driver.
+POSTGRES_DUPLICATE_SCHEMA_SQLSTATE = "42P06"
 
 BYPASS_PATHS = {
     "/api/v1/auth/register",
@@ -60,10 +71,80 @@ class TenantMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+async def _execute_create_schema(executor, schema: str) -> None:
+    """Emet le ``CREATE SCHEMA`` et traduit une collision en ``AppError``.
+
+    ``executor`` est soit une ``AsyncConnection`` soit une ``AsyncSession`` --
+    les deux exposent une methode ``execute`` compatible, ce qui permet
+    d'utiliser cette fonction aussi bien en transaction dediee
+    (``create_tenant_schema``) qu'inseree dans la transaction d'un appelant
+    (``create_tenant_schema_on``).
+
+    [SECURITE] Pas de ``IF NOT EXISTS`` : un schema deja present sous ce nom
+    (collision de slugs, schema residuel d'un tenant precedent, creation
+    concurrente) doit faire echouer la creation plutot que d'etre reutilise en
+    silence -- un ``CREATE SCHEMA IF NOT EXISTS`` masquerait le fait qu'un
+    tenant s'appreterait a partager le schema, donc les donnees, d'un autre
+    tenant. PostgreSQL rejette lui-meme la creation d'un schema deja existant
+    (``DuplicateSchemaError``, SQLSTATE 42P06) : on s'appuie sur cette
+    contrainte atomique au niveau base plutot que sur un ``SELECT`` prealable,
+    qui laisserait une fenetre de course entre la verification et la creation.
+
+    Raises:
+        AppError: TENANT_SCHEMA_COLLISION (409) si un schema du meme nom existe deja.
+    """
+    try:
+        await executor.execute(text(f'CREATE SCHEMA "{schema}"'))
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) == POSTGRES_DUPLICATE_SCHEMA_SQLSTATE:
+            raise AppError(
+                "TENANT_SCHEMA_COLLISION",
+                "A PostgreSQL schema already exists for this tenant identifier",
+                409,
+                "tenant_slug",
+            ) from exc
+        raise
+
+
 async def create_tenant_schema(tenant_slug: str) -> None:
+    """Cree le schema PostgreSQL dedie a un tenant, dans sa propre transaction.
+
+    A n'utiliser que lorsque la creation du schema n'a pas besoin d'etre
+    atomique avec une autre ecriture (ex. un script d'admin ponctuel). Le
+    parcours normal de creation de tenant doit utiliser
+    ``create_tenant_schema_on`` (voir sa docstring) pour eviter qu'une
+    collision laisse une ligne ``public.tenants`` orpheline.
+
+    Raises:
+        AppError: TENANT_SCHEMA_COLLISION (409) si un schema du meme nom existe deja.
+    """
     schema = tenant_schema_name(tenant_slug)
     async with engine.begin() as conn:
-        await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        await _execute_create_schema(conn, schema)
+
+
+async def create_tenant_schema_on(executor, tenant_slug: str) -> None:
+    """Cree le schema PostgreSQL dedie a un tenant SUR LA TRANSACTION DE L'APPELANT.
+
+    [SECURITE] A utiliser dans le meme bloc transactionnel que l'insertion de
+    la ligne ``public.tenants`` correspondante, AVANT le ``commit`` de
+    l'appelant. Si le schema existe deja (collision de troncature, residu,
+    creation concurrente), ``AppError`` remonte et l'appelant n'a JAMAIS
+    besoin de compenser explicitement : le rollback implicite de la
+    transaction (session fermee sans commit, ou exception propagee hors du
+    ``async with`` du connection) annule aussi l'insertion -- aucune ligne
+    orpheline dans ``public.tenants`` n'est possible.
+
+    Args:
+        executor: ``AsyncConnection`` ou ``AsyncSession`` ouverte par l'appelant,
+            non encore commitee.
+        tenant_slug: Slug deja valide (voir ``NEW_TENANT_SLUG_RE``).
+
+    Raises:
+        AppError: TENANT_SCHEMA_COLLISION (409) si un schema du meme nom existe deja.
+    """
+    schema = tenant_schema_name(tenant_slug)
+    await _execute_create_schema(executor, schema)
 
 
 async def user_belongs_to_tenant(user_id: int, tenant_slug: str, email: str | None) -> bool:

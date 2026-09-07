@@ -23,7 +23,7 @@ from app.core.config import settings
 from app.core.database import tenant_schema_name
 from app.core.http.limiter import limiter
 from app.main import app
-from app.modules.auth.service import _provision_tenant_schema
+from app.core.tenancy.provisioning import _provision_tenant_schema
 
 DEFAULT_TEST_TENANT_SLUG = "test"
 LEGACY_TEST_TENANT_SLUG = "pizza_test"
