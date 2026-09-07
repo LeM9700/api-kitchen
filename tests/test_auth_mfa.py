@@ -8,6 +8,10 @@ verrouillent le comportement corrige.
 """
 
 import pyotp
+from sqlalchemy import text
+
+from app.core.database import get_tenant_session
+from app.core.services.crypto import decrypt_tenant_mfa_secret
 
 
 async def _register_admin(client, tenant_slug: str) -> tuple[str, str]:
@@ -103,6 +107,44 @@ async def test_admin_login_requires_mfa_code_once_enabled(client):
     )
     assert with_code.status_code == 200, with_code.text
     assert "access_token" in with_code.json()
+
+
+async def test_mfa_secret_is_encrypted_at_rest(client):
+    """Prompt 11 — le secret TOTP stocké en base n'est jamais le secret en clair.
+
+    [🔒 SÉCURITÉ] Un accès direct à la base (dump, requête ad hoc) ne doit pas
+    révéler immédiatement un secret MFA utilisable -- voir
+    app.core.services.crypto.encrypt_tenant_mfa_secret /
+    app.modules.auth.service.setup_mfa.
+    """
+    token, email = await _register_admin(client, "mfaencrypt")
+    headers = {"Authorization": f"Bearer {token}", "X-Tenant-Slug": "mfaencrypt"}
+
+    setup = await client.post("/api/v1/auth/mfa/setup", headers=headers)
+    assert setup.status_code == 200, setup.text
+    secret = setup.json()["secret"]
+
+    async with get_tenant_session("mfaencrypt") as session:
+        row = await session.execute(
+            text("SELECT mfa_secret FROM users WHERE email = :email"),
+            {"email": email},
+        )
+        stored = row.scalar_one()
+
+    assert stored != secret
+    assert secret not in stored
+    # Le texte chiffré doit bien redonner le secret d'origine via la clé dédiée.
+    assert decrypt_tenant_mfa_secret(stored) == secret
+
+    # Le login/confirm avec le code TOTP doit continuer de fonctionner malgré
+    # le chiffrement (le déchiffrement se fait uniquement à la vérification).
+    totp_code = pyotp.TOTP(secret).now()
+    confirm = await client.post(
+        "/api/v1/auth/mfa/confirm",
+        json={"totp_code": totp_code},
+        headers=headers,
+    )
+    assert confirm.status_code == 200, confirm.text
 
 
 async def test_admin_can_regenerate_mfa_backup_codes(client):

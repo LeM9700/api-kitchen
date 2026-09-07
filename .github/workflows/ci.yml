@@ -54,6 +54,11 @@ jobs:
       # du secret MFA super-admin s'executent reellement plutot que d'etre
       # skippes en mode "feature desactivee" (voir app/core/services/crypto.py).
       SUPER_ADMIN_MFA_ENCRYPTION_KEY: 9abH0wJC2EwEdjxsRk6DrARnN3jgeczh5sSoSRw-z_Y=
+      # Cle Fernet de TEST uniquement, DISTINCTE de SUPER_ADMIN_MFA_ENCRYPTION_KEY --
+      # necessaire pour que setup_mfa/confirm_mfa (comptes admin/staff tenant,
+      # app/modules/auth/service.py) chiffrent reellement le secret TOTP plutot
+      # que d'echouer avec CryptoNotConfigured (voir app/core/services/crypto.py).
+      TENANT_MFA_ENCRYPTION_KEY: SitfgkPQbdU1K7l_JMGPe7QCvl1ly8VhEpFPqAW8_Gg=
       # Cloudinary — valeurs fictives suffisantes pour les tests unitaires.
       # Les tests qui font de vrais appels Cloudinary doivent être marqués @pytest.mark.integration.
       CLOUDINARY_CLOUD_NAME: test-cloud

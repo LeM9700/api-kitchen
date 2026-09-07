@@ -163,10 +163,62 @@ async def user_belongs_to_tenant(user_id: int, tenant_slug: str, email: str | No
     ``issue_tokens`` dans app/modules/auth/service.py, et unique par tenant)
     a l'email reel de l'utilisateur cible ferme ce trou. Ce check doit etre
     appele avant toute utilisation de ``current_user`` issue d'un JWT.
+
+    Conserve pour compatibilite (utilise par le handler WebSocket et les
+    tests existants) -- pour le flux HTTP, ``get_current_user`` utilise
+    desormais ``get_live_tenant_user_state`` qui fait la meme verification
+    tout en renvoyant l'etat courant (role/permissions/is_active).
+    """
+    state = await get_live_tenant_user_state(user_id, tenant_slug)
+    return state is not None and email is not None and state.email == email
+
+
+class LiveTenantUserState:
+    """Etat courant (base) d'un utilisateur tenant, relu a chaque requete.
+
+    [🔒 SÉCURITÉ] Sert a ne JAMAIS faire confiance aux claims ``role`` /
+    ``permissions`` embarques dans un access token deja emis : un retrait de
+    permission ou une desactivation doit prendre effet immediatement, pas
+    seulement a l'expiration du token (voir ``app.core.http.deps.get_current_user``,
+    qui ecrase les claims du JWT par cet etat frais a chaque requete). C'est
+    la solution retenue ici en equivalent d'une "version de session" ou d'une
+    liste de revocation : comme ce module fait deja un aller-retour base par
+    requete pour valider l'appartenance au tenant, autant y lire l'etat
+    autoritaire plutot que de faire confiance a une copie figee dans le JWT.
+    """
+
+    __slots__ = ("id", "email", "role", "permissions", "is_active")
+
+    def __init__(self, id: int, email: str, role: str, permissions: list[str] | None, is_active: bool):
+        self.id = id
+        self.email = email
+        self.role = role
+        self.permissions = permissions
+        self.is_active = is_active
+
+
+async def get_live_tenant_user_state(user_id: int, tenant_slug: str) -> LiveTenantUserState | None:
+    """Relit l'etat courant (role/permissions/is_active/email) d'un utilisateur tenant.
+
+    Args:
+        user_id: ``sub`` du JWT.
+        tenant_slug: Slug du tenant reclame par le JWT.
+
+    Returns:
+        ``LiveTenantUserState`` si l'utilisateur existe dans ce schema tenant,
+        ``None`` sinon (schema inexistant, id inconnu...).
     """
     from app.core.database import get_tenant_session
     from app.modules.auth.models import User
 
     async with get_tenant_session(tenant_slug) as session:
         user = await session.get(User, user_id)
-        return user is not None and email is not None and user.email == email
+        if user is None:
+            return None
+        return LiveTenantUserState(
+            id=user.id,
+            email=user.email,
+            role=user.role,
+            permissions=user.permissions,
+            is_active=user.is_active,
+        )

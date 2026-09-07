@@ -68,12 +68,15 @@ async def create_user(
 async def update_user_permissions(
     user_id: int,
     body: AdminUserPermissionsUpdate,
+    request: Request,
     current_user: dict = Depends(require_role("admin")),
 ) -> AdminUserOut:
+    redis = getattr(request.app.state, "arq_pool", None)
     return await users_service.update_user_permissions(
         user_id,
         current_user["tenant_slug"],
         body.permissions,
+        redis=redis,
     )
 
 

@@ -21,6 +21,11 @@ from app.core.auth.security import (
     get_password_hash,
     verify_password,
 )
+from app.core.services.crypto import (
+    CryptoNotConfigured,
+    decrypt_tenant_mfa_secret,
+    encrypt_tenant_mfa_secret,
+)
 from app.core.tenancy.provisioning import provision_tenant
 from app.modules.auth.models import RefreshToken, User
 
@@ -124,12 +129,33 @@ def _hash_backup_codes(codes: list[str]) -> list[str]:
     return [get_password_hash(code) for code in codes]
 
 
-def _verify_totp(secret: str, code: str | None) -> bool:
-    if not code:
+def _verify_totp(secret: str | None, code: str | None) -> bool:
+    if not code or not secret:
         return False
     import pyotp
 
     return bool(pyotp.TOTP(secret).verify(code.strip(), valid_window=1))
+
+
+def _decrypt_mfa_secret_for_verification(ciphertext: str | None) -> str | None:
+    """Dechiffre ``user.mfa_secret`` pour une verification TOTP, sans jamais lever.
+
+    [🔒 SÉCURITÉ] Chemin de verification uniquement (login, confirm, regenerate
+    backup codes) : une cle absente/rotee ou un texte corrompu ne doivent
+    jamais faire planter l'authentification (500) -- ils font simplement
+    echouer la verification TOTP (``_verify_totp`` retourne False sur un
+    secret ``None``), l'appelant retombe alors sur le code d'erreur MFA
+    habituel (401/400 INVALID_MFA_CODE). Ni la cle ni le texte chiffre ne
+    sont jamais inclus dans un message d'exception ou un log ici.
+    """
+    if not ciphertext:
+        return None
+    from cryptography.fernet import InvalidToken
+
+    try:
+        return decrypt_tenant_mfa_secret(ciphertext)
+    except (CryptoNotConfigured, InvalidToken):
+        return None
 
 
 def _build_mfa_payload(user: User, secret: str, backup_codes: list[str]) -> dict:
@@ -166,7 +192,15 @@ async def setup_mfa(tenant_slug: str, user_id: int) -> dict:
 
         secret = pyotp.random_base32()
         backup_codes = _generate_backup_codes()
-        user.mfa_secret = secret
+        # [🔒 SÉCURITÉ] Le secret TOTP n'est JAMAIS persisté en clair -- seul le
+        # texte chiffré (Fernet, clé dédiée TENANT_MFA_ENCRYPTION_KEY) est
+        # stocké dans users.mfa_secret. `secret` en clair ne survit que le
+        # temps de cette fonction, pour construire le QR code/otpauth URI
+        # retourné une seule fois à l'admin (voir _build_mfa_payload). Fail
+        # closed : si la clé n'est pas configurée, encrypt_tenant_mfa_secret
+        # lève CryptoNotConfigured et aucune ligne n'est modifiée (rollback
+        # implicite, pas de commit).
+        user.mfa_secret = encrypt_tenant_mfa_secret(secret)
         user.mfa_enabled = False
         user.mfa_backup_codes = _hash_backup_codes(backup_codes)
         await session.commit()
@@ -181,7 +215,7 @@ async def confirm_mfa(tenant_slug: str, user_id: int, totp_code: str | None) -> 
             raise AppError("UNAUTHORIZED", "User not found", 401)
         if user.role not in ("super-admin", "admin"):
             raise AppError("FORBIDDEN", "MFA confirmation is reserved to admin/super-admin users", 403)
-        if not user.mfa_secret or not _verify_totp(user.mfa_secret, totp_code):
+        if not _verify_totp(_decrypt_mfa_secret_for_verification(user.mfa_secret), totp_code):
             raise AppError("INVALID_MFA_CODE", "Invalid MFA code", 400, "totp_code")
 
         user.mfa_enabled = True
@@ -202,7 +236,7 @@ async def regenerate_mfa_backup_codes(
             raise AppError("FORBIDDEN", "MFA backup codes are reserved to admin/super-admin users", 403)
         if not user.mfa_enabled or not user.mfa_secret:
             raise AppError("MFA_NOT_ENABLED", "MFA is not enabled", 400)
-        if not _verify_totp(user.mfa_secret, totp_code):
+        if not _verify_totp(_decrypt_mfa_secret_for_verification(user.mfa_secret), totp_code):
             raise AppError("INVALID_MFA_CODE", "Invalid MFA code", 400, "totp_code")
 
         backup_codes = _generate_backup_codes()
@@ -217,7 +251,7 @@ async def _verify_login_mfa(session: AsyncSession, user: User, mfa_code: str | N
     if not user.mfa_secret:
         raise AppError("MFA_REQUIRED", "MFA setup incomplete", 401, "mfa_code")
 
-    if _verify_totp(user.mfa_secret, mfa_code):
+    if _verify_totp(_decrypt_mfa_secret_for_verification(user.mfa_secret), mfa_code):
         return
 
     backup_hashes = list(user.mfa_backup_codes or [])
@@ -363,8 +397,24 @@ async def refresh_token(token: str) -> dict:
     2. Fallback O(n*bcrypt) pour les tokens sans token_lookup (pre-migration 0003).
     3. Verification bcrypt sur le seul enregistrement trouve.
 
-    [SECURITE] Le token revoque est marque revoked_at avant l'emission du nouveau
-    (rotation monotone). En cas d'erreur, le rollback annule la revocation.
+    [🔒 SÉCURITÉ] Revalide ``user.is_active`` a chaque refresh -- un compte
+    desactive apres l'emission d'un refresh token ne doit plus jamais pouvoir
+    en tirer un nouvel access token, meme si son refresh token n'a pas encore
+    expire naturellement.
+
+    [🔒 SÉCURITÉ] Rotation atomique par UPDATE conditionnel : la ligne n'est
+    marquee ``revoked_at`` QUE si elle etait encore ``revoked_at IS NULL`` au
+    moment de l'UPDATE (``rowcount`` sert de verrou optimiste, meme idiome que
+    ``app.modules.super_admin.service.refresh_session``). Si deux requetes
+    concurrentes presentent le MEME refresh token, PostgreSQL serialise les
+    deux UPDATE sur la meme ligne (verrou de ligne implicite) : la premiere a
+    committer gagne, la seconde relit ``revoked_at`` deja pose et affecte 0
+    ligne -- elle est rejetee au lieu d'emettre elle aussi une nouvelle paire
+    de tokens. Sans ceci, un simple ``current.revoked_at = ...`` (mutation ORM
+    suivie d'un commit) laisse une fenetre ou deux requetes concurrentes
+    lisent toutes les deux ``revoked_at IS NULL`` avant que l'une ou l'autre
+    ne commite, et produisent chacune une paire de tokens valide pour le MEME
+    refresh token consomme une seule fois.
 
     Args:
         token: Refresh token JWT en clair extrait du corps de la requete.
@@ -373,8 +423,10 @@ async def refresh_token(token: str) -> dict:
         Dictionnaire {"access_token": str, "refresh_token": str}.
 
     Raises:
-        AppError: INVALID_TOKEN (401) si le token est invalide, expire ou revoque.
-        AppError: UNAUTHORIZED (401) si l'utilisateur associe est introuvable.
+        AppError: INVALID_TOKEN (401) si le token est invalide, expire, deja
+            tourne ou revoque (y compris par une requete concurrente gagnante).
+        AppError: UNAUTHORIZED (401) si l'utilisateur associe est introuvable
+            ou desactive.
     """
     try:
         payload = decode_token(token)
@@ -386,6 +438,7 @@ async def refresh_token(token: str) -> dict:
     tenant_slug = payload["tenant_slug"]
     user_id = int(payload["sub"])
     lookup = compute_token_lookup(token)
+    now = datetime.now(timezone.utc)
 
     async with get_tenant_session(tenant_slug) as session:
         # Phase 1 : lookup O(1) via HMAC index.
@@ -413,10 +466,20 @@ async def refresh_token(token: str) -> dict:
             if not verify_password(token, current.token_hash):
                 raise AppError("INVALID_TOKEN", "Refresh token is invalid or revoked", 401)
 
-        current.revoked_at = datetime.now(timezone.utc)
         user = await session.get(User, user_id)
         if user is None:
             raise AppError("UNAUTHORIZED", "User not found", 401)
+        if not user.is_active:
+            raise AppError("UNAUTHORIZED", "Account is disabled", 401)
+
+        claim = await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.id == current.id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        if claim.rowcount != 1:
+            raise AppError("INVALID_TOKEN", "Refresh token is invalid or revoked", 401)
+
         access, refresh, session_id = await issue_tokens(session, user, payload["tenant_id"], tenant_slug)
         await session.commit()
         return {"access_token": access, "refresh_token": refresh, "session_id": session_id}
@@ -511,6 +574,14 @@ async def revoke_all_sessions(
 ) -> None:
     """Revoke all active sessions for a user, optionally keeping the current one.
 
+    [🔒 SÉCURITÉ] Quand ``revoke_current=True`` (deconnexion complete "partout"),
+    un signal de revocation est publie pour fermer les WebSockets ouverts --
+    voir ``publish_session_revoked``. Ce n'est PAS fait quand
+    ``revoke_current=False`` ("deconnecter mes autres appareils") : la
+    WebSocket courante n'est pas rattachee a un ``session_id`` particulier
+    (voir ``issue_tokens``), donc publier ici fermerait aussi, a tort, la
+    connexion que l'utilisateur vient explicitement de choisir de garder.
+
     Args:
         user_id: ID of the authenticated user.
         tenant_slug: Tenant schema to query.
@@ -518,7 +589,8 @@ async def revoke_all_sessions(
             when revoke_current=False.
         revoke_current: When True, revoke ALL sessions including the current one.
             When False, keep the session identified by current_session_id.
-        redis: Unused at service level — JTI revocation is handled in the router.
+        redis: ArqRedis instance (optionnel) — utilisée pour signaler la
+            fermeture des WebSockets quand ``revoke_current=True``.
     """
     now = datetime.now(timezone.utc)
     async with get_tenant_session(tenant_slug) as session:
@@ -530,6 +602,10 @@ async def revoke_all_sessions(
             stmt = stmt.where(RefreshToken.id != current_session_id)
         await session.execute(stmt.values(revoked_at=now))
         await session.commit()
+
+    if redis is not None and revoke_current:
+        from app.core.auth.token_revocation import publish_session_revoked
+        await publish_session_revoked(redis, user_id, tenant_slug, reason="sessions_revoked")
 
 
 async def forgot_password(body, arq_pool=None) -> None:
@@ -628,8 +704,9 @@ async def reset_password(body, redis=None) -> dict:
 
     # Force re-login via user_disabled flag Redis
     if redis is not None:
-        from app.core.auth.token_revocation import flag_user_disabled
+        from app.core.auth.token_revocation import flag_user_disabled, publish_session_revoked
         await flag_user_disabled(redis, user.id, body.tenant_slug)
+        await publish_session_revoked(redis, user.id, body.tenant_slug, reason="password_reset")
 
     return {"message": "Password reset successfully"}
 

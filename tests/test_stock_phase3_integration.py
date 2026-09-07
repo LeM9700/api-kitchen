@@ -42,6 +42,7 @@ def auth_user_override():
         "tenant_slug": "default",
         "role": "staff",
         "email": "staff@example.test",
+        "permissions": ["*"],
     }
 
     async def _current_user() -> dict:

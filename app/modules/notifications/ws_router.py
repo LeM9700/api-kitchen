@@ -116,6 +116,37 @@ async def _get_user_lock(key: str) -> asyncio.Lock:
 # ---------------------------------------------------------------------------
 
 
+async def _close_user_connections(tenant_slug: str, user_id: int, code: int, reason: str) -> None:
+    """Ferme immediatement toutes les WebSockets locales d'un utilisateur.
+
+    [🔒 SÉCURITÉ] Appelee par ``_redis_subscriber`` a la reception d'un
+    message sur le canal ``session_revoked:*`` (voir
+    ``app.core.auth.token_revocation.publish_session_revoked``), publie
+    lorsqu'un compte est desactive, ses permissions modifiees, ou toutes ses
+    sessions revoquees. Ne touche que les connexions de l'instance courante --
+    en multi-instance Railway, chaque instance recoit le meme message pub/sub
+    et ferme ses propres connexions locales. Le nettoyage de l'etat
+    (``_connections``, ``ws:connections:*`` Redis) est laisse au bloc
+    ``finally`` de ``notifications_ws`` : fermer la socket ici suffit a faire
+    lever ``WebSocketDisconnect`` dans la boucle ``_ws_handler``.
+
+    Args:
+        tenant_slug: Slug du tenant.
+        user_id: Identifiant de l'utilisateur dont les connexions doivent fermer.
+        code: Code de fermeture WebSocket a envoyer.
+        reason: Motif court transmis au client.
+    """
+    key = f"{tenant_slug}:{user_id}"
+    async with _connections_lock:
+        sockets = set(_connections.get(key, set()))
+
+    for ws in sockets:
+        try:
+            await ws.close(code=code, reason=reason)
+        except Exception as exc:
+            logger.debug("_close_user_connections: echec fermeture key=%s: %s", key, exc)
+
+
 async def broadcast_to_user(
     tenant_slug: str,
     user_id: int,
@@ -187,18 +218,27 @@ async def _redis_subscriber() -> None:
         try:
             redis = await aioredis.from_url(settings.redis_url, decode_responses=True)
             pubsub = redis.pubsub()
-            await pubsub.psubscribe("notif:*")
-            logger.info("Redis subscriber: abonne a notif:*")
+            await pubsub.psubscribe("notif:*", "session_revoked:*")
+            logger.info("Redis subscriber: abonne a notif:* et session_revoked:*")
 
             async for raw_msg in pubsub.listen():
                 if raw_msg["type"] != "pmessage":
                     continue
-                channel: str = raw_msg["channel"]  # "notif:{tenant_slug}:{user_id}"
+                channel: str = raw_msg["channel"]  # "notif:{tenant_slug}:{user_id}" ou "session_revoked:{tenant_slug}:{user_id}"
                 try:
                     parts = channel.split(":", 2)
                     if len(parts) != 3:
                         continue
-                    _, tenant_slug, user_id_str = parts
+                    prefix, tenant_slug, user_id_str = parts
+                    if prefix == "session_revoked":
+                        payload = json.loads(raw_msg["data"])
+                        await _close_user_connections(
+                            tenant_slug,
+                            int(user_id_str),
+                            code=4009,
+                            reason=payload.get("reason", "session_revoked"),
+                        )
+                        continue
                     message = json.loads(raw_msg["data"])
                     await broadcast_to_user(tenant_slug, int(user_id_str), message)
                 except Exception as exc:
@@ -234,12 +274,22 @@ async def _ws_handler(
     tenant_slug: str,
     user_id: int,
     connection_id: str,
+    redis=None,
+    jti: str | None = None,
 ) -> None:
     """Boucle principale WebSocket avec heartbeat serveur.
 
     Attend des messages entrants avec un timeout de HEARTBEAT_INTERVAL secondes.
     A chaque expiration, envoie un ping et attend le pong dans HEARTBEAT_TIMEOUT
     secondes. Ferme la connexion zombie si le pong n'arrive pas.
+
+    [🔒 SÉCURITÉ] A chaque cycle de heartbeat (au plus HEARTBEAT_INTERVAL
+    secondes), revalide que le compte n'a pas ete desactive entre-temps et
+    que l'access token utilise pour l'authentification WS n'a pas ete revoque
+    -- filet de securite complementaire au signal pub/sub immediat
+    (``session_revoked:*``, voir ``_close_user_connections``) pour le cas ou
+    ce message aurait ete manque (redemarrage de l'abonne Redis entre la
+    publication et la reception).
 
     Les messages {"type": "pong"} sont consommes silencieusement.
     Les autres types de messages entrants sont ignores (protocole unidirectionnel
@@ -250,6 +300,8 @@ async def _ws_handler(
         tenant_slug: Slug du tenant (pour les logs).
         user_id: Identifiant de l'utilisateur authentifie (pour les logs).
         connection_id: UUID hex de cette connexion (pour les logs).
+        redis: ArqRedis instance, pour la revalidation periodique (optionnel).
+        jti: ``jti`` de l'access token ayant authentifie cette connexion.
     """
     while True:
         try:
@@ -268,7 +320,26 @@ async def _ws_handler(
             )
 
         except asyncio.TimeoutError:
-            # Aucun message depuis HEARTBEAT_INTERVAL -> envoyer un ping
+            # Aucun message depuis HEARTBEAT_INTERVAL -> revalider la session puis pinguer.
+            if redis is not None:
+                try:
+                    revoked = await is_user_disabled(redis, user_id, tenant_slug) or (
+                        bool(jti) and await is_jti_revoked(redis, jti)
+                    )
+                except Exception as exc:
+                    logger.debug("WS revalidation error: conn=%s error=%s", connection_id, exc)
+                    revoked = False
+                if revoked:
+                    logger.info(
+                        "WS ferme (session revoquee): user_id=%s tenant=%s conn=%s",
+                        user_id, tenant_slug, connection_id,
+                    )
+                    try:
+                        await websocket.close(code=4009, reason="session_revoked")
+                    except Exception:
+                        pass
+                    break
+
             try:
                 await websocket.send_json({"type": "ping", "timestamp": _utcnow()})
             except Exception:
@@ -628,7 +699,10 @@ async def notifications_ws(
     # Boucle principale (heartbeat + reception messages)
     # -------------------------------------------------------------------------
     try:
-        await _ws_handler(websocket, tenant_slug, user_id, connection_id)
+        await _ws_handler(
+            websocket, tenant_slug, user_id, connection_id,
+            redis=redis, jti=str(jti) if jti else None,
+        )
     except WebSocketDisconnect:
         logger.info(
             "WS deconnecte: user_id=%s tenant=%s conn=%s",

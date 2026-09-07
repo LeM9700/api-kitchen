@@ -78,6 +78,13 @@ async def create_user(tenant_slug: str, body) -> dict:
     L'email est marqué comme vérifié immédiatement (comptes créés par admin
     ne nécessitent pas de vérification email).
 
+    [🔒 SÉCURITÉ] ``body.permissions`` non fourni (``None``) est normalisé en
+    liste vide plutôt que persisté tel quel : ``permissions=None`` ne doit
+    jamais représenter "accès large" pour un compte staff (voir
+    ``app.core.http.deps.has_permission`` et ``docs/permissions.md``). Un
+    nouveau compte staff démarre donc sans aucun droit fin, à ajouter
+    explicitement via ``PATCH /admin/users/{id}/permissions``.
+
     Args:
         tenant_slug: Slug du tenant dans lequel créer l'utilisateur.
         body: AdminUserCreate validé (email, full_name, role).
@@ -99,7 +106,7 @@ async def create_user(tenant_slug: str, body) -> dict:
             full_name=body.full_name,
             password_hash=get_password_hash(temp_password),
             role=body.role,
-            permissions=body.permissions,
+            permissions=body.permissions if body.permissions is not None else [],
             must_change_password=True,
             # [SECURITE] Admin-created accounts skip email verification.
             email_verified_at=datetime.now(timezone.utc),
@@ -115,7 +122,33 @@ async def create_user(tenant_slug: str, body) -> dict:
     }
 
 
-async def update_user_permissions(user_id: int, tenant_slug: str, permissions: list[str]) -> dict:
+async def update_user_permissions(
+    user_id: int, tenant_slug: str, permissions: list[str], redis=None
+) -> dict:
+    """Met à jour la liste de permissions fines d'un staff/admin.
+
+    [🔒 SÉCURITÉ] Un changement de permissions révoque immédiatement toutes
+    les sessions (refresh tokens) actives de l'utilisateur et signale la
+    fermeture de ses WebSockets ouverts : le principe de moindre privilège
+    n'a de sens que si un retrait de droit s'applique tout de suite plutôt
+    qu'à la prochaine expiration naturelle du token. Les requêtes HTTP déjà
+    en vol avec l'ancien access token sont, elles, couvertes sans latence par
+    la relecture live des permissions dans ``app.core.http.deps.get_current_user``
+    (``get_live_tenant_user_state``) : cette révocation de session force en
+    plus une reconnexion propre côté client.
+
+    Args:
+        user_id: Identifiant de l'utilisateur.
+        tenant_slug: Slug du tenant.
+        permissions: Nouvelle liste de permissions explicite.
+        redis: ArqRedis instance (optionnel, depuis app.state.arq_pool) —
+            utilisée pour signaler la fermeture des WebSockets.
+
+    Raises:
+        AppError: NOT_FOUND (404) si l'utilisateur n'existe pas.
+        AppError: INVALID_ROLE (422) si le rôle n'est ni staff ni admin.
+    """
+    now = datetime.now(timezone.utc)
     async with get_tenant_session(tenant_slug) as session:
         user = await session.get(User, user_id)
         if user is None:
@@ -123,9 +156,14 @@ async def update_user_permissions(user_id: int, tenant_slug: str, permissions: l
         if user.role not in {"staff", "admin"}:
             raise AppError("INVALID_ROLE", "Permissions can only be assigned to staff/admin users", 422, "role")
         user.permissions = permissions
+        await session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
         await session.commit()
         await session.refresh(user)
-        return {
+        result = {
             "id": user.id,
             "email": user.email,
             "full_name": user.full_name,
@@ -136,6 +174,12 @@ async def update_user_permissions(user_id: int, tenant_slug: str, permissions: l
             "created_at": user.created_at,
             "must_change_password": user.must_change_password,
         }
+
+    if redis is not None:
+        from app.core.auth.token_revocation import publish_session_revoked
+        await publish_session_revoked(redis, user_id, tenant_slug, reason="permissions_changed")
+
+    return result
 
 
 async def deactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
@@ -169,8 +213,9 @@ async def deactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
         await session.commit()
 
     if redis is not None:
-        from app.core.auth.token_revocation import flag_user_disabled
+        from app.core.auth.token_revocation import flag_user_disabled, publish_session_revoked
         await flag_user_disabled(redis, user_id, tenant_slug)
+        await publish_session_revoked(redis, user_id, tenant_slug, reason="account_disabled")
 
 
 async def reactivate_user(user_id: int, tenant_slug: str, redis=None) -> None:
@@ -235,7 +280,8 @@ async def admin_reset_password(user_id: int, tenant_slug: str, redis=None) -> di
         await session.commit()
 
     if redis is not None:
-        from app.core.auth.token_revocation import flag_user_disabled
+        from app.core.auth.token_revocation import flag_user_disabled, publish_session_revoked
         await flag_user_disabled(redis, user_id, tenant_slug)
+        await publish_session_revoked(redis, user_id, tenant_slug, reason="password_reset")
 
     return {"temporary_password": temp_password}

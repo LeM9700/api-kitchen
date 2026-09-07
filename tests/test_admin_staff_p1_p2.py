@@ -187,13 +187,23 @@ async def test_terminal_intent_uses_local_fallback_when_stripe_is_unavailable(mo
     assert result["client_secret"] == "local_terminal_55"
 
 
-def test_fine_permissions_are_backward_compatible_and_authoritative():
+def test_fine_permissions_deny_by_default_for_staff_without_explicit_list():
+    """Un staff sans permissions explicites ne peut agir sur aucune permission fine.
+
+    [🔒 SÉCURITÉ] ``permissions=None`` (ou ``[]``) sur un compte staff n'est
+    PLUS traité comme un accès total legataire -- voir
+    ``docs/permissions.md`` et la migration
+    ``0056_staff_explicit_permissions``. Admin garde son accès total, non
+    conditionné par ``permissions``.
+    """
     from app.core.http.deps import has_permission
 
     assert has_permission({"role": "admin", "permissions": []}, "orders:write") is True
-    assert has_permission({"role": "staff", "permissions": None}, "orders:write") is True
+    assert has_permission({"role": "staff", "permissions": None}, "orders:write") is False
+    assert has_permission({"role": "staff", "permissions": []}, "orders:write") is False
     assert has_permission({"role": "staff", "permissions": ["orders:read"]}, "orders:read") is True
     assert has_permission({"role": "staff", "permissions": ["orders:read"]}, "orders:write") is False
+    assert has_permission({"role": "staff", "permissions": ["*"]}, "orders:write") is True
 
 
 def test_p1_p2_openapi_paths_are_registered():
