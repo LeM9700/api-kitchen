@@ -2,10 +2,15 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import text
 
-from app.core.database import get_public_session, get_tenant_session
+from app.core.database import (
+    NEW_TENANT_SLUG_RE,
+    TENANT_SLUG_MAX_LENGTH_FOR_CREATION,
+    get_public_session,
+    get_tenant_session,
+)
 from app.core.http.deps import get_arq_pool, require_role
 from app.core.tenancy.tenant import create_tenant_schema
 from app.modules.admin.tenants import service as tenant_service
@@ -20,11 +25,22 @@ router = APIRouter()
 
 
 class TenantCreate(BaseModel):
-    slug: str
+    # [SECURITE] Meme regle que le flux d'inscription standard (RegisterRequest,
+    # app/modules/auth/schemas.py) : sans cette validation, ce parcours acceptait
+    # n'importe quelle chaine (longueur et caracteres arbitraires), y compris des
+    # slugs susceptibles de faire collision une fois tronques par PostgreSQL.
+    slug: str = Field(min_length=1, max_length=TENANT_SLUG_MAX_LENGTH_FOR_CREATION)
     name: str
     plan: str = "starter"
     admin_email: EmailStr
     admin_password: str | None = None
+
+    @field_validator("slug")
+    @classmethod
+    def validate_slug(cls, v: str) -> str:
+        if not NEW_TENANT_SLUG_RE.fullmatch(v):
+            raise ValueError("slug must be lowercase alphanumeric with hyphens/underscores only")
+        return v
 
 
 class TenantCreateResponse(BaseModel):
