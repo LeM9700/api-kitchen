@@ -23,6 +23,7 @@ from app.core.http.limiter import limiter
 from app.core.http.logging_config import configure_logging, set_request_id
 from app.core.http.security_headers import SecurityHeadersMiddleware
 from app.core.tenancy.tenant import TenantMiddleware
+from app.modules.notifications import ws_router
 from app.modules.payments import service as payments_service
 from worker.main import get_redis_settings
 
@@ -71,6 +72,12 @@ async def lifespan(app: FastAPI):
     Singletons exposes via app.state :
     - motor_client : instance AsyncIOMotorClient reutilisee par toutes les routes admin.
     - arq_pool : pool de connexions Redis arq reutilise pour l'enqueue des jobs.
+    - ws_redis_subscriber_task : tache background unique qui ecoute notif:*/
+      session_revoked:* et alimente les WebSockets de notifications (voir
+      app.modules.notifications.ws_router._redis_subscriber) -- sans ce
+      demarrage, une WebSocket ouverte ne recoit ni les notifications
+      applicatives ni le signal de fermeture immediate suite a une
+      desactivation/revocation/retrait de permissions.
 
     Args:
         app: Instance FastAPI en cours de demarrage.
@@ -83,6 +90,11 @@ async def lifespan(app: FastAPI):
     init_cloudinary(settings)
     app.state.motor_client = AsyncIOMotorClient(settings.mongo_url)
     app.state.arq_pool = await create_pool(get_redis_settings())
+    # [🔒 SÉCURITÉ] Une seule tache par process API : le lifespan FastAPI
+    # n'entre qu'une fois par process (pas de re-entree sur un meme `app`
+    # deja demarre), donc pas de garde supplementaire necessaire ici contre
+    # un double-demarrage -- voir _redis_subscriber pour le detail.
+    app.state.ws_redis_subscriber_task = asyncio.create_task(ws_router._redis_subscriber())
 
     # Ensure TTL index (90 days) on all existing login_events_* collections.
     # Non-blocking — does not delay startup.
@@ -105,6 +117,11 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- shutdown ---
+    app.state.ws_redis_subscriber_task.cancel()
+    try:
+        await app.state.ws_redis_subscriber_task
+    except asyncio.CancelledError:
+        pass
     try:
         await app.state.arq_pool.close()
         await app.state.arq_pool.wait_closed()

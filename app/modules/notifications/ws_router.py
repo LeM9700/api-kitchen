@@ -5,9 +5,17 @@ Architecture :
   client repond avec le JWT (jamais en query param - invisible dans les logs).
 - Connexions stockees localement (_connections) ET dans Redis (SADD/SREM/SCARD)
   pour le decompte cross-instance Railway.
-- Redis pub/sub : _redis_subscriber ecoute notif:* et dispatche aux WS locaux.
-  A demarrer depuis le lifespan de main.py.
-- Heartbeat serveur : ping toutes les 30s, fermeture zombie si pong absent dans 10s.
+- Redis pub/sub (redis.asyncio, PAS aioredis) : _redis_subscriber ecoute
+  notif:* (diffusion de notifications) et session_revoked:* (fermeture
+  immediate suite a une desactivation/revocation/retrait de permissions,
+  voir app.core.auth.token_revocation.publish_session_revoked). Demarree et
+  annulee proprement par le lifespan de app.main:lifespan -- une seule tache
+  par instance, stockee sur app.state.ws_redis_subscriber_task.
+- Heartbeat serveur : ping toutes les 30s, fermeture zombie si pong absent
+  dans 10s ; a chaque cycle, revalide aussi l'etat AUTORITAIRE en PostgreSQL
+  (is_active) et, si Redis est disponible, les flags de revocation rapides --
+  voir _is_session_revoked_or_inactive et la note [⚠️ PROD] de _ws_handler
+  sur la limite de ce filet vis-a-vis d'un simple retrait de permissions.
 - Limite de 5 connexions simultanees par user (SCARD + Lock par user).
 
 Sécurité IP (ordre d'exécution au début de notifications_ws) :
@@ -30,7 +38,7 @@ from app.core.auth.token_revocation import is_jti_revoked, is_user_disabled
 from app.core.auth.security import decode_token
 from app.core.database import get_public_session
 from app.core.http.deps import get_client_ip_ws
-from app.core.tenancy.tenant import user_belongs_to_tenant
+from app.core.tenancy.tenant import get_live_tenant_user_state, user_belongs_to_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -190,33 +198,28 @@ async def broadcast_to_user(
 
 
 async def _redis_subscriber() -> None:
-    """Coroutine background : ecoute notif:* sur Redis et dispatche localement.
+    """Coroutine background : ecoute notif:*/session_revoked:* sur Redis et dispatche localement.
 
-    Doit etre demarree depuis le lifespan de main.py et annulee au shutdown.
-    Cree une connexion Redis dedicee (le pool arq ne supporte pas pubsub).
-    Reconnexion automatique avec retry toutes les secondes en cas de coupure Redis.
+    Demarree depuis le lifespan de ``app.main`` (``app.state.ws_redis_subscriber_task``)
+    et annulee proprement au shutdown -- une seule instance de cette coroutine
+    par process API, jamais recreee tant que le process vit (voir le lifespan
+    pour la garde contre un double-demarrage). Cree une connexion Redis dediee
+    (le pool arq ne supporte pas pubsub). Reconnexion automatique avec retry
+    toutes les secondes en cas de coupure Redis.
 
-    Exemple d'integration dans main.py::
-
-        from app.modules.notifications import ws_router
-
-        @asynccontextmanager
-        async def lifespan(app):
-            task = asyncio.create_task(ws_router._redis_subscriber())
-            yield
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    [🔒 SÉCURITÉ] Utilise ``redis.asyncio`` (le paquet ``redis>=5.0`` deja une
+    dependance du projet, voir ``pyproject.toml`` et ``app.main::health_ready``
+    pour le meme import) -- PAS ``aioredis`` (paquet tiers absent des
+    dependances, abandonne en amont au profit de ``redis-py``'s built-in
+    asyncio support depuis la 4.2).
     """
-    import aioredis
+    from redis.asyncio import from_url as redis_from_url
 
     while True:
         redis = None
         pubsub = None
         try:
-            redis = await aioredis.from_url(settings.redis_url, decode_responses=True)
+            redis = redis_from_url(settings.redis_url, decode_responses=True)
             pubsub = redis.pubsub()
             await pubsub.psubscribe("notif:*", "session_revoked:*")
             logger.info("Redis subscriber: abonne a notif:* et session_revoked:*")
@@ -269,6 +272,57 @@ async def _redis_subscriber() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _is_session_revoked_or_inactive(
+    redis, tenant_slug: str, user_id: int, jti: str | None
+) -> bool:
+    """Revalide, a un instant donne, si une WebSocket doit etre fermee.
+
+    [🔒 SÉCURITÉ] Deux sources, complementaires :
+    1. Redis (rapide, optionnel) : flags ``is_user_disabled``/``is_jti_revoked``
+       -- poses par ``flag_user_disabled``/``revoke_jti``, disparaissent si
+       Redis est indisponible ou a ete vide.
+    2. PostgreSQL (autoritaire, TOUJOURS consulte) : ``users.is_active`` via
+       ``get_live_tenant_user_state`` -- fonctionne meme sans Redis, source de
+       verite finale. Un utilisateur supprime (etat introuvable) est traite
+       comme inactif.
+
+    Ne verifie PAS les permissions fines : voir la note [⚠️ PROD] de
+    ``_ws_handler`` sur cette limite assumee.
+
+    Args:
+        redis: ArqRedis instance ou None si indisponible.
+        tenant_slug: Slug du tenant.
+        user_id: Identifiant de l'utilisateur authentifie sur cette WS.
+        jti: ``jti`` de l'access token ayant authentifie cette WS (optionnel).
+
+    Returns:
+        True si la connexion doit etre fermee (compte inactif ou signal de
+        revocation Redis actif), False sinon.
+    """
+    if redis is not None:
+        try:
+            if await is_user_disabled(redis, user_id, tenant_slug):
+                return True
+            if jti and await is_jti_revoked(redis, jti):
+                return True
+        except Exception as exc:
+            logger.debug(
+                "WS revalidation Redis error: tenant=%s user_id=%s error=%s",
+                tenant_slug, user_id, exc,
+            )
+
+    try:
+        live_state = await get_live_tenant_user_state(user_id, tenant_slug)
+    except Exception as exc:
+        logger.debug(
+            "WS revalidation PostgreSQL error: tenant=%s user_id=%s error=%s",
+            tenant_slug, user_id, exc,
+        )
+        return False
+
+    return live_state is None or not live_state.is_active
+
+
 async def _ws_handler(
     websocket: WebSocket,
     tenant_slug: str,
@@ -284,12 +338,29 @@ async def _ws_handler(
     secondes. Ferme la connexion zombie si le pong n'arrive pas.
 
     [🔒 SÉCURITÉ] A chaque cycle de heartbeat (au plus HEARTBEAT_INTERVAL
-    secondes), revalide que le compte n'a pas ete desactive entre-temps et
-    que l'access token utilise pour l'authentification WS n'a pas ete revoque
-    -- filet de securite complementaire au signal pub/sub immediat
-    (``session_revoked:*``, voir ``_close_user_connections``) pour le cas ou
-    ce message aurait ete manque (redemarrage de l'abonne Redis entre la
-    publication et la reception).
+    secondes, 30s par defaut), revalide l'etat AUTORITAIRE en PostgreSQL
+    (``is_active``, voir ``_is_session_revoked_or_inactive``) et, quand Redis
+    est disponible, les flags rapides ``is_user_disabled``/``is_jti_revoked``.
+    C'est un filet de securite qui fonctionne MEME SANS Redis -- le signal
+    pub/sub ``session_revoked:*`` (voir ``_close_user_connections`` et
+    ``publish_session_revoked``) reste le mecanisme de fermeture IMMEDIATE
+    (quasi temps reel, cross-instance) pour une desactivation ou une
+    revocation de session ; ce heartbeat couvre le cas ou ce message a ete
+    manque (redemarrage de l'abonne entre publication et reception, Redis
+    indisponible) au prix d'un delai pouvant aller jusqu'a HEARTBEAT_INTERVAL.
+
+    [⚠️ PROD] Limite assumee : un RETRAIT DE PERMISSIONS (sans desactivation
+    du compte) ne fait PAS fermer la WebSocket par ce heartbeat -- seul
+    ``is_active`` est revalide en base ici, pas les permissions fines
+    (``users.permissions``), que la WS ne consulte de toute facon jamais
+    (elle ne fait que router des notifications par ``user_id``, sans
+    verification de permission par message). Pour un retrait de permissions,
+    le signal pub/sub ``session_revoked`` publie par
+    ``update_user_permissions`` est donc le SEUL mecanisme de fermeture
+    proactive de cette WS ; en son absence (Redis indisponible au moment de
+    la publication), la connexion reste ouverte jusqu'a l'expiration
+    naturelle de l'access token cote HTTP (qui, lui, revalide les
+    permissions a chaque requete via ``get_live_tenant_user_state``).
 
     Les messages {"type": "pong"} sont consommes silencieusement.
     Les autres types de messages entrants sont ignores (protocole unidirectionnel
@@ -300,7 +371,7 @@ async def _ws_handler(
         tenant_slug: Slug du tenant (pour les logs).
         user_id: Identifiant de l'utilisateur authentifie (pour les logs).
         connection_id: UUID hex de cette connexion (pour les logs).
-        redis: ArqRedis instance, pour la revalidation periodique (optionnel).
+        redis: ArqRedis instance, pour la revalidation periodique rapide (optionnel).
         jti: ``jti`` de l'access token ayant authentifie cette connexion.
     """
     while True:
@@ -321,24 +392,16 @@ async def _ws_handler(
 
         except asyncio.TimeoutError:
             # Aucun message depuis HEARTBEAT_INTERVAL -> revalider la session puis pinguer.
-            if redis is not None:
+            if await _is_session_revoked_or_inactive(redis, tenant_slug, user_id, jti):
+                logger.info(
+                    "WS ferme (session revoquee ou compte inactif): user_id=%s tenant=%s conn=%s",
+                    user_id, tenant_slug, connection_id,
+                )
                 try:
-                    revoked = await is_user_disabled(redis, user_id, tenant_slug) or (
-                        bool(jti) and await is_jti_revoked(redis, jti)
-                    )
-                except Exception as exc:
-                    logger.debug("WS revalidation error: conn=%s error=%s", connection_id, exc)
-                    revoked = False
-                if revoked:
-                    logger.info(
-                        "WS ferme (session revoquee): user_id=%s tenant=%s conn=%s",
-                        user_id, tenant_slug, connection_id,
-                    )
-                    try:
-                        await websocket.close(code=4009, reason="session_revoked")
-                    except Exception:
-                        pass
-                    break
+                    await websocket.close(code=4009, reason="session_revoked")
+                except Exception:
+                    pass
+                break
 
             try:
                 await websocket.send_json({"type": "ping", "timestamp": _utcnow()})
