@@ -1,14 +1,11 @@
 """Tasks ARQ pour les alertes RH."""
 
 import logging
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import func, select
 
-from app.core.config import settings
-from app.core.database import tenant_schema_name
+from app.core.database import engine, get_tenant_session
 from app.modules.hr.models import (
     EmployeeProfile,
     EstablishmentHrConfig,
@@ -26,19 +23,6 @@ except Exception:  # noqa: BLE001  # pragma: no cover - defensive import for wor
 logger = logging.getLogger(__name__)
 
 _DEFAULT_COOLDOWN_HOURS = 4
-
-
-@asynccontextmanager
-async def _open_tenant_session(tenant_slug: str):
-    engine = create_async_engine(settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    schema = tenant_schema_name(tenant_slug)
-    try:
-        async with session_factory() as session:
-            await session.execute(text(f'SET search_path TO "{schema}", public'))
-            yield session
-    finally:
-        await engine.dispose()
 
 
 async def _establishment_id_for_employee(session, employee_id: int) -> int | None:
@@ -137,7 +121,7 @@ async def send_hr_late_alert(
     shift_id: int,
     minutes_late: int,
 ) -> None:
-    async with _open_tenant_session(tenant_slug) as session:
+    async with get_tenant_session(tenant_slug) as session:
         alert = await _record_alert_if_not_in_cooldown(
             session,
             employee_id,
@@ -177,7 +161,7 @@ async def send_hr_overrun_alert(
     shift_id: int,
     minutes_over: int,
 ) -> None:
-    async with _open_tenant_session(tenant_slug) as session:
+    async with get_tenant_session(tenant_slug) as session:
         alert = await _record_alert_if_not_in_cooldown(
             session,
             employee_id,
@@ -253,70 +237,63 @@ async def _weekly_hours_worked(session, employee_id: int, as_of: datetime) -> fl
 
 async def check_weekly_overtime(ctx) -> None:
     """Cron ARQ quotidien: alerte si un employe depasse le seuil hebdomadaire."""
-    engine = create_async_engine(settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC)
 
-    try:
-        tenant_slugs = await _get_all_tenant_slugs(engine)
-        for slug in tenant_slugs:
-            schema = tenant_schema_name(slug)
-            async with session_factory() as session:
-                await session.execute(text(f'SET search_path TO "{schema}", public'))
-                result = await session.execute(
-                    select(EmployeeProfile).where(EmployeeProfile.is_active.is_(True))
+    tenant_slugs = await _get_all_tenant_slugs(engine)
+    for slug in tenant_slugs:
+        async with get_tenant_session(slug) as session:
+            result = await session.execute(
+                select(EmployeeProfile).where(EmployeeProfile.is_active.is_(True))
+            )
+            employees = list(result.scalars())
+            result.close()
+
+            for employee in employees:
+                hours = await _weekly_hours_worked(session, employee.id, now)
+                config = await _get_config_for_employee(session, employee)
+                threshold = int(config.weekly_hours_legal_threshold)
+                if hours <= threshold:
+                    continue
+
+                alert = await _record_alert_if_not_in_cooldown(
+                    session,
+                    employee.id,
+                    "weekly_overtime",
+                    "warning",
+                    {
+                        "hours_worked": hours,
+                        "threshold": threshold,
+                        "establishment_id": employee.establishment_id,
+                    },
+                    establishment_id=employee.establishment_id,
                 )
-                employees = list(result.scalars())
-                result.close()
+                if alert is None:
+                    continue
 
-                for employee in employees:
-                    hours = await _weekly_hours_worked(session, employee.id, now)
-                    config = await _get_config_for_employee(session, employee)
-                    threshold = int(config.weekly_hours_legal_threshold)
-                    if hours <= threshold:
-                        continue
-
-                    alert = await _record_alert_if_not_in_cooldown(
-                        session,
-                        employee.id,
-                        "weekly_overtime",
-                        "warning",
-                        {
-                            "hours_worked": hours,
-                            "threshold": threshold,
-                            "establishment_id": employee.establishment_id,
-                        },
-                        establishment_id=employee.establishment_id,
-                    )
-                    if alert is None:
-                        continue
-
-                    try:
-                        if notify_staff is not None:
-                            await notify_staff(
-                                session=session,
-                                tenant_slug=slug,
-                                event="hr.weekly_overtime",
-                                title="Depassement des 35h",
-                                body=(
-                                    f"Employe #{employee.id} : {hours}h cette semaine "
-                                    f"(seuil {threshold}h)."
-                                ),
-                                data={
-                                    "employee_id": employee.id,
-                                    "hours_worked": hours,
-                                    "threshold": threshold,
-                                },
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error(
-                            "notify_staff failed for hr.weekly_overtime tenant=%s employee=%s: %s",
-                            slug,
-                            employee.id,
-                            exc,
+                try:
+                    if notify_staff is not None:
+                        await notify_staff(
+                            session=session,
+                            tenant_slug=slug,
+                            event="hr.weekly_overtime",
+                            title="Depassement des 35h",
+                            body=(
+                                f"Employe #{employee.id} : {hours}h cette semaine "
+                                f"(seuil {threshold}h)."
+                            ),
+                            data={
+                                "employee_id": employee.id,
+                                "hours_worked": hours,
+                                "threshold": threshold,
+                            },
                         )
-    finally:
-        await engine.dispose()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "notify_staff failed for hr.weekly_overtime tenant=%s employee=%s: %s",
+                        slug,
+                        employee.id,
+                        exc,
+                    )
 
 
 async def _labor_cost_ratio(session, establishment_id: int, since: datetime) -> float:
@@ -350,8 +327,6 @@ async def _labor_cost_ratio(session, establishment_id: int, since: datetime) -> 
 
 async def check_labor_cost_risk(ctx) -> None:
     """Cron ARQ quotidien: compare le cout main-d'oeuvre au CA hebdomadaire."""
-    engine = create_async_engine(settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC)
     monday = (now - timedelta(days=now.weekday())).replace(
         hour=0,
@@ -360,60 +335,55 @@ async def check_labor_cost_risk(ctx) -> None:
         microsecond=0,
     )
 
-    try:
-        tenant_slugs = await _get_all_tenant_slugs(engine)
-        for slug in tenant_slugs:
-            schema = tenant_schema_name(slug)
-            async with session_factory() as session:
-                await session.execute(text(f'SET search_path TO "{schema}", public'))
-                result = await session.execute(select(EstablishmentHrConfig))
-                configs = list(result.scalars())
-                result.close()
+    tenant_slugs = await _get_all_tenant_slugs(engine)
+    for slug in tenant_slugs:
+        async with get_tenant_session(slug) as session:
+            result = await session.execute(select(EstablishmentHrConfig))
+            configs = list(result.scalars())
+            result.close()
 
-                for config in configs:
-                    ratio = await _labor_cost_ratio(session, config.establishment_id, monday)
-                    target_ratio = float(config.labor_cost_target_ratio)
-                    if ratio <= target_ratio:
-                        continue
+            for config in configs:
+                ratio = await _labor_cost_ratio(session, config.establishment_id, monday)
+                target_ratio = float(config.labor_cost_target_ratio)
+                if ratio <= target_ratio:
+                    continue
 
-                    alert = await _record_alert_if_not_in_cooldown(
-                        session,
-                        employee_id=None,
-                        alert_type="labor_cost_risk",
-                        severity="critical",
-                        payload={
-                            "establishment_id": config.establishment_id,
-                            "ratio": ratio,
-                            "target_ratio": target_ratio,
-                        },
-                        establishment_id=config.establishment_id,
-                    )
-                    if alert is None:
-                        continue
+                alert = await _record_alert_if_not_in_cooldown(
+                    session,
+                    employee_id=None,
+                    alert_type="labor_cost_risk",
+                    severity="critical",
+                    payload={
+                        "establishment_id": config.establishment_id,
+                        "ratio": ratio,
+                        "target_ratio": target_ratio,
+                    },
+                    establishment_id=config.establishment_id,
+                )
+                if alert is None:
+                    continue
 
-                    try:
-                        if notify_staff is not None:
-                            await notify_staff(
-                                session=session,
-                                tenant_slug=slug,
-                                event="hr.labor_cost_risk",
-                                title="Cout main d'oeuvre eleve",
-                                body=(
-                                    f"Etablissement #{config.establishment_id} : ratio cout/CA "
-                                    f"{ratio:.0%} (cible {target_ratio:.0%})."
-                                ),
-                                data={
-                                    "establishment_id": config.establishment_id,
-                                    "ratio": ratio,
-                                    "target_ratio": target_ratio,
-                                },
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error(
-                            "notify_staff failed for hr.labor_cost_risk tenant=%s establishment=%s: %s",
-                            slug,
-                            config.establishment_id,
-                            exc,
+                try:
+                    if notify_staff is not None:
+                        await notify_staff(
+                            session=session,
+                            tenant_slug=slug,
+                            event="hr.labor_cost_risk",
+                            title="Cout main d'oeuvre eleve",
+                            body=(
+                                f"Etablissement #{config.establishment_id} : ratio cout/CA "
+                                f"{ratio:.0%} (cible {target_ratio:.0%})."
+                            ),
+                            data={
+                                "establishment_id": config.establishment_id,
+                                "ratio": ratio,
+                                "target_ratio": target_ratio,
+                            },
                         )
-    finally:
-        await engine.dispose()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "notify_staff failed for hr.labor_cost_risk tenant=%s establishment=%s: %s",
+                        slug,
+                        config.establishment_id,
+                        exc,
+                    )

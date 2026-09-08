@@ -321,3 +321,57 @@ async def test_single_connection_internal_commit_then_more_queries(single_connec
         assert await _read_marker(session) == TENANT_A_MARKER
 
     assert pid_before == pid_after
+
+
+# ---------------------------------------------------------------------------
+# 3. Concurrence REELLE (asyncio.gather, pas une sequence d'await manuelle) --
+#    reproduit exactement le pattern de worker/tasks/loyalty.py::
+#    expire_loyalty_points (Semaphore(10) + asyncio.gather sur tous les
+#    tenants) : c'est le point d'entree le plus a risque pour une fuite de
+#    search_path, puisque plusieurs sessions tenant DIFFERENTES se disputent
+#    reellement les memes connexions physiques du pool EN MEME TEMPS, pas
+#    seulement l'une apres l'autre.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_gather_across_tenants_never_cross_contaminates(single_connection_setup):
+    """Meme sous contention maximale (pool a UNE seule connexion physique,
+    donc chaque tache concurrente doit attendre son tour pour la MEME
+    connexion), N taches asyncio lancees ensemble via ``asyncio.gather`` --
+    chacune ouvrant ``get_tenant_session``/``get_public_session`` pour un
+    tenant DIFFERENT -- ne doivent jamais lire le marqueur d'un autre tenant
+    ni de ``public``. Preuve que le filet de securite (after_begin + pool
+    reset) protege aussi le pattern de concurrence reel utilise par
+    ``worker.tasks.loyalty.expire_loyalty_points``, pas seulement une
+    sequence de checkouts orchestree a la main par le test."""
+    import asyncio
+
+    factory = single_connection_setup
+    schema_a = f'"{tenant_schema_name(TENANT_A_SLUG)}"'
+    schema_b = f'"{tenant_schema_name(TENANT_B_SLUG)}"'
+
+    # 12 taches melangeant les trois contextes, lancees simultanement --
+    # l'ordre reel d'execution est laisse a l'event loop/au pool, pas impose.
+    plan = [
+        (schema_a, TENANT_A_MARKER),
+        (schema_b, TENANT_B_MARKER),
+        (None, PUBLIC_MARKER),
+    ] * 4
+
+    async def _run_one(search_path: str | None, expected_marker: str) -> None:
+        async with _session_cm(factory, search_path) as session:
+            # Une petite pause APRES l'ouverture de la session force
+            # d'autres taches a tenter leur propre checkout pendant que
+            # celle-ci detient encore la connexion -- maximise les chances
+            # qu'une fuite de search_path (s'il y en avait une) se produise
+            # reellement pendant le test plutot que par chance.
+            await asyncio.sleep(0)
+            marker = await _read_marker(session)
+            assert marker == expected_marker, (
+                f"attendu {expected_marker!r}, lu {marker!r} -- fuite de "
+                "search_path entre taches concurrentes"
+            )
+            await session.commit()
+
+    await asyncio.gather(*[_run_one(sp, marker) for sp, marker in plan])

@@ -8,11 +8,10 @@ import logging
 from datetime import datetime, timezone
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.database import tenant_schema_name
+from app.core.database import engine, get_tenant_session
 from app.modules.stock.models import Ingredient
 
 from worker.tasks.stats import _get_all_tenant_slugs
@@ -34,20 +33,16 @@ async def aggregate_stock_snapshot(ctx) -> None:
     Args:
         ctx: Contexte ARQ injecté automatiquement (contient ``redis``).
     """
-    engine = create_async_engine(settings.database_url)
     client = AsyncIOMotorClient(settings.mongo_url)
     db = client[settings.mongo_db]
     now = datetime.now(timezone.utc)
 
     try:
         tenant_slugs = await _get_all_tenant_slugs(engine)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
         for slug in tenant_slugs:
-            schema = tenant_schema_name(slug)
             try:
-                async with session_factory() as session:
-                    await session.execute(text(f'SET search_path TO "{schema}", public'))
+                async with get_tenant_session(slug) as session:
                     result = await session.execute(
                         select(Ingredient).where(
                             Ingredient.current_qty <= Ingredient.alert_threshold
@@ -106,4 +101,3 @@ async def aggregate_stock_snapshot(ctx) -> None:
 
     finally:
         client.close()
-        await engine.dispose()

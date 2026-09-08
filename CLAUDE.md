@@ -31,14 +31,21 @@ migrations, pytest + coverage, `pip-audit` — no `alembic check` step) and is d
   loss) — don't refactor these into separate commits.
 - **The ARQ worker is a second deployable process**, not a background thread of the API. It needs
   its own Railway service with `python -m arq worker.main.WorkerSettings` as start command.
-- **`worker/tasks/*.py` do NOT share `app/core/database/session.py`'s tenant search_path safety
-  net.** Each worker task file opens its own ad hoc `create_async_engine`/session (e.g.
-  `hr_alerts.py::_open_tenant_session`) with a single `SET search_path TO "{schema}", public` —
-  the `, public` fallback, and the missing `SessionEvents.after_begin`/`PoolEvents.reset`
-  protections, that the API side deliberately removed (see git history around
-  `app/core/database/session.py`). Known, unfixed gap as of this writing — treat any worker task
-  that commits mid-session and keeps querying as suspect, and don't assume the API's isolation
-  guarantees extend here without checking the specific task file.
+- **`worker/tasks/*.py` share `app/core/database/session.py`'s tenant search_path safety net.**
+  Fixed — every worker task now opens sessions via `get_tenant_session()`/`get_public_session()`
+  (the same shared, hardened `engine` the API imports), instead of each file building its own ad
+  hoc `create_async_engine` + a single `SET search_path TO "{schema}", public` per invocation. That
+  old pattern had two problems: the `, public` fallback (silent resolution to the legacy homonymous
+  tables in `public`, see the no-fallback rationale on `get_tenant_session()`'s docstring) and no
+  `SessionEvents.after_begin`/`PoolEvents.reset` protection, so a task that committed mid-session
+  and kept querying (`worker/tasks/stock_alerts.py::send_stock_alert`, most cron jobs looping over
+  `_get_all_tenant_slugs`) risked the search_path silently reverting once the pool recycled the
+  connection — worst for `worker/tasks/loyalty.py::expire_loyalty_points`, which processes tenants
+  **concurrently** (`asyncio.gather` + `Semaphore(10)`), the exact shape most likely to hit it.
+  `tests/test_search_path_pool_safety.py::test_concurrent_gather_across_tenants_never_cross_contaminates`
+  proves the fix holds under genuine concurrent contention on a single-connection pool. Any *new*
+  worker task must use `get_tenant_session()`/`get_public_session()` too — never re-introduce a
+  local `create_async_engine` + manual `SET search_path`.
 
 ## Planning state (`.planning/`, GSD)
 
