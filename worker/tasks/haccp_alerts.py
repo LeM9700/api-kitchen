@@ -16,14 +16,11 @@ toutes les instances relaient via WebSocket aux clients connectés.
 """
 
 import logging
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import and_, select
 
-from app.core.config import settings
-from app.core.database import tenant_schema_name
+from app.core.database import engine, get_tenant_session
 from app.modules.haccp.models import HaccpCoolingLog, HaccpNonConformity
 from worker.tasks.stats import _get_all_tenant_slugs
 
@@ -43,15 +40,6 @@ _NC_OVERDUE_HOURS = 24           # NC non traitée considérée comme en retard
 _EVENT_COOLING_WARNING = "haccp.cooling_warning"
 _EVENT_COOLING_CRITICAL = "haccp.cooling_critical"
 _EVENT_NC_OVERDUE = "haccp.nc_overdue"
-
-
-@asynccontextmanager
-async def _open_tenant_session(engine, tenant_slug: str):
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    schema = tenant_schema_name(tenant_slug)
-    async with session_factory() as session:
-        await session.execute(text(f'SET search_path TO "{schema}", public'))
-        yield session
 
 
 # ── Refroidissement rapide ────────────────────────────────────────────────────
@@ -74,77 +62,72 @@ async def check_haccp_cooling_alerts(ctx) -> None:
         logger.warning("check_haccp_cooling_alerts: notify_staff non disponible")
         return
 
-    engine = create_async_engine(settings.database_url)
     now = datetime.now(UTC)
     warning_threshold = now - timedelta(minutes=_COOLING_WARNING_MINUTES)
     critical_threshold = now - timedelta(minutes=_COOLING_CRITICAL_MINUTES)
 
-    try:
-        tenant_slugs = await _get_all_tenant_slugs(engine)
+    tenant_slugs = await _get_all_tenant_slugs(engine)
 
-        for slug in tenant_slugs:
-            try:
-                async with _open_tenant_session(engine, slug) as session:
-                    # Tous les refroidissements actifs démarrés il y a >= 90 min
-                    result = await session.execute(
-                        select(HaccpCoolingLog).where(
-                            and_(
-                                HaccpCoolingLog.ended_at.is_(None),
-                                HaccpCoolingLog.started_at <= warning_threshold,
-                            )
+    for slug in tenant_slugs:
+        try:
+            async with get_tenant_session(slug) as session:
+                # Tous les refroidissements actifs démarrés il y a >= 90 min
+                result = await session.execute(
+                    select(HaccpCoolingLog).where(
+                        and_(
+                            HaccpCoolingLog.ended_at.is_(None),
+                            HaccpCoolingLog.started_at <= warning_threshold,
                         )
                     )
-                    active_logs = result.scalars().all()
-
-                    for log in active_logs:
-                        elapsed_min = (now - log.started_at).total_seconds() / 60
-                        is_critical = log.started_at <= critical_threshold
-
-                        event = _EVENT_COOLING_CRITICAL if is_critical else _EVENT_COOLING_WARNING
-                        elapsed_str = f"{int(elapsed_min)} min"
-
-                        if is_critical:
-                            title = f"⚠️ Refroidissement critique — {log.product_name}"
-                            body = (
-                                f"{log.product_name} est en refroidissement depuis {elapsed_str}. "
-                                "Limite légale de 2h dépassée. Vérifier ou éliminer le produit."
-                            )
-                        else:
-                            title = f"⏱ Refroidissement — {log.product_name}"
-                            body = (
-                                f"{log.product_name} est en refroidissement depuis {elapsed_str}. "
-                                "Vérifier la température avant 120 min."
-                            )
-
-                        try:
-                            await notify_staff(
-                                session=session,
-                                tenant_slug=slug,
-                                event=event,
-                                title=title,
-                                body=body,
-                                data={
-                                    "cooling_log_id": log.id,
-                                    "product_name": log.product_name,
-                                    "started_at": log.started_at.isoformat(),
-                                    "temp_start": log.temp_start,
-                                    "elapsed_minutes": int(elapsed_min),
-                                    "is_critical": is_critical,
-                                },
-                            )
-                        except Exception as exc:
-                            logger.error(
-                                "cooling alert notify_staff failed tenant=%s log_id=%s: %s",
-                                slug, log.id, exc,
-                            )
-
-            except Exception as exc:
-                logger.error(
-                    "check_haccp_cooling_alerts: erreur tenant=%s : %s", slug, exc
                 )
+                active_logs = result.scalars().all()
 
-    finally:
-        await engine.dispose()
+                for log in active_logs:
+                    elapsed_min = (now - log.started_at).total_seconds() / 60
+                    is_critical = log.started_at <= critical_threshold
+
+                    event = _EVENT_COOLING_CRITICAL if is_critical else _EVENT_COOLING_WARNING
+                    elapsed_str = f"{int(elapsed_min)} min"
+
+                    if is_critical:
+                        title = f"⚠️ Refroidissement critique — {log.product_name}"
+                        body = (
+                            f"{log.product_name} est en refroidissement depuis {elapsed_str}. "
+                            "Limite légale de 2h dépassée. Vérifier ou éliminer le produit."
+                        )
+                    else:
+                        title = f"⏱ Refroidissement — {log.product_name}"
+                        body = (
+                            f"{log.product_name} est en refroidissement depuis {elapsed_str}. "
+                            "Vérifier la température avant 120 min."
+                        )
+
+                    try:
+                        await notify_staff(
+                            session=session,
+                            tenant_slug=slug,
+                            event=event,
+                            title=title,
+                            body=body,
+                            data={
+                                "cooling_log_id": log.id,
+                                "product_name": log.product_name,
+                                "started_at": log.started_at.isoformat(),
+                                "temp_start": log.temp_start,
+                                "elapsed_minutes": int(elapsed_min),
+                                "is_critical": is_critical,
+                            },
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "cooling alert notify_staff failed tenant=%s log_id=%s: %s",
+                            slug, log.id, exc,
+                        )
+
+        except Exception as exc:
+            logger.error(
+                "check_haccp_cooling_alerts: erreur tenant=%s : %s", slug, exc
+            )
 
 
 # ── Non-conformités en retard ─────────────────────────────────────────────────
@@ -162,63 +145,58 @@ async def check_haccp_nc_alerts(ctx) -> None:
         logger.warning("check_haccp_nc_alerts: notify_staff non disponible")
         return
 
-    engine = create_async_engine(settings.database_url)
     now = datetime.now(UTC)
     overdue_threshold = now - timedelta(hours=_NC_OVERDUE_HOURS)
 
-    try:
-        tenant_slugs = await _get_all_tenant_slugs(engine)
+    tenant_slugs = await _get_all_tenant_slugs(engine)
 
-        for slug in tenant_slugs:
-            try:
-                async with _open_tenant_session(engine, slug) as session:
-                    result = await session.execute(
-                        select(HaccpNonConformity).where(
-                            and_(
-                                HaccpNonConformity.status.in_(["open", "in_progress"]),
-                                HaccpNonConformity.created_at <= overdue_threshold,
-                            )
+    for slug in tenant_slugs:
+        try:
+            async with get_tenant_session(slug) as session:
+                result = await session.execute(
+                    select(HaccpNonConformity).where(
+                        and_(
+                            HaccpNonConformity.status.in_(["open", "in_progress"]),
+                            HaccpNonConformity.created_at <= overdue_threshold,
                         )
                     )
-                    overdue_ncs = result.scalars().all()
+                )
+                overdue_ncs = result.scalars().all()
 
-                    if not overdue_ncs:
-                        continue
+                if not overdue_ncs:
+                    continue
 
-                    nc_count = len(overdue_ncs)
-                    title = (
-                        f"⚠️ {nc_count} non-conformité{'s' if nc_count > 1 else ''} en retard"
-                    )
-                    body = (
-                        f"{nc_count} NC sans traitement depuis plus de 24h. "
-                        "Une action corrective validée est requise."
-                    )
-
-                    try:
-                        await notify_staff(
-                            session=session,
-                            tenant_slug=slug,
-                            event=_EVENT_NC_OVERDUE,
-                            title=title,
-                            body=body,
-                            data={
-                                "nc_count": nc_count,
-                                "nc_ids": [nc.id for nc in overdue_ncs],
-                                "oldest_nc_hours": int(
-                                    (now - min(nc.created_at for nc in overdue_ncs)).total_seconds()
-                                    / 3600
-                                ),
-                            },
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "nc_overdue alert notify_staff failed tenant=%s: %s", slug, exc
-                        )
-
-            except Exception as exc:
-                logger.error(
-                    "check_haccp_nc_alerts: erreur tenant=%s : %s", slug, exc
+                nc_count = len(overdue_ncs)
+                title = (
+                    f"⚠️ {nc_count} non-conformité{'s' if nc_count > 1 else ''} en retard"
+                )
+                body = (
+                    f"{nc_count} NC sans traitement depuis plus de 24h. "
+                    "Une action corrective validée est requise."
                 )
 
-    finally:
-        await engine.dispose()
+                try:
+                    await notify_staff(
+                        session=session,
+                        tenant_slug=slug,
+                        event=_EVENT_NC_OVERDUE,
+                        title=title,
+                        body=body,
+                        data={
+                            "nc_count": nc_count,
+                            "nc_ids": [nc.id for nc in overdue_ncs],
+                            "oldest_nc_hours": int(
+                                (now - min(nc.created_at for nc in overdue_ncs)).total_seconds()
+                                / 3600
+                            ),
+                        },
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "nc_overdue alert notify_staff failed tenant=%s: %s", slug, exc
+                    )
+
+        except Exception as exc:
+            logger.error(
+                "check_haccp_nc_alerts: erreur tenant=%s : %s", slug, exc
+            )

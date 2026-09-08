@@ -9,11 +9,8 @@ import asyncio
 import logging
 
 import sqlalchemy as sa
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.core.config import settings
-from app.core.database import tenant_schema_name
+from app.core.database import get_public_session, get_tenant_session
 from app.modules.loyalty.config.service import (
     check_and_expire_points_for_all_users,
     notify_expiring_points_for_all_users,
@@ -37,11 +34,8 @@ async def expire_loyalty_points(ctx: dict) -> dict:
     Returns:
         Dictionnaire ``{"tenants_processed": int, "points_expired": int}``.
     """
-    engine = create_async_engine(settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-
     # Récupère tous les slugs de tenants actifs depuis le schéma public.
-    async with session_factory() as session:
+    async with get_public_session() as session:
         result = await session.execute(
             sa.text("SELECT slug FROM public.tenants WHERE is_active = TRUE")
         )
@@ -58,11 +52,9 @@ async def expire_loyalty_points(ctx: dict) -> dict:
         Returns:
             Nombre de points expirés (0 en cas d'erreur ou d'expiration désactivée).
         """
-        schema = tenant_schema_name(slug)
         async with semaphore:
             try:
-                async with session_factory() as session:
-                    await session.execute(text(f'SET search_path TO "{schema}", public'))
+                async with get_tenant_session(slug) as session:
                     notified = await notify_expiring_points_for_all_users(
                         session,
                         slug,
@@ -85,8 +77,6 @@ async def expire_loyalty_points(ctx: dict) -> dict:
                 return 0, 0
 
     results = await asyncio.gather(*[process_tenant(slug) for slug in slugs])
-
-    await engine.dispose()
 
     tenants_processed = len(slugs)
     total_expired = sum(expired for expired, _notified in results)

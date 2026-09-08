@@ -59,9 +59,28 @@ async def test_hub_sync_chain_connects_worker_snapshot_and_provider(db_session, 
     # Redirect the task's own engine/session creation to the test's isolated
     # db_session -- same wiring proof as
     # tests/test_worker_catalog_sync.py::_patch_engine_and_sessions.
-    fake_engine = AsyncMock()
-    monkeypatch.setattr(catalog_sync, "create_async_engine", lambda *a, **kw: fake_engine)
-    monkeypatch.setattr(catalog_sync, "async_sessionmaker", lambda *a, **kw: (lambda: db_session))
+    # Redirect the task's own session creation to the test's isolated db_session
+    # -- get_public_session/get_tenant_session normally set the session's
+    # search_path themselves (session.info + after_begin), so this fake must
+    # reproduce that explicitly, or later queries resolve against whatever
+    # schema a prior statement in the test left search_path pointed at.
+    from contextlib import asynccontextmanager
+
+    from app.core.database import tenant_schema_name
+
+    @asynccontextmanager
+    async def _fake_public_session(*_a, **_kw):
+        await db_session.execute(sa.text("SET search_path TO public"))
+        yield db_session
+
+    @asynccontextmanager
+    async def _fake_tenant_session(tenant_slug: str, *_a, **_kw):
+        schema = tenant_schema_name(tenant_slug)
+        await db_session.execute(sa.text(f'SET search_path TO "{schema}", public'))
+        yield db_session
+
+    monkeypatch.setattr(catalog_sync, "get_public_session", _fake_public_session)
+    monkeypatch.setattr(catalog_sync, "get_tenant_session", _fake_tenant_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
@@ -132,9 +151,28 @@ async def test_hub_synced_product_can_be_ordered_via_real_product_id(db_session,
     connection_id = 90302
     await _seed_active_connection(db_session, connection_id=connection_id)
 
-    fake_engine = AsyncMock()
-    monkeypatch.setattr(catalog_sync, "create_async_engine", lambda *a, **kw: fake_engine)
-    monkeypatch.setattr(catalog_sync, "async_sessionmaker", lambda *a, **kw: (lambda: db_session))
+    # Redirect the task's own session creation to the test's isolated db_session
+    # -- get_public_session/get_tenant_session normally set the session's
+    # search_path themselves (session.info + after_begin), so this fake must
+    # reproduce that explicitly, or later queries resolve against whatever
+    # schema a prior statement in the test left search_path pointed at.
+    from contextlib import asynccontextmanager
+
+    from app.core.database import tenant_schema_name
+
+    @asynccontextmanager
+    async def _fake_public_session(*_a, **_kw):
+        await db_session.execute(sa.text("SET search_path TO public"))
+        yield db_session
+
+    @asynccontextmanager
+    async def _fake_tenant_session(tenant_slug: str, *_a, **_kw):
+        schema = tenant_schema_name(tenant_slug)
+        await db_session.execute(sa.text(f'SET search_path TO "{schema}", public'))
+        yield db_session
+
+    monkeypatch.setattr(catalog_sync, "get_public_session", _fake_public_session)
+    monkeypatch.setattr(catalog_sync, "get_tenant_session", _fake_tenant_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())

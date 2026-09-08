@@ -26,23 +26,41 @@ async def _seed_active_connection(db_session, connection_id: int, tenant_slug: s
 
 
 def _patch_engine_and_sessions(monkeypatch, db_session):
-    """Redirects the task's engine/session creation so every session it opens is the
-    test's isolated, rollback-only ``db_session`` -- while still returning a spy engine
-    whose ``dispose()`` can be asserted, proving the real engine-lifecycle wiring
-    (``create_async_engine`` -> ... -> ``engine.dispose()``) is exercised end to end
-    rather than bypassed.
+    """Redirects the task's session creation so every session it opens is the
+    test's isolated, rollback-only ``db_session`` -- both the public-schema lookup
+    (``get_public_session``) and the tenant-scoped one (``get_tenant_session``),
+    since sync_catalog_from_hub/sync_stale_catalog_connections now use the shared,
+    hardened session helpers from app.core.database instead of building their own
+    ad hoc engine per invocation (see app/core/database/session.py for why: the
+    after_begin/pool-reset search_path safety net only exists there).
 
-    ``fake_engine`` stands in for the real ``AsyncEngine`` returned by
-    ``create_async_engine`` inside ``sync_catalog_from_hub``; ``async_sessionmaker`` is
-    patched to ignore that engine and always hand back ``db_session`` instead, so DB
-    writes/reads made by the task stay inside the test's transaction/rollback boundary.
+    The real ``get_public_session``/``get_tenant_session`` set the session's
+    search_path themselves (via ``session.info`` + the ``after_begin`` event) --
+    this fake must reproduce that explicitly on ``db_session``, or every query
+    the task makes silently resolves against whatever schema a PRIOR statement
+    in the test left search_path pointed at (typically ``public``, since seed
+    helpers below set it there), not the tenant schema the task actually asked
+    for.
     """
+    import sqlalchemy as sa
+    from contextlib import asynccontextmanager
+
+    from app.core.database import tenant_schema_name
     from worker.tasks import catalog_sync
 
-    fake_engine = AsyncMock()
-    monkeypatch.setattr(catalog_sync, "create_async_engine", lambda *a, **kw: fake_engine)
-    monkeypatch.setattr(catalog_sync, "async_sessionmaker", lambda *a, **kw: (lambda: db_session))
-    return fake_engine
+    @asynccontextmanager
+    async def _fake_public_session(*_args, **_kwargs):
+        await db_session.execute(sa.text("SET search_path TO public"))
+        yield db_session
+
+    @asynccontextmanager
+    async def _fake_tenant_session(tenant_slug: str, *_args, **_kwargs):
+        schema = tenant_schema_name(tenant_slug)
+        await db_session.execute(sa.text(f'SET search_path TO "{schema}", public'))
+        yield db_session
+
+    monkeypatch.setattr(catalog_sync, "get_public_session", _fake_public_session)
+    monkeypatch.setattr(catalog_sync, "get_tenant_session", _fake_tenant_session)
 
 
 async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
@@ -52,7 +70,7 @@ async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
 
     await _seed_active_connection(db_session, connection_id=90001)
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
@@ -73,7 +91,6 @@ async def test_sync_catalog_from_hub_upserts_snapshot(db_session, monkeypatch):
     assert snapshot is not None
     assert snapshot.normalized[0]["external_id"] == "ext-1"
 
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, monkeypatch):
@@ -82,7 +99,7 @@ async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, mo
 
     await _seed_active_connection(db_session, connection_id=90002)
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=False))
     fetch_mock = AsyncMock()
@@ -91,7 +108,6 @@ async def test_sync_catalog_from_hub_skips_when_lock_not_acquired(db_session, mo
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=90002)
 
     fetch_mock.assert_not_awaited()
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, monkeypatch):
@@ -102,7 +118,7 @@ async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, m
 
     await _seed_active_connection(db_session, connection_id=90003)
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
@@ -115,20 +131,18 @@ async def test_sync_catalog_from_hub_re_enqueues_when_rate_limited(db_session, m
 
     fetch_mock.assert_not_awaited()
     redis.enqueue_job.assert_awaited_once_with("sync_catalog_from_hub", connection_id=90003, _defer_by=30)
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_noop_when_connection_not_found_or_inactive(monkeypatch, db_session):
     from worker.tasks import catalog_sync
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     fetch_mock = AsyncMock()
     monkeypatch.setattr(catalog_sync.HttpHubCatalogClient, "fetch_catalog", fetch_mock)
 
     await catalog_sync.sync_catalog_from_hub({"redis": AsyncMock()}, connection_id=99999999)
 
     fetch_mock.assert_not_awaited()
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_error(db_session, monkeypatch, caplog):
@@ -146,7 +160,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_err
     await _seed_active_connection(db_session, connection_id=90004)
 
     release_mock = AsyncMock()
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", release_mock)
@@ -176,7 +190,6 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_hub_http_err
     assert exc_info.value.__suppress_context__ is True
 
     release_mock.assert_awaited_once()
-    fake_engine.dispose.assert_awaited_once()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "HTTPError" in log_text
@@ -196,7 +209,7 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     await _seed_active_connection(db_session, connection_id=90005)
 
     release_mock = AsyncMock()
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", release_mock)
@@ -221,7 +234,6 @@ async def test_sync_catalog_from_hub_reraises_and_logs_type_only_on_malformed_pa
     assert exc_info.value.__suppress_context__ is True
 
     release_mock.assert_awaited_once()
-    fake_engine.dispose.assert_awaited_once()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "MalformedHubCatalogPayloadError" in log_text
@@ -249,7 +261,7 @@ async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db
     await db_session.commit()
     # 90102 has no snapshot at all -- must also be enqueued.
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
 
     redis = AsyncMock()
@@ -259,7 +271,6 @@ async def test_sync_stale_catalog_connections_enqueues_missing_and_stale_only(db
     assert 90101 not in enqueued_ids
     assert 90102 in enqueued_ids
 
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_stale_catalog_connections_enqueues_stale_snapshot(db_session, monkeypatch):
@@ -285,7 +296,7 @@ async def test_sync_stale_catalog_connections_enqueues_stale_snapshot(db_session
     )
     await db_session.commit()
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
 
     redis = AsyncMock()
@@ -294,7 +305,6 @@ async def test_sync_stale_catalog_connections_enqueues_stale_snapshot(db_session
     enqueued_ids = {call.kwargs["connection_id"] for call in redis.enqueue_job.await_args_list}
     assert 90103 in enqueued_ids
 
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def _seed_active_connection_with_broken_tenant_slug(db_session, connection_id: int) -> None:
@@ -339,7 +349,7 @@ async def test_sync_stale_catalog_connections_isolates_per_connection_failures(d
     await _seed_active_connection_with_broken_tenant_slug(db_session, connection_id=90106)
     # 90104 and 90105 have no snapshot -- both must still be enqueued despite 90106 failing.
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
 
     redis = AsyncMock()
@@ -351,7 +361,6 @@ async def test_sync_stale_catalog_connections_isolates_per_connection_failures(d
     assert 90105 in enqueued_ids
     assert 90106 not in enqueued_ids
 
-    fake_engine.dispose.assert_awaited_once()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "connection_id=90106" in log_text
@@ -372,7 +381,7 @@ async def test_sync_catalog_from_hub_skips_when_not_configured(db_session, monke
 
     await _seed_active_connection(db_session, connection_id=90006)
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "")
     lock_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", lock_mock)
@@ -383,7 +392,6 @@ async def test_sync_catalog_from_hub_skips_when_not_configured(db_session, monke
 
     lock_mock.assert_not_awaited()
     fetch_mock.assert_not_awaited()
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_stale_catalog_connections_skips_when_not_configured(db_session, monkeypatch):
@@ -394,14 +402,13 @@ async def test_sync_stale_catalog_connections_skips_when_not_configured(db_sessi
 
     await _seed_active_connection(db_session, connection_id=90007)
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "")
 
     redis = AsyncMock()
     await catalog_sync.sync_stale_catalog_connections({"redis": redis})
 
     redis.enqueue_job.assert_not_awaited()
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_rejects_empty_catalog_overwriting_existing_snapshot(db_session, monkeypatch):
@@ -429,7 +436,7 @@ async def test_sync_catalog_from_hub_rejects_empty_catalog_overwriting_existing_
     original_normalized = original.normalized
     await db_session.commit()
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
@@ -448,7 +455,6 @@ async def test_sync_catalog_from_hub_rejects_empty_catalog_overwriting_existing_
     assert snapshot.normalized == original_normalized
     assert snapshot.synced_at == original_synced_at
 
-    fake_engine.dispose.assert_awaited_once()
 
 
 async def test_sync_catalog_from_hub_allows_empty_catalog_on_first_sync(db_session, monkeypatch):
@@ -463,7 +469,7 @@ async def test_sync_catalog_from_hub_allows_empty_catalog_on_first_sync(db_sessi
 
     await _seed_active_connection(db_session, connection_id=90009)
 
-    fake_engine = _patch_engine_and_sessions(monkeypatch, db_session)
+    _patch_engine_and_sessions(monkeypatch, db_session)
     monkeypatch.setattr(settings, "pos_hub_catalog_url", "https://hub.example.com/catalog")
     monkeypatch.setattr(catalog_sync, "acquire_sync_lock", AsyncMock(return_value=True))
     monkeypatch.setattr(catalog_sync, "release_sync_lock", AsyncMock())
@@ -481,7 +487,6 @@ async def test_sync_catalog_from_hub_allows_empty_catalog_on_first_sync(db_sessi
     assert snapshot is not None
     assert snapshot.normalized == []
 
-    fake_engine.dispose.assert_awaited_once()
 
 
 def test_sync_catalog_from_hub_registered_in_worker_settings():

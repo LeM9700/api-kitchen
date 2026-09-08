@@ -44,7 +44,7 @@ async def test_send_hr_late_alert_creates_hr_alert_row(db_session, employee, mon
 
     from worker.tasks import hr_alerts
 
-    monkeypatch.setattr(hr_alerts, "_open_tenant_session", _tenant_session_context(db_session))
+    monkeypatch.setattr(hr_alerts, "get_tenant_session", _tenant_session_context(db_session))
     monkeypatch.setattr(hr_alerts, "notify_staff", None)
 
     await hr_alerts.send_hr_late_alert(
@@ -83,7 +83,7 @@ async def test_send_hr_late_alert_respects_cooldown(db_session, employee, monkey
     )
     await db_session.commit()
 
-    monkeypatch.setattr(hr_alerts, "_open_tenant_session", _tenant_session_context(db_session))
+    monkeypatch.setattr(hr_alerts, "get_tenant_session", _tenant_session_context(db_session))
     monkeypatch.setattr(hr_alerts, "notify_staff", None)
 
     await hr_alerts.send_hr_late_alert(

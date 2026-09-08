@@ -330,20 +330,9 @@ async def test_send_stock_alert_uses_runtime_tenant_cooldown(monkeypatch):
         async def commit(self):
             committed["value"] = True
 
-    class FakeSessionContext:
-        async def __aenter__(self):
-            return FakeSession()
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    class FakeSessionFactory:
-        def __call__(self):
-            return FakeSessionContext()
-
-    class FakeEngine:
-        async def dispose(self):
-            return None
+    @asynccontextmanager
+    async def _fake_tenant_session(_tenant_slug: str):
+        yield FakeSession()
 
     class FakeRedis:
         async def enqueue_job(self, name, **kwargs):
@@ -352,8 +341,7 @@ async def test_send_stock_alert_uses_runtime_tenant_cooldown(monkeypatch):
     async def fake_notify_staff(**kwargs):
         notify_calls.append(kwargs)
 
-    monkeypatch.setattr(stock_alerts, "create_async_engine", lambda _url: FakeEngine())
-    monkeypatch.setattr(stock_alerts, "async_sessionmaker", lambda *args, **kwargs: FakeSessionFactory())
+    monkeypatch.setattr(stock_alerts, "get_tenant_session", _fake_tenant_session)
     monkeypatch.setattr(stock_alerts, "notify_staff", fake_notify_staff, raising=False)
     monkeypatch.setattr(stock_alerts, "datetime", SimpleNamespace(now=lambda _tz: now))
 

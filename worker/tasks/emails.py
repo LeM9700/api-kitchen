@@ -241,11 +241,10 @@ async def notify_config_change(ctx, *, tenant_slug: str, is_closed: bool) -> Non
         tenant_slug: Slug du tenant concerne.
         is_closed: True si le restaurant vient de fermer, False s'il rouvre.
     """
-    from sqlalchemy import select, text
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy import select
 
     from app.core.config import settings as _settings
-    from app.core.database import tenant_schema_name
+    from app.core.database import get_tenant_session
     from app.modules.auth.models import User
     from app.modules.notifications.notification_service import notify_staff
 
@@ -256,51 +255,41 @@ async def notify_config_change(ctx, *, tenant_slug: str, is_closed: bool) -> Non
         "Ce message est automatique suite a une modification de configuration."
     )
 
-    engine = create_async_engine(_settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    schema = tenant_schema_name(tenant_slug)
+    async with get_tenant_session(tenant_slug) as session:
+        # Email aux admins.
+        admin_result = await session.execute(
+            select(User).where(User.role == "admin", User.is_active.is_(True))
+        )
+        admins = list(admin_result.scalars().all())
 
-    try:
-        async with session_factory() as session:
-            await session.execute(text(f'SET search_path TO "{schema}", public'))
-
-            # Email aux admins.
-            admin_result = await session.execute(
-                select(User).where(User.role == "admin", User.is_active.is_(True))
-            )
-            admins = list(admin_result.scalars().all())
-
-            for admin in admins:
-                if not _settings.smtp_host:
-                    logger.info(
-                        "notify_config_change (SMTP non configure): %s -> %s",
+        for admin in admins:
+            if not _settings.smtp_host:
+                logger.info(
+                    "notify_config_change (SMTP non configure): %s -> %s",
+                    admin.email,
+                    subject,
+                )
+            else:
+                try:
+                    _send_smtp(admin.email, subject, body)
+                except Exception as exc:
+                    logger.error(
+                        "notify_config_change email echec to=%s: %s",
                         admin.email,
-                        subject,
+                        exc,
                     )
-                else:
-                    try:
-                        _send_smtp(admin.email, subject, body)
-                    except Exception as exc:
-                        logger.error(
-                            "notify_config_change email echec to=%s: %s",
-                            admin.email,
-                            exc,
-                        )
 
-            # Push staff + admin.
-            try:
-                await notify_staff(
-                    session=session,
-                    tenant_slug=tenant_slug,
-                    event="tenant.status_changed",
-                    title="Statut restaurant",
-                    body=f"Le restaurant est maintenant {status_label}",
-                    data={"is_closed": is_closed},
-                )
-            except Exception as exc:
-                logger.error(
-                    "notify_config_change push echec tenant=%s: %s", tenant_slug, exc
-                )
-
-    finally:
-        await engine.dispose()
+        # Push staff + admin.
+        try:
+            await notify_staff(
+                session=session,
+                tenant_slug=tenant_slug,
+                event="tenant.status_changed",
+                title="Statut restaurant",
+                body=f"Le restaurant est maintenant {status_label}",
+                data={"is_closed": is_closed},
+            )
+        except Exception as exc:
+            logger.error(
+                "notify_config_change push echec tenant=%s: %s", tenant_slug, exc
+            )

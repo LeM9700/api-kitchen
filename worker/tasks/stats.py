@@ -2,10 +2,10 @@ from datetime import datetime, timedelta, timezone
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import settings
-from app.core.database import tenant_schema_name
+from app.core.database import engine, get_tenant_session
 from app.modules.orders.models import Order
 
 
@@ -14,12 +14,7 @@ async def aggregate_daily_stats(ctx, tenant_slug: str, date: str | None = None):
     day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
 
-    engine = create_async_engine(settings.database_url)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    schema = tenant_schema_name(tenant_slug)
-
-    async with session_factory() as session:
-        await session.execute(text(f'SET search_path TO "{schema}", public'))
+    async with get_tenant_session(tenant_slug) as session:
         revenue = await session.scalar(
             select(func.sum(Order.total)).where(
                 Order.status == "delivered",
@@ -51,7 +46,6 @@ async def aggregate_daily_stats(ctx, tenant_slug: str, date: str | None = None):
         upsert=True,
     )
     client.close()
-    await engine.dispose()
 
 
 async def _get_all_tenant_slugs(engine) -> list[str]:
@@ -81,7 +75,6 @@ async def aggregate_monthly_stats(ctx) -> None:
     Args:
         ctx: Contexte ARQ (injecté automatiquement par le worker).
     """
-    engine = create_async_engine(settings.database_url)
     client = AsyncIOMotorClient(settings.mongo_url)
     db = client[settings.mongo_db]
 
@@ -130,7 +123,6 @@ async def aggregate_monthly_stats(ctx) -> None:
                 )
     finally:
         client.close()
-        await engine.dispose()
 
 
 async def aggregate_live_stats(ctx) -> None:
@@ -145,7 +137,6 @@ async def aggregate_live_stats(ctx) -> None:
     Args:
         ctx: Contexte ARQ (injecté automatiquement par le worker).
     """
-    engine = create_async_engine(settings.database_url)
     client = AsyncIOMotorClient(settings.mongo_url)
     db = client[settings.mongo_db]
     now = datetime.now(timezone.utc)
@@ -153,12 +144,9 @@ async def aggregate_live_stats(ctx) -> None:
 
     try:
         tenant_slugs = await _get_all_tenant_slugs(engine)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
         for slug in tenant_slugs:
-            schema = tenant_schema_name(slug)
-            async with session_factory() as session:
-                await session.execute(text(f'SET search_path TO "{schema}", public'))
+            async with get_tenant_session(slug) as session:
                 revenue_24h = await session.scalar(
                     select(func.sum(Order.total)).where(
                         Order.status == "delivered",
@@ -195,4 +183,3 @@ async def aggregate_live_stats(ctx) -> None:
             )
     finally:
         client.close()
-        await engine.dispose()
