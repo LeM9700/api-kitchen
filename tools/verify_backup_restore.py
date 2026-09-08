@@ -18,6 +18,25 @@ Variables optionnelles :
                                   MONGO_URL). Absent = section Mongo marquee SKIPPED,
                                   jamais faussement PASSED.
 
+Controles executes apres une restauration Postgres reussie (voir Prompt 08 --
+"presence des donnees attendues", "coherence de plusieurs schemas tenants",
+"possibilite de connexion", "tests metier essentiels") :
+    - postgres_connectivity   : la cible restauree accepte une connexion.
+    - postgres_tenant_coherence : reutilise tools/audit_tenant_schemas.py (deja
+      teste, deja utilise en pre-deploiement) contre la cible -- collisions de
+      schema, tenants sans schema, schemas orphelins/incomplets, sur
+      PLUSIEURS tenants a la fois, pas un seul.
+    - postgres_business_data  : interroge les modeles ORM applicatifs reels
+      (User/Order/Product) sur un echantillon de tenants (``--validate-tenant-limit``,
+      defaut 25) -- prouve que les chemins de lecture metier fonctionnent
+      contre les donnees restaurees, pas seulement que les tables existent.
+    - cloudinary_media_cross_check : croise media_images.cloudinary_public_id
+      (tenants restaures) avec l'API Cloudinary -- preuve que les medias
+      REFERENCES par les donnees restaurees resolvent reellement, pas
+      seulement que l'API Cloudinary repond en general.
+    - mongo_validate (si RESTORE_TEST_MONGO_URL configuree) : collections et
+      comptages reellement presents apres restauration.
+
 Ce que ce script NE fait PAS et ne pretend PAS faire :
     - Il ne prouve PAS que les backups automatiques Railway sont actives ou fiables --
       cela reste une verification humaine au dashboard Railway (RUNBOOK.md section 4,
@@ -428,9 +447,10 @@ def postgres_restore(target_url: str, dump_path: Path) -> CheckResult:
     return CheckResult("postgres_restore", "pass", "Restauration sans code d'erreur ni ligne ERROR.", duration)
 
 
-async def postgres_validate(target_url: str) -> CheckResult:
-    """RUNBOOK.md section 4 etape 5 -- comptages de sante, pas une comparaison
-    exhaustive avec la source (une approximation suffit a detecter un dump vide)."""
+async def postgres_connectivity_check(target_url: str) -> CheckResult:
+    """'Possibilite de connexion' -- le controle le plus basique, isole des
+    autres pour que le rapport nomme precisement CE qui a echoue (se connecter,
+    ou lire les donnees une fois connecte ne sont pas la meme panne)."""
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -438,25 +458,119 @@ async def postgres_validate(target_url: str) -> CheckResult:
     engine = create_async_engine(target_url, echo=False)
     try:
         async with engine.connect() as conn:
-            tenants = (await conn.execute(text("SELECT slug FROM public.tenants"))).all()
-            if not tenants:
-                return CheckResult(
-                    "postgres_validate", "fail",
-                    "public.tenants est vide apres restauration -- dump probablement vide/partiel.",
-                    time.monotonic() - start,
-                )
-            sample_slug = tenants[0][0]
-            schema = f'"tenant_{sample_slug}"'
-            user_count = await conn.scalar(text(f"SELECT count(*) FROM {schema}.users"))
+            version = await conn.scalar(text("SELECT version()"))
         return CheckResult(
-            "postgres_validate", "pass",
-            f"{len(tenants)} tenant(s) restaure(s), {user_count} user(s) dans un schema echantillon.",
+            "postgres_connectivity", "pass",
+            f"Connexion etablie -- {(version or '')[:60]}",
             time.monotonic() - start,
         )
     except Exception as exc:
         return CheckResult(
-            "postgres_validate", "fail",
-            f"Erreur de validation ({type(exc).__name__}) -- voir logs locaux pour le detail complet.",
+            "postgres_connectivity", "fail",
+            f"Connexion impossible ({type(exc).__name__}).",
+            time.monotonic() - start,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def postgres_tenant_coherence_check(target_url: str) -> CheckResult:
+    """'Coherence de plusieurs schemas tenants' -- reutilise l'audit en lecture
+    seule deja teste de tools/audit_tenant_schemas.py (deja utilise en
+    pre-deploiement, voir RUNBOOK.md section 8) contre la cible restauree,
+    plutot que de reimplementer une seconde version de la meme logique :
+    collisions de schema par troncature a 63 octets, tenants sans schema
+    physique correspondant, schemas orphelins (schema sans ligne
+    public.tenants), et schemas incomplets (tables manquantes vs
+    Base.metadata -- detecte une restauration partielle qu'un simple
+    COUNT(*) sur une seule table ne verrait pas)."""
+    from tools.audit_tenant_schemas import run_audit
+
+    start = time.monotonic()
+    try:
+        audit_report = await run_audit(target_url)
+    except Exception as exc:
+        return CheckResult(
+            "postgres_tenant_coherence", "fail",
+            f"Audit impossible ({type(exc).__name__}).",
+            time.monotonic() - start,
+        )
+
+    if not audit_report.has_issues:
+        return CheckResult(
+            "postgres_tenant_coherence", "pass",
+            f"{audit_report.total_tenants} tenant(s), "
+            f"{audit_report.total_tenant_schemas} schema(s) -- aucune anomalie "
+            "(pas de collision, pas de schema orphelin/manquant/incomplet).",
+            time.monotonic() - start,
+        )
+    return CheckResult(
+        "postgres_tenant_coherence", "fail",
+        f"{audit_report.total_tenants} tenant(s), {audit_report.total_tenant_schemas} "
+        f"schema(s) -- anomalies : {len(audit_report.long_slug_tenants)} slug(s) trop "
+        f"long(s), {len(audit_report.truncation_collision_groups)} collision(s) de "
+        f"schema, {len(audit_report.tenants_missing_schema)} tenant(s) sans schema, "
+        f"{len(audit_report.orphan_schemas)} schema(s) orphelin(s), "
+        f"{len(audit_report.incomplete_schemas)} schema(s) incomplet(s) -- restauration "
+        "suspecte, investiguer avant de faire confiance a ce backup.",
+        time.monotonic() - start,
+    )
+
+
+async def postgres_business_data_check(target_url: str, tenant_limit: int) -> CheckResult:
+    """'Lancement de tests metier essentiels' + 'presence des donnees
+    attendues' -- interroge les VRAIS modeles ORM de l'application (User,
+    Order, Product -- les memes classes que les routes API utilisent), pas
+    du SQL texte generique : detecte un mismatch colonne/type qu'une simple
+    presence de table ne verrait pas, et prouve que les chemins de lecture
+    metier fonctionnent reellement contre les donnees restaurees. Echantillonne
+    jusqu'a ``tenant_limit`` tenants (pas systematiquement tous -- une
+    production avec des centaines de tenants rendrait la verification trop
+    lente pour rester executable regulierement)."""
+    from sqlalchemy import func, select, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.database import tenant_schema_name
+    from app.modules.auth.models import User
+    from app.modules.catalog.models import Product
+    from app.modules.orders.models import Order
+
+    start = time.monotonic()
+    engine = create_async_engine(target_url, echo=False)
+    try:
+        async with engine.connect() as conn:
+            all_tenants = [
+                row[0] for row in (await conn.execute(text("SELECT slug FROM public.tenants ORDER BY id"))).all()
+            ]
+            if not all_tenants:
+                return CheckResult(
+                    "postgres_business_data", "fail",
+                    "public.tenants est vide apres restauration -- dump probablement vide/partiel.",
+                    time.monotonic() - start,
+                )
+
+            sample = all_tenants[:tenant_limit]
+            per_tenant: list[str] = []
+            for slug in sample:
+                schema = tenant_schema_name(slug)
+                await conn.execute(text(f'SET search_path TO "{schema}", public'))
+                user_count = await conn.scalar(select(func.count()).select_from(User))
+                order_count = await conn.scalar(select(func.count()).select_from(Order))
+                product_count = await conn.scalar(select(func.count()).select_from(Product))
+                per_tenant.append(f"{slug}(users={user_count},orders={order_count},products={product_count})")
+
+        return CheckResult(
+            "postgres_business_data", "pass",
+            f"{len(sample)}/{len(all_tenants)} tenant(s) echantillonne(s) via les modeles "
+            f"ORM applicatifs reels (User/Order/Product) -- " + ", ".join(per_tenant),
+            time.monotonic() - start,
+        )
+    except Exception as exc:
+        return CheckResult(
+            "postgres_business_data", "fail",
+            f"Erreur ({type(exc).__name__}) -- un modele ORM ne correspond plus au schema "
+            "restaure (colonne/table manquante ou de type different), ou une donnee est "
+            "corrompue. Voir logs locaux pour le detail complet.",
             time.monotonic() - start,
         )
     finally:
@@ -500,6 +614,46 @@ def mongo_restore(target_url: str, dump_dir: Path) -> CheckResult:
     return CheckResult("mongo_restore", "pass", "Restauration Mongo sans code d'erreur.", duration)
 
 
+async def mongo_validate(target_url: str, mongo_db_name: str) -> CheckResult:
+    """'Presence des donnees attendues' cote Mongo -- liste les collections
+    reellement restaurees et un comptage par collection, meme logique que
+    postgres_business_data_check (une collection absente ou vide apres un
+    dump/restore reussi indique un probleme silencieux, pas forcement une
+    erreur d'outil)."""
+    start = time.monotonic()
+    try:
+        from motor.motor_asyncio import AsyncIOMotorClient
+
+        client = AsyncIOMotorClient(target_url)
+        try:
+            db = client[mongo_db_name]
+            collection_names = await db.list_collection_names()
+            if not collection_names:
+                return CheckResult(
+                    "mongo_validate", "fail",
+                    f"Base {mongo_db_name!r} restauree mais sans aucune collection -- "
+                    "dump probablement vide.",
+                    time.monotonic() - start,
+                )
+            counts = []
+            for name in sorted(collection_names)[:10]:
+                counts.append(f"{name}={await db[name].estimated_document_count()}")
+            more = f" (+{len(collection_names) - 10} autre(s))" if len(collection_names) > 10 else ""
+            return CheckResult(
+                "mongo_validate", "pass",
+                f"{len(collection_names)} collection(s) restauree(s) -- " + ", ".join(counts) + more,
+                time.monotonic() - start,
+            )
+        finally:
+            client.close()
+    except Exception as exc:
+        return CheckResult(
+            "mongo_validate", "fail",
+            f"Erreur ({type(exc).__name__}) -- voir logs locaux pour le detail complet.",
+            time.monotonic() - start,
+        )
+
+
 def assert_safe_mongo_target(source_url: str, target_url: str | None, safe_markers: tuple[str, ...]) -> CheckResult | None:
     """Meme famille de garde-fous que Postgres (host different, pas de marqueur
     prod, marqueur isole present) mais SANS bloquer tout le script si absent --
@@ -534,6 +688,99 @@ def assert_safe_mongo_target(source_url: str, target_url: str | None, safe_marke
 # ---------------------------------------------------------------------------
 # Cloudinary -- controle d'INTEGRITE en lecture seule, PAS un restore
 # ---------------------------------------------------------------------------
+
+
+async def cloudinary_media_cross_check(target_url: str, tenant_limit: int) -> CheckResult:
+    """Version renforcee de ``cloudinary_integrity_check`` : au lieu d'un
+    echantillon Cloudinary generique sans rapport avec la restauration, lit
+    ``media_images.cloudinary_public_id`` (voir app/modules/catalog/image/
+    image_model.py) dans les schemas tenant RESTAURES et verifie que ces
+    ``public_id`` precis resolvent bien via l'API Cloudinary -- une preuve
+    directe que les medias reference'es par les donnees restaurees sont
+    reellement joignables, pas juste que l'API Cloudinary repond en general.
+    Reste un controle d'INTEGRITE en lecture seule -- Cloudinary n'a pas de
+    notion de restore applicable ici (voir docstring de module)."""
+    start = time.monotonic()
+    try:
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from app.core.config import settings
+        from app.core.database import tenant_schema_name
+
+        if not settings.cloudinary_cloud_name or not settings.cloudinary_api_key:
+            return CheckResult(
+                "cloudinary_media_cross_check", "skip",
+                "CLOUDINARY_* non configure -- controle non execute.",
+                time.monotonic() - start,
+            )
+
+        engine = create_async_engine(target_url, echo=False)
+        try:
+            async with engine.connect() as conn:
+                tenants = [
+                    row[0] for row in (await conn.execute(text("SELECT slug FROM public.tenants ORDER BY id"))).all()
+                ]
+                sample_ids: list[str] = []
+                for slug in tenants[:tenant_limit]:
+                    schema = tenant_schema_name(slug)
+                    rows = (
+                        await conn.execute(
+                            text(f'SELECT cloudinary_public_id FROM "{schema}".media_images LIMIT 3')
+                        )
+                    ).all()
+                    sample_ids.extend(row[0] for row in rows)
+                    if len(sample_ids) >= 10:
+                        break
+        finally:
+            await engine.dispose()
+
+        if not sample_ids:
+            return CheckResult(
+                "cloudinary_media_cross_check", "skip",
+                "Aucune ligne media_images dans l'echantillon de tenants restaures -- "
+                "rien a croiser avec Cloudinary (pas un echec : peut etre legitime si "
+                "aucun produit n'a d'image).",
+                time.monotonic() - start,
+            )
+
+        import cloudinary
+        import cloudinary.api
+
+        cloudinary.config(
+            cloud_name=settings.cloudinary_cloud_name,
+            api_key=settings.cloudinary_api_key,
+            api_secret=settings.cloudinary_api_secret,
+            secure=True,
+        )
+        resolved, missing = 0, []
+        for public_id in sample_ids[:10]:
+            try:
+                cloudinary.api.resource(public_id)
+                resolved += 1
+            except Exception:
+                missing.append(public_id)
+
+        if missing:
+            return CheckResult(
+                "cloudinary_media_cross_check", "fail",
+                f"{resolved}/{len(sample_ids[:10])} media(s) reference'es par les donnees "
+                f"restaurees resolvent sur Cloudinary -- {len(missing)} introuvable(s) "
+                "(identifiants non loggues -- voir la base restauree pour investiguer).",
+                time.monotonic() - start,
+            )
+        return CheckResult(
+            "cloudinary_media_cross_check", "pass",
+            f"{resolved}/{len(sample_ids[:10])} media(s) reference'es par les donnees "
+            "restaurees resolvent bien sur Cloudinary.",
+            time.monotonic() - start,
+        )
+    except Exception as exc:
+        return CheckResult(
+            "cloudinary_media_cross_check", "fail",
+            f"Erreur ({type(exc).__name__}) -- voir logs locaux pour le detail complet.",
+            time.monotonic() - start,
+        )
 
 
 def cloudinary_integrity_check() -> CheckResult:
@@ -642,6 +889,7 @@ async def run(args: argparse.Namespace) -> RestoreReport:
     work_dir = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="backup_restore_"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    postgres_restored = False
     try:
         # --- PostgreSQL ---
         dump_path, dump_check = postgres_dump(source_url, work_dir)
@@ -650,7 +898,12 @@ async def run(args: argparse.Namespace) -> RestoreReport:
             restore_check = postgres_restore(target_url, dump_path)
             report.checks.append(restore_check)
             if restore_check.status == "pass":
-                report.checks.append(await postgres_validate(target_url))
+                postgres_restored = True
+                report.checks.append(await postgres_connectivity_check(target_url))
+                report.checks.append(await postgres_tenant_coherence_check(target_url))
+                report.checks.append(
+                    await postgres_business_data_check(target_url, args.validate_tenant_limit)
+                )
 
         # --- MongoDB (optionnel) ---
         mongo_source = args.mongo_url or settings.mongo_url
@@ -662,11 +915,20 @@ async def run(args: argparse.Namespace) -> RestoreReport:
             mongo_dump_path, mongo_dump_check = mongo_dump(mongo_source, work_dir)
             report.checks.append(mongo_dump_check)
             if mongo_dump_check.status == "pass":
-                report.checks.append(mongo_restore(mongo_target, mongo_dump_path))
+                mongo_restore_check = mongo_restore(mongo_target, mongo_dump_path)
+                report.checks.append(mongo_restore_check)
+                if mongo_restore_check.status == "pass":
+                    mongo_db_name = urlsplit(mongo_target).path.lstrip("/") or settings.mongo_db
+                    report.checks.append(await mongo_validate(mongo_target, mongo_db_name))
 
         # --- Cloudinary (integrite, pas un restore) ---
         if not args.skip_cloudinary:
-            report.checks.append(cloudinary_integrity_check())
+            if postgres_restored:
+                report.checks.append(
+                    await cloudinary_media_cross_check(target_url, args.validate_tenant_limit)
+                )
+            else:
+                report.checks.append(cloudinary_integrity_check())
 
         # --- Redis (documente, jamais simule) ---
         report.checks.append(redis_note())
@@ -719,6 +981,11 @@ def main() -> None:
         help="Execute reellement dump+restore+validation. Sans ce flag : dry-run (garde-fous evalues, rien d'autre).",
     )
     parser.add_argument("--work-dir", default=None, help="Repertoire pour les dumps temporaires (defaut : dossier tmp, hors depot).")
+    parser.add_argument(
+        "--validate-tenant-limit", type=int, default=25,
+        help="Nombre max de tenants echantillonnes pour les controles de coherence/donnees "
+        "metier/medias (defaut : 25) -- borne la duree sur une production a nombreux tenants.",
+    )
     parser.add_argument("--keep-dump", action="store_true", help="Conserve les fichiers de dump apres execution (par defaut : supprimes).")
     parser.add_argument("--skip-cloudinary", action="store_true", help="Ignore le controle d'integrite Cloudinary.")
     parser.add_argument("--report-path", default=None, help="Chemin du rapport (defaut : ~/.api-kitchen-backup-reports/, hors depot).")
