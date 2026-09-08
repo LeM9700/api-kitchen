@@ -85,6 +85,27 @@ ce dépôt ne peut l'exécuter à votre place (pas d'accès aux identifiants Rai
 environnement d'agent). **Ne pas accepter de données clients réelles tant que cette checklist n'a pas
 été cochée en entier au moins une fois.**
 
+`tools/verify_backup_restore.py` automatise les étapes 2, 4 et 5 (dump PostgreSQL, restore sur une
+cible isolée, validation des comptages) ainsi qu'un dump/restore MongoDB équivalent (optionnel) et
+un contrôle d'intégrité Cloudinary en lecture seule (voir son docstring pour le détail des
+garde-fous). **Il ne couvre PAS l'étape 1** (vérification du plan Railway — nécessite le dashboard) ni
+l'étape 8 (planification récurrente). Dry-run par défaut ; `--execute` exige `RESTORE_TEST_DATABASE_URL`
+(instance isolée, distincte de `DATABASE_URL` **et** de `TEST_DATABASE_URL`) et `--confirm-target`.
+Le rapport produit (JSON ou texte, horodaté, source/cible anonymisées) s'écrit hors dépôt par défaut
+(`~/.api-kitchen-backup-reports/`) pour pouvoir être archivé sans jamais transiter par git :
+
+```bash
+uv run python tools/verify_backup_restore.py                                    # dry-run
+RESTORE_TEST_DATABASE_URL="postgresql+asyncpg://...instance-isolee.../pizza_restore_test" \
+  uv run python tools/verify_backup_restore.py --execute --confirm-target <hote-cible>
+```
+
+**Exécuter ce script ne remplace pas l'étape 1** (vérifier que les backups automatiques du
+fournisseur sont réellement actifs) : une exécution réussie prouve qu'un dump pris à cet instant se
+restaure et se valide correctement sur la cible fournie, pas que les backups automatiques Railway
+fonctionnent ou qu'une restauration future réussira de la même manière — le rapport produit le
+rappelle explicitement.
+
 ### Checklist
 
 - [ ] **1. Vérifier les backups automatiques du plan Railway**
@@ -105,11 +126,14 @@ environnement d'agent). **Ne pas accepter de données clients réelles tant que 
 - [ ] **3. Provisionner une instance Postgres de test isolée**
   Ne jamais restaurer directement sur l'instance de production. Soit un second service Postgres
   Railway dédié aux tests, soit une instance locale/Docker temporaire. Exporter son URL dans
-  `TEST_DATABASE_URL` (déjà une variable connue du projet, voir `.env.example`).
+  `RESTORE_TEST_DATABASE_URL` — **jamais** `TEST_DATABASE_URL` : cette dernière est la base que la
+  suite pytest recrée/detruit à chaque run (`DROP SCHEMA ... CASCADE` par tenant, voir
+  `tests/conftest.py::bootstrap_default_tenant`) ; la partager avec la vérification de restore
+  ferait courir aux deux le risque de s'écraser mutuellement.
 
 - [ ] **4. Restaurer le dump sur l'instance de test**
   ```bash
-  pg_restore -d "$TEST_DATABASE_URL" --clean --if-exists backup_XXXXXXXX.dump
+  pg_restore -d "$RESTORE_TEST_DATABASE_URL" --clean --if-exists backup_XXXXXXXX.dump
   ```
   Un code de sortie non nul ou des lignes `ERROR` dans la sortie signifient un problème à
   diagnostiquer avant de considérer le backup fiable (version Postgres incompatible, droits
