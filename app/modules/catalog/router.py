@@ -4,7 +4,7 @@ from fastapi.responses import PlainTextResponse
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_arq_pool, get_pagination, require_permission, require_role
 from app.core.http.errors import AppError
-from app.core.http.limiter import limiter
+from app.core.http.limiter import limiter, user_or_ip_key
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
 from app.modules.catalog import override_repository, service
@@ -550,7 +550,9 @@ async def delete_recommendation(
 
 
 @router.post("/imports/csv/dry-run", response_model=CatalogCsvDryRunResponse)
+@limiter.limit("10/minute", key_func=user_or_ip_key)
 async def import_csv_dry_run(
+    request: Request,
     body: CatalogCsvImportRequest,
     current_user=Depends(require_role("admin")),
 ):
@@ -564,7 +566,9 @@ async def import_csv_dry_run(
 
 
 @router.post("/imports/csv/{token}/confirm", response_model=CatalogCsvConfirmResponse)
+@limiter.limit("10/minute", key_func=user_or_ip_key)
 async def import_csv_confirm(
+    request: Request,
     token: str,
     current_user=Depends(require_role("admin")),
     _catalog_writable=Depends(require_catalog_writable),
@@ -577,7 +581,8 @@ async def import_csv_confirm(
 
 
 @router.get("/exports/csv", response_class=PlainTextResponse)
-async def export_csv(current_user=Depends(require_role("admin"))):
+@limiter.limit("10/minute", key_func=user_or_ip_key)
+async def export_csv(request: Request, current_user=Depends(require_role("admin"))):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         csv_text = await service.export_catalog_csv(session)
     return PlainTextResponse(
