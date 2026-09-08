@@ -12,10 +12,18 @@ Architecture :
   annulee proprement par le lifespan de app.main:lifespan -- une seule tache
   par instance, stockee sur app.state.ws_redis_subscriber_task.
 - Heartbeat serveur : ping toutes les 30s, fermeture zombie si pong absent
-  dans 10s ; a chaque cycle, revalide aussi l'etat AUTORITAIRE en PostgreSQL
-  (is_active) et, si Redis est disponible, les flags de revocation rapides --
-  voir _is_session_revoked_or_inactive et la note [⚠️ PROD] de _ws_handler
-  sur la limite de ce filet vis-a-vis d'un simple retrait de permissions.
+  dans 10s ; a chaque cycle, relit aussi l'etat AUTORITAIRE en PostgreSQL
+  (role, permissions triees, is_active -- voir WsAuthState/_fetch_ws_auth_state)
+  et le compare au snapshot capture a l'authentification (_ws_close_reason),
+  en plus des flags Redis rapides quand Redis est disponible. Un retrait de
+  permission, un changement de role, une desactivation ou une suppression
+  de compte ferment donc la WebSocket (code 4009) sous HEARTBEAT_INTERVAL
+  secondes au pire, MEME SI Redis est indisponible ou si le signal pub/sub
+  session_revoked a ete manque -- PostgreSQL est le mecanisme de secours
+  autoritaire, Redis restant le mecanisme rapide. Un access token HTTP
+  expire n'a par lui-meme aucun effet sur une WebSocket deja etablie : c'est
+  ce heartbeat, pas l'expiration du JWT, qui borne l'effet d'un tel
+  changement sur une connexion deja ouverte.
 - Limite de 5 connexions simultanees par user (SCARD + Lock par user).
 
 Sécurité IP (ordre d'exécution au début de notifications_ws) :
@@ -29,6 +37,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from jwt.exceptions import ExpiredSignatureError, PyJWTError as JWTError
@@ -272,55 +281,124 @@ async def _redis_subscriber() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _is_session_revoked_or_inactive(
-    redis, tenant_slug: str, user_id: int, jti: str | None
-) -> bool:
+class WsAuthState(NamedTuple):
+    """Snapshot normalise, comparable par egalite, de l'etat tenant autoritaire
+    d'un utilisateur au moment ou une WebSocket est authentifiee.
+
+    [🔒 SÉCURITÉ] ``permissions`` est un tuple TRIE (pas la liste brute
+    ``users.permissions``) pour que la comparaison d'egalite entre deux
+    snapshots ne depende pas de l'ordre de stockage en base -- seul un
+    changement de CONTENU (ajout/retrait d'une permission) doit declencher
+    une fermeture, jamais un simple reordonnancement sans effet.
+    """
+
+    role: str
+    permissions: tuple[str, ...]
+    is_active: bool
+
+
+async def _fetch_ws_auth_state(tenant_slug: str, user_id: int) -> WsAuthState | None:
+    """Lit l'etat tenant AUTORITAIRE (PostgreSQL) et le normalise en ``WsAuthState``.
+
+    [🔒 SÉCURITÉ] Ne fait JAMAIS confiance aux claims du JWT (``role``,
+    ``permissions``) pour cette comparaison -- ils sont fige a l'emission du
+    token et peuvent etre perimes des la seconde suivante (retrait de
+    permission, changement de role). Seule une lecture fraiche via
+    ``get_live_tenant_user_state`` (meme fonction que
+    ``app.core.http.deps.get_current_user`` cote HTTP) fait foi.
+
+    Args:
+        tenant_slug: Slug du tenant.
+        user_id: Identifiant de l'utilisateur.
+
+    Returns:
+        ``WsAuthState`` si l'utilisateur existe dans ce schema tenant,
+        ``None`` sinon (compte supprime).
+    """
+    live_state = await get_live_tenant_user_state(user_id, tenant_slug)
+    if live_state is None:
+        return None
+    return WsAuthState(
+        role=live_state.role,
+        permissions=tuple(sorted(live_state.permissions or [])),
+        is_active=bool(live_state.is_active),
+    )
+
+
+async def _ws_close_reason(
+    redis, tenant_slug: str, user_id: int, jti: str | None, auth_state: WsAuthState | None
+) -> str | None:
     """Revalide, a un instant donne, si une WebSocket doit etre fermee.
 
     [🔒 SÉCURITÉ] Deux sources, complementaires :
     1. Redis (rapide, optionnel) : flags ``is_user_disabled``/``is_jti_revoked``
        -- poses par ``flag_user_disabled``/``revoke_jti``, disparaissent si
-       Redis est indisponible ou a ete vide.
-    2. PostgreSQL (autoritaire, TOUJOURS consulte) : ``users.is_active`` via
-       ``get_live_tenant_user_state`` -- fonctionne meme sans Redis, source de
-       verite finale. Un utilisateur supprime (etat introuvable) est traite
-       comme inactif.
-
-    Ne verifie PAS les permissions fines : voir la note [⚠️ PROD] de
-    ``_ws_handler`` sur cette limite assumee.
+       Redis est indisponible ou a ete vide. Sert de raccourci pour les cas
+       de desactivation/logout deja couverts par un signal explicite ; leur
+       absence ne bloque jamais la revalidation PostgreSQL ci-dessous.
+    2. PostgreSQL (autoritaire, TOUJOURS consulte, meme quand Redis a repondu
+       "rien a signaler" ou est indisponible) : relit l'etat courant via
+       ``_fetch_ws_auth_state`` et le compare au snapshot ``auth_state``
+       capture a l'authentification de cette connexion (voir
+       ``notifications_ws``). Toute difference -- compte supprime, compte
+       desactive, changement de role, AJOUT OU RETRAIT d'une permission --
+       declenche la fermeture. C'est ce mecanisme, pas l'expiration du JWT
+       HTTP (qui n'a aucun effet sur une WebSocket deja etablie), qui borne
+       dans le temps l'effet d'un retrait de permissions sur une connexion
+       WS deja ouverte, meme si Redis est indisponible ou si le signal
+       pub/sub ``session_revoked`` a ete manque.
 
     Args:
         redis: ArqRedis instance ou None si indisponible.
         tenant_slug: Slug du tenant.
         user_id: Identifiant de l'utilisateur authentifie sur cette WS.
         jti: ``jti`` de l'access token ayant authentifie cette WS (optionnel).
+        auth_state: Snapshot capture a l'authentification de cette connexion,
+            ou ``None`` pour un flux sans etat tenant a comparer (jeton
+            super-admin plateforme -- voir ``notifications_ws``), auquel cas
+            seule la revalidation Redis ci-dessus s'applique, inchangee par
+            rapport au comportement precedent pour ce flux.
 
     Returns:
-        True si la connexion doit etre fermee (compte inactif ou signal de
-        revocation Redis actif), False sinon.
+        Motif court (str) si la connexion doit etre fermee, ``None`` sinon.
     """
     if redis is not None:
         try:
             if await is_user_disabled(redis, user_id, tenant_slug):
-                return True
+                return "account_disabled"
             if jti and await is_jti_revoked(redis, jti):
-                return True
+                return "token_revoked"
         except Exception as exc:
             logger.debug(
                 "WS revalidation Redis error: tenant=%s user_id=%s error=%s",
                 tenant_slug, user_id, exc,
             )
 
+    if auth_state is None:
+        return None
+
     try:
-        live_state = await get_live_tenant_user_state(user_id, tenant_slug)
+        current_state = await _fetch_ws_auth_state(tenant_slug, user_id)
     except Exception as exc:
+        # [⚠️ PROD] Fail-open sur une erreur PostgreSQL transitoire : une
+        # coupure passagere de la base ne doit pas fermer en masse toutes les
+        # WebSockets ouvertes a chaque cycle de heartbeat. Le prochain cycle
+        # (au plus HEARTBEAT_INTERVAL secondes plus tard) retentera la lecture.
         logger.debug(
             "WS revalidation PostgreSQL error: tenant=%s user_id=%s error=%s",
             tenant_slug, user_id, exc,
         )
-        return False
+        return None
 
-    return live_state is None or not live_state.is_active
+    if current_state is None:
+        return "account_deleted"
+    if not current_state.is_active:
+        return "account_disabled"
+    if current_state.role != auth_state.role:
+        return "role_changed"
+    if current_state.permissions != auth_state.permissions:
+        return "permissions_changed"
+    return None
 
 
 async def _ws_handler(
@@ -328,6 +406,7 @@ async def _ws_handler(
     tenant_slug: str,
     user_id: int,
     connection_id: str,
+    auth_state: WsAuthState | None,
     redis=None,
     jti: str | None = None,
 ) -> None:
@@ -338,29 +417,31 @@ async def _ws_handler(
     secondes. Ferme la connexion zombie si le pong n'arrive pas.
 
     [🔒 SÉCURITÉ] A chaque cycle de heartbeat (au plus HEARTBEAT_INTERVAL
-    secondes, 30s par defaut), revalide l'etat AUTORITAIRE en PostgreSQL
-    (``is_active``, voir ``_is_session_revoked_or_inactive``) et, quand Redis
-    est disponible, les flags rapides ``is_user_disabled``/``is_jti_revoked``.
-    C'est un filet de securite qui fonctionne MEME SANS Redis -- le signal
-    pub/sub ``session_revoked:*`` (voir ``_close_user_connections`` et
-    ``publish_session_revoked``) reste le mecanisme de fermeture IMMEDIATE
-    (quasi temps reel, cross-instance) pour une desactivation ou une
-    revocation de session ; ce heartbeat couvre le cas ou ce message a ete
-    manque (redemarrage de l'abonne entre publication et reception, Redis
-    indisponible) au prix d'un delai pouvant aller jusqu'a HEARTBEAT_INTERVAL.
+    secondes, 30s par defaut), relit l'etat AUTORITAIRE en PostgreSQL --
+    role, permissions (triees) et is_active, voir ``_fetch_ws_auth_state`` --
+    et le compare au snapshot ``auth_state`` capture a l'authentification de
+    cette connexion (voir ``notifications_ws``). Cette comparaison est
+    TOUJOURS effectuee, meme quand Redis a repondu "rien a signaler" ou est
+    totalement indisponible : PostgreSQL est le mecanisme de SECOURS
+    autoritaire, Redis (flags ``is_user_disabled``/``is_jti_revoked`` et
+    signal pub/sub ``session_revoked:*``, voir ``_close_user_connections``
+    et ``publish_session_revoked``) restant le mecanisme de fermeture RAPIDE
+    (quasi temps reel, cross-instance) quand il est disponible. Toute
+    difference -- compte supprime, compte desactive, changement de role, ou
+    AJOUT/RETRAIT d'une permission -- ferme la connexion avec le code 4009.
+    Le pire delai avant fermeture est donc borne a HEARTBEAT_INTERVAL, y
+    compris pour un retrait de permissions sans desactivation et y compris
+    si le signal pub/sub a ete manque ou si Redis est totalement indisponible
+    -- CE heartbeat, PAS l'expiration du JWT HTTP, est ce qui borne l'effet
+    d'un tel retrait sur une WebSocket deja etablie : un access token
+    expire cote HTTP n'a par lui-meme AUCUN effet sur une connexion
+    WebSocket deja ouverte (voir ``_ws_close_reason`` pour le detail des
+    deux sources).
 
-    [⚠️ PROD] Limite assumee : un RETRAIT DE PERMISSIONS (sans desactivation
-    du compte) ne fait PAS fermer la WebSocket par ce heartbeat -- seul
-    ``is_active`` est revalide en base ici, pas les permissions fines
-    (``users.permissions``), que la WS ne consulte de toute facon jamais
-    (elle ne fait que router des notifications par ``user_id``, sans
-    verification de permission par message). Pour un retrait de permissions,
-    le signal pub/sub ``session_revoked`` publie par
-    ``update_user_permissions`` est donc le SEUL mecanisme de fermeture
-    proactive de cette WS ; en son absence (Redis indisponible au moment de
-    la publication), la connexion reste ouverte jusqu'a l'expiration
-    naturelle de l'access token cote HTTP (qui, lui, revalide les
-    permissions a chaque requete via ``get_live_tenant_user_state``).
+    [🔒 SÉCURITÉ] Ne fait JAMAIS confiance aux claims ``role``/``permissions``
+    du JWT ayant servi a l'authentification initiale pour cette comparaison
+    -- ``auth_state`` est lui-meme deja un snapshot PostgreSQL (jamais un
+    decodage du JWT), et chaque relecture au heartbeat l'est aussi.
 
     Les messages {"type": "pong"} sont consommes silencieusement.
     Les autres types de messages entrants sont ignores (protocole unidirectionnel
@@ -371,6 +452,11 @@ async def _ws_handler(
         tenant_slug: Slug du tenant (pour les logs).
         user_id: Identifiant de l'utilisateur authentifie (pour les logs).
         connection_id: UUID hex de cette connexion (pour les logs).
+        auth_state: Snapshot ``WsAuthState`` capture a l'authentification de
+            cette connexion (voir ``notifications_ws``), reference pour
+            detecter tout changement de role/permissions/is_active. ``None``
+            pour un flux sans etat tenant a comparer (jeton super-admin
+            plateforme), auquel cas seule la revalidation Redis s'applique.
         redis: ArqRedis instance, pour la revalidation periodique rapide (optionnel).
         jti: ``jti`` de l'access token ayant authentifie cette connexion.
     """
@@ -392,13 +478,14 @@ async def _ws_handler(
 
         except asyncio.TimeoutError:
             # Aucun message depuis HEARTBEAT_INTERVAL -> revalider la session puis pinguer.
-            if await _is_session_revoked_or_inactive(redis, tenant_slug, user_id, jti):
+            close_reason = await _ws_close_reason(redis, tenant_slug, user_id, jti, auth_state)
+            if close_reason is not None:
                 logger.info(
-                    "WS ferme (session revoquee ou compte inactif): user_id=%s tenant=%s conn=%s",
-                    user_id, tenant_slug, connection_id,
+                    "WS ferme (%s): user_id=%s tenant=%s conn=%s",
+                    close_reason, user_id, tenant_slug, connection_id,
                 )
                 try:
-                    await websocket.close(code=4009, reason="session_revoked")
+                    await websocket.close(code=4009, reason=close_reason)
                 except Exception:
                     pass
                 break
@@ -686,6 +773,12 @@ async def notifications_ws(
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
+    # [🔒 SÉCURITÉ] ``auth_state`` reste ``None`` pour un token super-admin
+    # (``role="super-admin"``, ``payload_tenant`` vide) : ce flux n'a pas de
+    # ligne dans ``tenant_{slug}.users`` a comparer -- voir la note dans
+    # ``_ws_close_reason`` sur ce cas ecarte du perimetre de ce filet.
+    auth_state: WsAuthState | None = None
+
     if payload.get("role") != "super-admin" and payload_tenant:
         from sqlalchemy import text as _text
 
@@ -706,6 +799,22 @@ async def notifications_ws(
                 })
                 await websocket.close(code=4003, reason="Tenant suspended")
                 return
+
+        # [🔒 SÉCURITÉ] Capture le snapshot AUTORITAIRE (PostgreSQL) role +
+        # permissions (triees) + is_active a l'instant de l'authentification --
+        # jamais les claims du JWT, potentiellement perimes des la seconde
+        # suivante. Ce snapshot sert de reference pour ``_ws_handler`` : tout
+        # ecart detecte a un heartbeat ulterieur (retrait de permission,
+        # changement de role, desactivation, suppression) ferme la connexion.
+        auth_state = await _fetch_ws_auth_state(payload_tenant, user_id)
+        if auth_state is None or not auth_state.is_active:
+            await websocket.send_json({
+                "type": "error",
+                "code": "unauthorized",
+                "reason": "Account disabled",
+            })
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
 
     # -------------------------------------------------------------------------
     # [🔒 SÉCURITÉ] Signal 3 — Credential stuffing : enregistrer l'IP pour ce user
@@ -763,7 +872,7 @@ async def notifications_ws(
     # -------------------------------------------------------------------------
     try:
         await _ws_handler(
-            websocket, tenant_slug, user_id, connection_id,
+            websocket, tenant_slug, user_id, connection_id, auth_state,
             redis=redis, jti=str(jti) if jti else None,
         )
     except WebSocketDisconnect:

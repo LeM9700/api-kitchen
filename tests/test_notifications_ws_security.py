@@ -132,6 +132,9 @@ class _HangingWebSocket:
         self.closed = (code, reason)
 
 
+_ACTIVE_STAFF_AUTH_STATE = ws_router.WsAuthState(role="staff", permissions=(), is_active=True)
+
+
 @pytest.mark.asyncio
 async def test_ws_handler_closes_when_user_disabled_between_heartbeats(monkeypatch):
     """Un compte desactive APRES l'ouverture de la WS doit voir sa connexion
@@ -145,10 +148,10 @@ async def test_ws_handler_closes_when_user_disabled_between_heartbeats(monkeypat
     websocket = _HangingWebSocket()
 
     await ws_router._ws_handler(
-        websocket, "acme", 42, "conn-1", redis=_Redis(), jti="some-jti"
+        websocket, "acme", 42, "conn-1", _ACTIVE_STAFF_AUTH_STATE, redis=_Redis(), jti="some-jti"
     )
 
-    assert websocket.closed == (4009, "session_revoked")
+    assert websocket.closed == (4009, "account_disabled")
     assert websocket.sent == []  # ferme avant meme d'envoyer un ping
 
 
@@ -165,10 +168,10 @@ async def test_ws_handler_closes_when_jti_revoked_between_heartbeats(monkeypatch
     websocket = _HangingWebSocket()
 
     await ws_router._ws_handler(
-        websocket, "acme", 42, "conn-1", redis=_Redis(), jti="revoked-jti"
+        websocket, "acme", 42, "conn-1", _ACTIVE_STAFF_AUTH_STATE, redis=_Redis(), jti="revoked-jti"
     )
 
-    assert websocket.closed == (4009, "session_revoked")
+    assert websocket.closed == (4009, "token_revoked")
 
 
 @pytest.mark.asyncio

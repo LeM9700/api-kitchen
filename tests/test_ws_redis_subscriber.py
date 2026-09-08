@@ -1,20 +1,34 @@
-"""Correctif WebSocket sur le commit efff556 (branche permissions-revocation-mfa).
+"""Correctifs WebSocket sur les commits efff556/8b20128 (branche permissions-revocation-mfa).
 
-Constat corrigé :
+Constat corrigé (8b20128) :
 - ``_redis_subscriber`` n'était jamais démarré par le lifespan FastAPI (le
   pub/sub notif:*/session_revoked:* restait mort en pratique) ;
 - le module importait ``aioredis``, absent des dépendances du projet
   (``redis>=5.0`` fournit ``redis.asyncio``) ;
-- le filet heartbeat ne relisait que des flags Redis, donc une WebSocket
-  restait ouverte si Redis était indisponible malgré un compte désactivé.
+- le filet heartbeat ne relisait que ``users.is_active``, donc un simple
+  retrait de permissions (sans désactivation) ne fermait jamais une
+  WebSocket déjà ouverte si le pub/sub était manqué ou Redis indisponible --
+  et l'expiration d'un access token HTTP n'a par elle-même aucun effet sur
+  une connexion WebSocket déjà établie.
+
+Constat corrigé (ce commit) :
+- le heartbeat compare désormais un snapshot ``WsAuthState`` (role,
+  permissions triées, is_active) capturé à l'authentification à un nouveau
+  snapshot relu en PostgreSQL à chaque cycle -- tout écart (permission
+  ajoutée/retirée, rôle changé, compte désactivé ou supprimé) ferme la
+  connexion (code 4009), même sans Redis.
 
 Ces tests prouvent :
 1. le lifespan démarre puis annule proprement la tâche du subscriber ;
 2. un message pub/sub ``session_revoked:*`` ferme réellement une socket
    locale (à travers le vrai code de dispatch de ``_redis_subscriber``) ;
-3. un compte devenu inactif est fermé par le heartbeat même sans Redis
-   (revalidation PostgreSQL autoritaire) ;
-4. le module n'importe plus ``aioredis``.
+3. avec ``redis=None`` : un retrait de permission ferme la connexion ; un
+   changement de rôle ferme la connexion ; un état identique la conserve ;
+   un compte devenu inactif la ferme (test préexistant conservé) ;
+4. le module n'importe plus ``aioredis`` ;
+5. ``_fetch_ws_auth_state`` (utilisé à l'authentification de la connexion
+   pour capturer le snapshot de référence) lit bien l'état réel en base,
+   contre une vraie session tenant PostgreSQL.
 """
 
 import ast
@@ -24,7 +38,6 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from fastapi import FastAPI
 
 from app.modules.notifications import ws_router
@@ -139,42 +152,134 @@ class _HangingWebSocket:
         self.closed = (code, reason)
 
 
+def _live_state(role: str, permissions: list[str], is_active: bool) -> SimpleNamespace:
+    """Fabrique un objet compatible avec ``LiveTenantUserState`` pour mocker
+    ``get_live_tenant_user_state`` (seuls role/permissions/is_active sont lus
+    par ``_fetch_ws_auth_state``)."""
+    return SimpleNamespace(
+        id=42, email="staff@acme.test", role=role, permissions=permissions, is_active=is_active
+    )
+
+
+# Snapshot de référence capturé "à l'authentification" pour tous les tests
+# heartbeat ci-dessous : staff actif avec deux permissions.
+_REFERENCE_AUTH_STATE = ws_router.WsAuthState(
+    role="staff", permissions=("orders:read", "stock:read"), is_active=True
+)
+
+
 async def test_ws_handler_closes_inactive_account_without_redis(monkeypatch):
     """Un compte devenu inactif doit fermer la WebSocket via le heartbeat
     PostgreSQL même quand Redis n'est pas disponible (redis=None)."""
     monkeypatch.setattr(ws_router, "HEARTBEAT_INTERVAL", 0.01)
 
-    inactive_state = SimpleNamespace(
-        id=42, email="staff@acme.test", role="staff", permissions=[], is_active=False
-    )
+    inactive_state = _live_state("staff", ["orders:read", "stock:read"], is_active=False)
     websocket = _HangingWebSocket()
 
     with patch.object(
         ws_router, "get_live_tenant_user_state", AsyncMock(return_value=inactive_state)
     ):
-        await ws_router._ws_handler(websocket, "acme", 42, "conn-1", redis=None, jti=None)
+        await ws_router._ws_handler(
+            websocket, "acme", 42, "conn-1", _REFERENCE_AUTH_STATE, redis=None, jti=None
+        )
 
-    assert websocket.closed == (4009, "session_revoked")
+    assert websocket.closed == (4009, "account_disabled")
     assert websocket.sent == []
 
 
-async def test_ws_handler_keeps_open_when_account_active_and_no_redis(monkeypatch):
-    """Contrôle négatif : un compte actif ne doit pas être fermé par le
-    heartbeat -- seul le ping doit partir."""
+async def test_ws_handler_closes_on_permission_removed_without_redis(monkeypatch):
+    """Un retrait de permission (compte toujours actif, même rôle) doit
+    fermer la WebSocket via le heartbeat PostgreSQL même sans Redis --
+    c'est le risque résiduel corrigé par ce commit : ni le pub/sub (manqué),
+    ni l'expiration du JWT HTTP (sans effet sur une WS déjà ouverte) ne sont
+    nécessaires pour que la fermeture ait lieu."""
     monkeypatch.setattr(ws_router, "HEARTBEAT_INTERVAL", 0.01)
-    monkeypatch.setattr(ws_router, "HEARTBEAT_TIMEOUT", 0.01)
 
-    active_state = SimpleNamespace(
-        id=42, email="staff@acme.test", role="staff", permissions=[], is_active=True
-    )
+    # "stock:read" a été retiré depuis la capture du snapshot de référence.
+    reduced_state = _live_state("staff", ["orders:read"], is_active=True)
     websocket = _HangingWebSocket()
 
     with patch.object(
-        ws_router, "get_live_tenant_user_state", AsyncMock(return_value=active_state)
+        ws_router, "get_live_tenant_user_state", AsyncMock(return_value=reduced_state)
+    ):
+        await ws_router._ws_handler(
+            websocket, "acme", 42, "conn-1", _REFERENCE_AUTH_STATE, redis=None, jti=None
+        )
+
+    assert websocket.closed == (4009, "permissions_changed")
+    assert websocket.sent == []
+
+
+async def test_ws_handler_closes_on_role_changed_without_redis(monkeypatch):
+    """Un changement de rôle (staff -> admin, ou l'inverse) doit fermer la
+    WebSocket via le heartbeat PostgreSQL même sans Redis."""
+    monkeypatch.setattr(ws_router, "HEARTBEAT_INTERVAL", 0.01)
+
+    promoted_state = _live_state("admin", ["orders:read", "stock:read"], is_active=True)
+    websocket = _HangingWebSocket()
+
+    with patch.object(
+        ws_router, "get_live_tenant_user_state", AsyncMock(return_value=promoted_state)
+    ):
+        await ws_router._ws_handler(
+            websocket, "acme", 42, "conn-1", _REFERENCE_AUTH_STATE, redis=None, jti=None
+        )
+
+    assert websocket.closed == (4009, "role_changed")
+    assert websocket.sent == []
+
+
+async def test_ws_handler_keeps_open_when_state_identical_and_no_redis(monkeypatch):
+    """Contrôle négatif : un état PostgreSQL rigoureusement identique au
+    snapshot de référence (même rôle, mêmes permissions, actif) ne doit pas
+    fermer la connexion -- seul le ping doit partir."""
+    monkeypatch.setattr(ws_router, "HEARTBEAT_INTERVAL", 0.01)
+    monkeypatch.setattr(ws_router, "HEARTBEAT_TIMEOUT", 0.01)
+
+    # Ordre de stockage volontairement différent : la comparaison normalise
+    # via un tuple trié (voir WsAuthState), donc ceci ne doit PAS compter
+    # comme un changement de permissions.
+    unchanged_state = _live_state("staff", ["stock:read", "orders:read"], is_active=True)
+    websocket = _HangingWebSocket()
+
+    with patch.object(
+        ws_router, "get_live_tenant_user_state", AsyncMock(return_value=unchanged_state)
     ):
         # Le ping part puis le pong n'arrive jamais (_HangingWebSocket) -> la
         # boucle se termine par timeout zombie, PAS par une fermeture 4009.
-        await ws_router._ws_handler(websocket, "acme", 42, "conn-1", redis=None, jti=None)
+        await ws_router._ws_handler(
+            websocket, "acme", 42, "conn-1", _REFERENCE_AUTH_STATE, redis=None, jti=None
+        )
 
     assert websocket.sent, "un ping aurait dû être envoyé"
     assert websocket.closed is None
+
+
+async def test_fetch_ws_auth_state_reads_live_tenant_state(client, unique_slug):
+    """``_fetch_ws_auth_state`` -- utilisé par ``notifications_ws`` pour
+    capturer le snapshot de référence à l'authentification de la connexion
+    (objectif 1) -- doit refléter l'état réel en base contre une vraie
+    session tenant PostgreSQL, jamais un JWT."""
+    from app.core.auth.security import decode_token
+
+    tenant_slug = f"wsauth{unique_slug}"
+    resp = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "tenant_slug": tenant_slug,
+            "tenant_name": tenant_slug,
+            "email": f"admin-{unique_slug}@test.com",
+            "password": "Valid1!aa",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    admin_id = int(decode_token(resp.json()["access_token"])["sub"])
+
+    state = await ws_router._fetch_ws_auth_state(tenant_slug, admin_id)
+
+    assert state is not None
+    assert state.role == "admin"
+    assert state.is_active is True
+
+    missing = await ws_router._fetch_ws_auth_state(tenant_slug, admin_id + 999)
+    assert missing is None

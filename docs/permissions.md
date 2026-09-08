@@ -72,3 +72,14 @@ en vol avec un ancien access token ne peuvent pas exploiter les anciennes
 permissions : `get_current_user` relit `role`/`permissions`/`is_active` en base à
 chaque requête (`app.core.tenancy.tenant.get_live_tenant_user_state`) plutôt que
 de faire confiance aux claims du JWT.
+
+Une **WebSocket déjà ouverte** (`/ws/notifications`) n'est en revanche pas
+concernée par l'expiration ou la relecture d'un access token HTTP : un jeton
+expiré côté HTTP n'a par lui-même aucun effet sur une connexion déjà établie.
+Sa fermeture repose sur deux mécanismes indépendants — le signal pub/sub
+`session_revoked` (rapide, quasi temps réel) et, en secours si Redis est
+indisponible ou si ce signal est manqué, un heartbeat qui relit l'état
+autoritaire (`role`/`permissions`/`is_active`) en PostgreSQL au maximum toutes
+les 30 secondes et ferme la connexion (code 4009) au moindre écart avec le
+snapshot capturé à l'authentification (voir
+`app.modules.notifications.ws_router._ws_close_reason`).
