@@ -21,6 +21,7 @@ from app.core.database.session import engine
 from app.core.http.errors import AppError, app_error_handler
 from app.core.http.limiter import limiter
 from app.core.http.logging_config import configure_logging, set_request_id
+from app.core.http.request_size_limit import RequestSizeLimitMiddleware
 from app.core.http.security_headers import SecurityHeadersMiddleware
 from app.core.tenancy.tenant import TenantMiddleware
 from app.modules.notifications import ws_router
@@ -133,59 +134,6 @@ async def lifespan(app: FastAPI):
         pass
 
 
-class _RequestSizeLimitMiddleware:
-    """Middleware ASGI qui rejette les requetes dont le Content-Length depasse MAX_BYTES.
-
-    [🔒 SÉCURITÉ] Sans cette limite, un attaquant peut envoyer des payloads
-    massifs (plusieurs centaines de Mo) qui saturent la RAM du processus uvicorn.
-    FastAPI lit le body complet avant la validation Pydantic — il n'y a pas de
-    protection native.
-
-    La limite de 1 Mo s'applique a toutes les routes. Les images (8 Mo max) sont
-    validees au niveau de Cloudinary service apres le check de taille ici — les
-    uploads d'images ne depassent pas 1 Mo avant multipart parsing si l'app mobile
-    compresse correctement.
-
-    Note : seul l'en-tete Content-Length est verifie ici (protection rapide, pas
-    de lecture du body). Un client malicieux peut omettre Content-Length — la
-    protection complementaire est le timeout uvicorn (--timeout-keep-alive).
-    """
-
-    MAX_BYTES: int = 1 * 1024 * 1024       # 1 Mo pour les routes JSON
-    MAX_BYTES_UPLOAD: int = 10 * 1024 * 1024  # 10 Mo pour les routes d'upload (Cloudinary valide à 8 Mo)
-
-    # Préfixes de routes d'upload multipart — limite étendue à MAX_BYTES_UPLOAD.
-    _UPLOAD_PREFIXES: tuple[str, ...] = (
-        b"/api/v1/catalog/",  # images produits/catégories/extras/variantes
-    )
-
-    def __init__(self, app) -> None:
-        self.app = app
-
-    async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers", []))
-            content_length = headers.get(b"content-length")
-            if content_length:
-                try:
-                    path: bytes = scope.get("path", b"").encode() if isinstance(scope.get("path"), str) else scope.get("path", b"")
-                    is_upload = any(path.startswith(p) for p in self._UPLOAD_PREFIXES)
-                    limit = self.MAX_BYTES_UPLOAD if is_upload else self.MAX_BYTES
-                    if int(content_length) > limit:
-                        response = JSONResponse(
-                            {
-                                "code": "PAYLOAD_TOO_LARGE",
-                                "detail": f"Body trop volumineux (max {limit // (1024 * 1024)} Mo).",
-                            },
-                            status_code=413,
-                        )
-                        await response(scope, receive, send)
-                        return
-                except (ValueError, TypeError):
-                    pass
-        await self.app(scope, receive, send)
-
-
 def create_app() -> FastAPI:
     """Construit et configure l'instance FastAPI avec tous les routers et middlewares.
 
@@ -224,8 +172,9 @@ def create_app() -> FastAPI:
     # sur l'ecran de connexion au lieu de l'ecran dedie).
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(TenantMiddleware)
-    # [🔒 SÉCURITÉ] Limite la taille des requêtes HTTP à 1 Mo.
-    app.add_middleware(_RequestSizeLimitMiddleware)
+    # [🔒 SÉCURITÉ] Limite la taille des requêtes HTTP, appliquée au flux reçu
+    # (pas seulement à Content-Length) -- voir app.core.http.request_size_limit.
+    app.add_middleware(RequestSizeLimitMiddleware)
     local_cors_regex = (
         r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$"
         if not is_production
