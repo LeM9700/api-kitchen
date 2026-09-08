@@ -54,6 +54,16 @@ class Settings(BaseSettings):
     # jamais reutiliser la meme cle Fernet pour deux categories de secrets sans
     # rapport (blast radius d'une fuite de cle).
     super_admin_mfa_encryption_key: str = ""
+    # Cle Fernet dediee au chiffrement au repos du secret TOTP des comptes
+    # admin/staff d'un tenant (app.modules.auth.models.User.mfa_secret).
+    # Vide = MFA tenant desactive -- fail-closed, meme logique que
+    # super_admin_mfa_encryption_key ci-dessus. Cle DEDIEE et distincte de
+    # super_admin_mfa_encryption_key ET de pos_token_encryption_key : le
+    # secret MFA d'un compte tenant n'a pas le meme blast radius qu'un
+    # secret MFA plateforme (compromission d'UN tenant vs. de TOUTE la
+    # plateforme) ni qu'un token OAuth de caisse -- une rotation de l'une ne
+    # doit jamais invalider silencieusement les autres.
+    tenant_mfa_encryption_key: str = ""
     # Duree de vie des sessions/refresh tokens super-admin (public.super_admin_sessions).
     # Distincte de jwt_refresh_expire_days (tenant) : blast radius d'un compte
     # super-admin compromis plus eleve, rotation plus frequente attendue.

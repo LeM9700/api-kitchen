@@ -4,6 +4,7 @@ Couvre les fixes FF-04, FF-06, FF-07, FF-08, FF-13.
 Mix tests unitaires (service / deps) et HTTP (client ASGI).
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -71,7 +72,14 @@ async def test_must_change_password_blocks_route_unit():
 
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="fake")
 
-    with patch("app.core.tenancy.tenant.user_belongs_to_tenant", new_callable=AsyncMock, return_value=True):
+    live_state = SimpleNamespace(
+        id=1, email="user@test.com", role="customer", permissions=None, is_active=True
+    )
+    with patch(
+        "app.core.tenancy.tenant.get_live_tenant_user_state",
+        new_callable=AsyncMock,
+        return_value=live_state,
+    ):
         with pytest.raises(AppError) as exc:
             await get_current_user(mock_request, credentials)
 
@@ -113,7 +121,14 @@ async def test_must_change_password_allows_change_password_path():
     mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
     mock_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.core.tenancy.tenant.user_belongs_to_tenant", new_callable=AsyncMock, return_value=True):
+    live_state = SimpleNamespace(
+        id=1, email="user@test.com", role="customer", permissions=None, is_active=True
+    )
+    with patch(
+        "app.core.tenancy.tenant.get_live_tenant_user_state",
+        new_callable=AsyncMock,
+        return_value=live_state,
+    ):
         with patch("app.core.database.get_public_session", return_value=mock_cm):
             user = await get_current_user(mock_request, credentials)
 

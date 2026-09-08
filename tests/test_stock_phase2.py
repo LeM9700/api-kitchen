@@ -26,6 +26,7 @@ def staff_user_override():
             "tenant_slug": "default",
             "role": "staff",
             "email": "staff@example.test",
+            "permissions": ["*"],
         }
 
     app.dependency_overrides[get_current_user] = _staff_user

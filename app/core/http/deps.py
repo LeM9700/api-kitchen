@@ -85,9 +85,21 @@ async def get_current_user(
     # tenant_slug sont incoherents resoudrait vers l'utilisateur reel portant
     # cet id dans le tenant reclame (les ids repartent a 1 par schema).
     elif user_id_str and tenant_slug:
-        from app.core.tenancy.tenant import user_belongs_to_tenant
-        if not await user_belongs_to_tenant(int(user_id_str), tenant_slug, payload.get("email")):
+        from app.core.tenancy.tenant import get_live_tenant_user_state
+
+        live_state = await get_live_tenant_user_state(int(user_id_str), tenant_slug)
+        if live_state is None or live_state.email != payload.get("email"):
             raise AppError("UNAUTHORIZED", "Invalid token", 401)
+        # [🔒 SÉCURITÉ] N'accorde JAMAIS confiance aux claims role/permissions du
+        # JWT au-dela de l'instant de son emission : un retrait de permission ou
+        # un changement de role doit s'appliquer immediatement, pas seulement a
+        # l'expiration du token (voir LiveTenantUserState). is_active est
+        # revalide ici en plus du flag Redis is_user_disabled (defense en
+        # profondeur : le flag Redis est ephemere et peut disparaitre avant
+        # l'expiration naturelle du token en cas de redemarrage/eviction).
+        if not live_state.is_active:
+            raise AppError("UNAUTHORIZED", "Account is disabled", 401)
+        payload = {**payload, "role": live_state.role, "permissions": live_state.permissions}
     # [SECURITE] Meme principe pour le flux super-admin independant (pas de
     # tenant_slug -- voir app.modules.super_admin.router.super_admin_login) :
     # revalide que le sub correspond a un compte reel et actif de
@@ -234,9 +246,21 @@ def require_role(*roles: str) -> Callable:
 def has_permission(current_user: dict, permission: str) -> bool:
     """Return True when a user has a fine-grained staff permission.
 
-    Admin and super-admin keep full access. Staff accounts with permissions=None
-    are treated as legacy unrestricted staff during rollout; once an admin stores
-    an explicit list, it becomes authoritative.
+    Admin and super-admin keep full access (unrestricted by design — the
+    permission model only ever scopes down "staff").
+
+    [🔒 SÉCURITÉ] ``permissions=None`` sur un compte "staff" est un DENY, pas
+    un blanc-seing. Historiquement, ``permissions=None`` était traité comme
+    "staff légataire non restreint" et recevait l'équivalent d'un accès
+    total — un compte staff créé sans liste explicite (ou dont la liste
+    n'a jamais été renseignée) pouvait donc agir sur toutes les routes
+    ``require_permission(...)``. Ce n'est plus le cas : l'absence de liste
+    explicite ne donne plus AUCUN droit fin. Les comptes historiques sont
+    migrés vers une liste explicite (voir
+    ``alembic/versions/0056_staff_explicit_permissions.py``) et
+    ``app.modules.admin.users.service.create_user`` force désormais
+    ``permissions=[]`` par défaut pour tout nouveau compte staff — voir
+    ``docs/permissions.md`` pour les permissions minimales par rôle.
 
     [🔒 SÉCURITÉ] Exception au raccourci admin/super-admin : un token
     d'impersonation (``is_impersonation=True``, voir
@@ -257,9 +281,7 @@ def has_permission(current_user: dict, permission: str) -> bool:
         return "*" in permissions or permission in permissions
     if role in {"admin", "super-admin"}:
         return True
-    permissions = current_user.get("permissions")
-    if permissions is None:
-        return role == "staff"
+    permissions = current_user.get("permissions") or []
     return "*" in permissions or permission in permissions
 
 
