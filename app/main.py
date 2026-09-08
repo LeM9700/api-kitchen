@@ -146,10 +146,26 @@ def create_app() -> FastAPI:
         title="Pizzeria API",
         version="1.0.0",
         lifespan=lifespan,
-        # [🔒 SÉCURITÉ] Swagger et ReDoc désactivés en production pour ne pas
-        # exposer la surface d'attaque complète de l'API.
+        # [🔒 SÉCURITÉ] Décision explicite et documentée (pas un oubli) : en
+        # production, Swagger UI, ReDoc ET le schéma OpenAPI brut
+        # (``/openapi.json``, servi par défaut par FastAPI même quand
+        # docs_url/redoc_url sont désactivés -- c'était le trou avant ce
+        # commit) sont tous les trois désactivés.
+        #
+        # Ceci réduit l'EXPOSITION DOCUMENTAIRE (la liste structurée et
+        # exhaustive de toutes les routes, schémas de requête/réponse, et
+        # noms de champs, prête à l'emploi pour un reconnaissance
+        # automatisée) mais n'est PAS un contrôle de sécurité suffisant en
+        # soi : un attaquant déterminé retrouve la même information par
+        # d'autres moyens (code source si le repo fuite, réponses d'erreur
+        # 422 de validation Pydantic qui révèlent les noms de champs
+        # attendus, énumération manuelle des routes). L'authentification,
+        # l'autorisation et la validation métier sur chaque route restent
+        # les VRAIS contrôles -- voir ``app.core.http.deps``,
+        # ``app.core.tenancy.tenant`` -- jamais l'absence de ce schéma.
         docs_url=None if is_production else "/docs",
         redoc_url=None if is_production else "/redoc",
+        openapi_url=None if is_production else "/openapi.json",
     )
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
