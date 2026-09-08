@@ -28,11 +28,21 @@ Ces tests prouvent :
 4. le module n'importe plus ``aioredis`` ;
 5. ``_fetch_ws_auth_state`` (utilisé à l'authentification de la connexion
    pour capturer le snapshot de référence) lit bien l'état réel en base,
-   contre une vraie session tenant PostgreSQL.
+   contre une vraie session tenant PostgreSQL ;
+6. une notification (canal ``notif:*``, pas seulement ``session_revoked:*``)
+   publiée sur Redis est bien dispatchée par le vrai ``_redis_subscriber``
+   vers ``broadcast_to_user`` -- critère d'acceptation du prompt "Démarrage
+   fiable du subscriber Redis WebSocket" ;
+7. bout en bout, deux "instances API" reliées uniquement par un broker
+   pub/sub en mémoire (chacune avec son propre client Redis et son propre
+   état local de connexions) : l'instance A publie via
+   ``notification_service.notify_user``, l'instance B la reçoit via son
+   propre ``_redis_subscriber`` et la livre à sa WebSocket locale.
 """
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import json
 from types import SimpleNamespace
@@ -283,3 +293,236 @@ async def test_fetch_ws_auth_state_reads_live_tenant_state(client, unique_slug):
 
     missing = await ws_router._fetch_ws_auth_state(tenant_slug, admin_id + 999)
     assert missing is None
+
+
+class _RecordingWebSocket:
+    """WebSocket factice qui journalise les JSON envoyés et l'éventuelle fermeture."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.closed: tuple[int, str] | None = None
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+    async def close(self, code: int, reason: str = "") -> None:
+        self.closed = (code, reason)
+
+
+async def test_redis_subscriber_dispatches_notification_to_local_websocket():
+    """Un message pub/sub sur ``notif:*`` (pas ``session_revoked:*``) doit être
+    dispatché par le vrai ``_redis_subscriber`` vers ``broadcast_to_user`` et
+    livré, avec son contenu exact, à la WebSocket locale correspondante --
+    c'est le chemin emprunté par ``notification_service.notify_user`` en
+    production, distinct du chemin de fermeture déjà couvert ci-dessus."""
+
+    class _FakePubSub:
+        async def psubscribe(self, *patterns) -> None:
+            return None
+
+        async def listen(self):
+            yield {
+                "type": "pmessage",
+                "channel": "notif:acme:42",
+                "data": json.dumps(
+                    {
+                        "type": "notification",
+                        "event": "order.confirmed",
+                        "title": "Commande confirmee",
+                        "body": "Votre commande #42 a ete confirmee.",
+                        "data": {"order_id": 42},
+                        "notification_id": "abc123",
+                        "timestamp": "2026-06-20T12:00:00+00:00",
+                    }
+                ),
+            }
+            # Simule l'annulation de la tâche après traitement du message.
+            raise asyncio.CancelledError()
+
+        async def close(self) -> None:
+            return None
+
+    class _FakeRedisClient:
+        def pubsub(self):
+            return _FakePubSub()
+
+        async def close(self) -> None:
+            return None
+
+    target_ws = _RecordingWebSocket()
+    ws_router._connections["acme:42"] = {target_ws}
+    try:
+        with patch("redis.asyncio.from_url", return_value=_FakeRedisClient()):
+            await ws_router._redis_subscriber()
+    finally:
+        ws_router._connections.pop("acme:42", None)
+
+    assert len(target_ws.sent) == 1
+    assert target_ws.sent[0]["event"] == "order.confirmed"
+    assert target_ws.sent[0]["notification_id"] == "abc123"
+    assert target_ws.closed is None
+
+
+class _InMemoryPubSubBroker:
+    """Broker pub/sub minimal en mémoire, simulant Redis partagé entre
+    plusieurs "instances API" dans un test contrôlé : chaque instance obtient
+    son propre client (``new_client``), mais toutes les publications sont
+    diffusées à tous les abonnés, exactement comme un vrai Redis le ferait
+    entre deux process distincts."""
+
+    def __init__(self):
+        self._queues: list[asyncio.Queue] = []
+
+    def new_client(self) -> "_BrokerRedisClient":
+        return _BrokerRedisClient(self)
+
+    def _register(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._queues.append(queue)
+        return queue
+
+    async def _publish(self, channel: str, data: str) -> None:
+        for queue in self._queues:
+            await queue.put((channel, data))
+
+
+class _BrokerPubSub:
+    def __init__(self, broker: _InMemoryPubSubBroker):
+        self._queue = broker._register()
+
+    async def psubscribe(self, *patterns) -> None:
+        return None
+
+    async def listen(self):
+        while True:
+            channel, data = await self._queue.get()
+            yield {"type": "pmessage", "channel": channel, "data": data}
+
+    async def close(self) -> None:
+        return None
+
+
+class _BrokerRedisClient:
+    """Client Redis factice branché sur le broker -- fournit ``publish`` (cote
+    "instance A", utilise par ``notify_user``) et ``pubsub`` (cote "instance
+    B", utilise par ``_redis_subscriber``)."""
+
+    def __init__(self, broker: _InMemoryPubSubBroker):
+        self._broker = broker
+
+    def pubsub(self) -> _BrokerPubSub:
+        return _BrokerPubSub(self._broker)
+
+    async def publish(self, channel: str, data: str) -> None:
+        await self._broker._publish(channel, data)
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_notification_published_by_one_instance_delivered_on_another_instance():
+    """Critère d'acceptation du prompt : avec deux instances API, une
+    notification publiée dans Redis par l'une est livrée à une WebSocket
+    connectée sur l'autre.
+
+    Simulation : deux clients Redis distincts (``instance_a_redis``,
+    ``instance_b_redis``) branchés sur le même broker en mémoire -- aucun
+    état partagé entre les deux sauf le pub/sub, comme deux process Railway
+    distincts parlant au même Redis. L'instance A appelle le vrai
+    ``notification_service.notify_user`` avec son client Redis (persistance
+    push mockée -- hors périmètre de ce test) ; l'instance B fait tourner le
+    vrai ``_redis_subscriber`` avec son propre client Redis et sa propre
+    WebSocket locale (``ws_router._connections``, jamais peuplé côté A)."""
+    from app.modules.notifications.notification_service import notify_user
+
+    broker = _InMemoryPubSubBroker()
+    instance_a_redis = broker.new_client()
+    instance_b_redis = broker.new_client()
+
+    target_ws = _RecordingWebSocket()
+    ws_router._connections["acme:99"] = {target_ws}
+
+    subscriber_task: asyncio.Task | None = None
+    try:
+        with patch("redis.asyncio.from_url", return_value=instance_b_redis):
+            subscriber_task = asyncio.create_task(ws_router._redis_subscriber())
+
+            # Laisse la coroutine "instance B" s'abonner avant de publier
+            # depuis "instance A" (sinon le message serait perdu, comme avec
+            # un vrai pub/sub Redis sans backlog).
+            for _ in range(100):
+                if broker._queues:
+                    break
+                await asyncio.sleep(0)
+            assert broker._queues, "instance B ne s'est jamais abonnée"
+
+            fake_session = AsyncMock()
+            with patch(
+                "app.modules.notifications.notification_service.send_push_notification",
+                AsyncMock(return_value={"sent": 0, "failed": 0}),
+            ):
+                await notify_user(
+                    session=fake_session,
+                    tenant_slug="acme",
+                    user_id=99,
+                    event="order.confirmed",
+                    title="Commande confirmee",
+                    body="Votre commande #7 a ete confirmee.",
+                    data={"order_id": 7},
+                    redis=instance_a_redis,
+                )
+
+            for _ in range(100):
+                if target_ws.sent:
+                    break
+                await asyncio.sleep(0)
+    finally:
+        ws_router._connections.pop("acme:99", None)
+        if subscriber_task is not None:
+            subscriber_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await subscriber_task
+
+    assert len(target_ws.sent) == 1
+    assert target_ws.sent[0]["event"] == "order.confirmed"
+    assert target_ws.sent[0]["data"]["order_id"] == 7
+    assert target_ws.closed is None
+
+
+async def test_redis_subscriber_reconnects_after_connection_error(monkeypatch):
+    """Reconnexion contrôlée : si la connexion Redis échoue (ou est perdue en
+    plein listen), ``_redis_subscriber`` ne doit ni lever ni s'arrêter -- il
+    retente après une pause courte, jusqu'à ce que Redis redevienne
+    joignable, sans jamais perdre la boucle ``while True`` de fond."""
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    attempts = {"n": 0}
+
+    class _FailingThenWorkingPubSub:
+        async def psubscribe(self, *patterns) -> None:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ConnectionError("redis unreachable")
+            return None
+
+        async def listen(self):
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover - rend la fonction generator
+
+        async def close(self) -> None:
+            return None
+
+    class _FailingThenWorkingRedisClient:
+        def pubsub(self):
+            return _FailingThenWorkingPubSub()
+
+        async def close(self) -> None:
+            return None
+
+    with patch("redis.asyncio.from_url", return_value=_FailingThenWorkingRedisClient()):
+        await ws_router._redis_subscriber()
+
+    # Une premiere tentative a echoue (ConnectionError), une seconde a
+    # reussi puis s'est arretee proprement sur CancelledError -- la boucle a
+    # bien retente au lieu de laisser l'exception se propager.
+    assert attempts["n"] == 2
