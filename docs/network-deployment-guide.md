@@ -8,11 +8,19 @@ opérationnelles côté API, voir [RUNBOOK.md](../RUNBOOK.md).
 
 ## 1. Principe
 
-Kitchen est un SaaS Cloud : tablettes, KDS et caisse ne parlent **jamais** en LAN entre eux, ils
-appellent l'API via HTTPS sur Internet. Ça simplifie beaucoup la topologie par rapport à un
-système de caisse legacy on-prem : il n'y a pas de serveur local à protéger, seulement un
-**point de sortie Internet** à sécuriser et des **appareils à cloisonner entre eux**. La
-segmentation ci-dessous répond à une seule question par zone : *si cet appareil est compromis,
+Les flux métier principaux (tablettes, KDS, caisse) passent par HTTPS vers l'API Kitchen dans le
+Cloud — aucun serveur Kitchen local ni communication LAN généralisée entre ces appareils n'est
+requis. Ça simplifie beaucoup la topologie par rapport à un système de caisse legacy on-prem : pas
+de serveur local applicatif à protéger, seulement un **point de sortie Internet** à sécuriser et
+des **appareils à cloisonner entre eux**.
+
+Nuance importante : si l'impression réseau locale est activée (tablette/caisse → imprimante de
+commande via IP locale plutôt que via un module d'impression cloud), ce flux-là **est** local et
+doit être explicitement autorisé — voir section 2. Il doit rester limité à des imprimantes
+désignées, avec IP/ports explicitement autorisés, et n'est jamais accessible depuis le Wi-Fi
+invités.
+
+La segmentation ci-dessous répond à une seule question par zone : *si cet appareil est compromis,
 qu'est-ce qu'il peut atteindre ?*
 
 ## 2. Zones
@@ -35,14 +43,25 @@ Points qui ne sont pas dans le tableau mais qui font échouer un déploiement en
 - **Le TPE ne doit pas être joignable depuis le Wi-Fi staff**, même si c'est pratique pour le
   debug. C'est le sens de "accès bloqués : accès libre depuis Staff" dans le tableau — le trafic
   carte bancaire n'a rien à faire visible depuis un réseau où un téléphone perso peut se connecter
-  par erreur.
+  par erreur. Le VLAN/réseau paiement reste **fermé par défaut** depuis Staff. Si l'intégration du
+  terminal impose une communication locale (ex. caisse qui pilote le TPE en direct plutôt que via
+  la passerelle cloud du prestataire), n'autoriser que le flux précis **caisse désignée → TPE
+  désigné**, sur les ports documentés par le prestataire — jamais une ouverture générale
+  Staff → Paiement.
+- **Si l'impression réseau locale est utilisée**, le flux tablette/caisse → imprimante doit être
+  explicitement autorisé (règle firewall dédiée, pas une ouverture large du VLAN staff), limité aux
+  IP/ports des imprimantes désignées, et jamais accessible depuis le Wi-Fi invités.
 
 ## 3. Quand 3 réseaux suffisent, quand il en faut plus
 
-Trois zones séparées (invités / staff-cuisine / paiement) au niveau **SSID Wi-Fi avec isolation
-client + VLAN dédié au moins pour le paiement** couvrent la grande majorité des installations
-Kitchen. Ne pas sur-designer avec six VLAN "au cas où" — ça complique la maintenance pour un gain
-de sécurité nul si le contexte ne le justifie pas.
+Trois zones **métier** séparées — invités / staff-cuisine / paiement — au niveau **SSID Wi-Fi avec
+isolation client + VLAN dédié au moins pour le paiement** couvrent la grande majorité des
+installations Kitchen. L'Administration (section 2) est une zone de gestion à part : elle existe
+dès que le matériel le permet (routeur/switch manageables) ou qu'un administrateur désigné est
+identifié, indépendamment du nombre de zones métier — ce n'est pas une quatrième zone "au même
+niveau" que les trois autres, c'est le plan de contrôle qui les administre toutes. Ne pas
+sur-designer avec six VLAN "au cas où" — ça complique la maintenance pour un gain de sécurité nul
+si le contexte ne le justifie pas.
 
 **3 zones suffisent quand :**
 - Un seul site, une seule caisse/back-office.
@@ -70,9 +89,10 @@ de sécurité nul si le contexte ne le justifie pas.
   un VLAN documenté avec règles firewall traçables (pas juste un SSID), parce que l'auditeur PCI
   demande une preuve de cloisonnement réseau, pas une confiance sur la config du point d'accès.
 
-Dans le doute, la règle simple : trois zones logiques minimum toujours ; VLAN dédié en plus dès
-qu'un appareil du bâtiment n'est *pas* sous le contrôle direct de l'exploitant (multi-site,
-prestataire tiers, IoT) ou dès qu'une exigence contractuelle l'impose.
+Dans le doute, la règle simple : trois zones métier logiques minimum toujours (+ Administration dès
+que le matériel/un responsable le permet) ; VLAN dédié en plus dès qu'un appareil du bâtiment n'est
+*pas* sous le contrôle direct de l'exploitant (multi-site, prestataire tiers, IoT) ou dès qu'une
+exigence contractuelle l'impose.
 
 ## 4. Connexion Internet
 
@@ -127,18 +147,32 @@ identifier rapidement quel appareil bloquer sur le Wi-Fi ni quelle session appli
 Diagnostic → correction → prévention, dans l'ordre, dès la découverte de la perte :
 
 1. **Cause probable** : l'appareil a une session Kitchen active (JWT + refresh token) et est
-   toujours connecté au Wi-Fi staff — les deux sont exploitables tant qu'ils ne sont pas révoqués,
+   toujours connecté au Wi-Fi staff — les deux sont exploitables tant qu'ils ne sont pas traités,
    indépendamment l'un de l'autre.
-2. **Correction immédiate** :
-   - Révoquer la session applicative : `GET /api/v1/auth/sessions` (identifier la session via
-     `user_agent`/`ip_address` de l'appareil perdu), puis `DELETE /api/v1/auth/sessions/{id}` —
-     ou `DELETE /api/v1/auth/sessions` pour une déconnexion globale du compte si plusieurs
-     appareils partageaient le même identifiant. Ça invalide le refresh token en base et met
-     l'access token en deny-list Redis immédiatement (voir `docs/modules/auth.md`).
-   - Bloquer l'appareil sur le Wi-Fi staff par adresse MAC (filtrage MAC sur le point d'accès),
-     en s'appuyant sur l'inventaire (section 7).
-   - Si l'appareil était partagé entre plusieurs membres du staff avec un identifiant commun,
-     changer le mot de passe de ce compte en plus de révoquer la session.
+2. **Correction immédiate** — dans cet ordre de priorité :
+   - **Révocation Kitchen (prioritaire)** : `GET /api/v1/auth/sessions` pour identifier la session
+     via `user_agent`/`ip_address` de l'appareil perdu, puis `DELETE /api/v1/auth/sessions/{id}`.
+     Ça révoque le refresh token de cette session en base — **mais ne révoque pas instantanément
+     l'access token déjà émis** : celui-ci reste valide jusqu'à son expiration naturelle (durée de
+     vie courte configurée côté API, voir `docs/modules/auth.md`). C'est un risque **borné dans le
+     temps**, pas éliminé à l'instant de l'appel.
+     Si l'urgence l'exige (vol plutôt que simple oubli, ou identifiant partagé entre plusieurs
+     membres du staff), utiliser `DELETE /api/v1/auth/sessions?revoke_current=true` ou désactiver
+     directement le compte : ça peut mettre en deny-list le JTI du token courant et déclencher la
+     fermeture de connexions actives (WebSocket), ce qui réduit la fenêtre de risque plus vite
+     qu'une simple révocation de session ciblée. Ne pas présenter la révocation de session comme
+     une coupure d'accès immédiate et totale — c'est une révocation du refresh token avec un délai
+     résiduel côté access token.
+   - **Retrait des identifiants Wi-Fi** : si l'appareil connaissait un mot de passe Wi-Fi staff
+     nominatif ou partagé exposé par la perte, le changer (section 5).
+   - **MDM / effacement à distance** si l'appareil est enrôlé dans une solution de gestion — c'est
+     le seul mécanisme qui agit sur l'appareil lui-même plutôt que sur ses accès réseau/applicatifs.
+   - **Blocage MAC en complément, jamais en mesure principale** : filtrer l'adresse MAC de
+     l'appareil sur le point d'accès (en s'appuyant sur l'inventaire, section 7) reste utile
+     opérationnellement, mais ce n'est **pas une mesure fiable** — une adresse MAC se spoof
+     facilement, et rien n'empêche l'appareil de rejoindre le réseau par un port Ethernet ou de
+     sortir directement via le réseau mobile (4G/5G du téléphone) sans passer par le Wi-Fi staff
+     du tout. Le blocage MAC ne remplace jamais la révocation applicative ci-dessus.
 3. **Prévention future** :
    - Si le volume de matériel le justifie, passer sur une solution MDM (verrouillage/effacement
      à distance) plutôt que de dépendre uniquement de la révocation applicative.
