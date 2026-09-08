@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_client_ip, get_current_user, require_role
 from app.core.http.errors import AppError
-from app.core.http.limiter import limiter
+from app.core.http.limiter import limiter, user_or_ip_key
 from app.modules.auth import service
 from app.modules.auth.login_audit import log_login_event
 from app.modules.auth.models import User
@@ -65,7 +65,11 @@ async def login(request: Request, body: LoginRequest):
 
 
 @router.post("/mfa/setup", response_model=MfaSetupResponse)
-async def mfa_setup(current_user: dict = Depends(require_role("super-admin", "admin"))):
+@limiter.limit("10/minute", key_func=user_or_ip_key)
+async def mfa_setup(
+    request: Request,
+    current_user: dict = Depends(require_role("super-admin", "admin")),
+):
     return await service.setup_mfa(
         current_user["tenant_slug"],
         int(current_user["id"]),
@@ -73,7 +77,9 @@ async def mfa_setup(current_user: dict = Depends(require_role("super-admin", "ad
 
 
 @router.post("/mfa/confirm")
+@limiter.limit("5/minute", key_func=user_or_ip_key)
 async def mfa_confirm(
+    request: Request,
     body: MfaVerifyRequest,
     current_user: dict = Depends(require_role("super-admin", "admin")),
 ):
@@ -85,7 +91,9 @@ async def mfa_confirm(
 
 
 @router.post("/mfa/backup-codes/regenerate")
+@limiter.limit("5/minute", key_func=user_or_ip_key)
 async def mfa_regenerate_backup_codes(
+    request: Request,
     body: MfaVerifyRequest,
     current_user: dict = Depends(require_role("super-admin", "admin")),
 ):

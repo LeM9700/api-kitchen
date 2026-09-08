@@ -12,13 +12,14 @@ HACCP de l'établissement (températures, NC, formations, etc.).
 from datetime import date
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import require_role
+from app.core.http.limiter import limiter, user_or_ip_key
 from app.modules.admin.tenants.models import TenantConfig
 from app.modules.haccp.export_service import generate_csv, generate_pdf
 
@@ -34,7 +35,9 @@ async def _get_restaurant_name(db: AsyncSession) -> str:
 
 
 @router.get("/pdf", summary="Export rapport HACCP — PDF")
+@limiter.limit("5/minute", key_func=user_or_ip_key)
 async def export_pdf(
+    request: Request,
     from_date: date = Query(..., alias="from", description="Date de début (YYYY-MM-DD)"),
     to_date: date = Query(..., alias="to", description="Date de fin (YYYY-MM-DD)"),
     current_user: dict = Depends(require_role("admin")),
@@ -75,7 +78,9 @@ async def export_pdf(
 
 
 @router.get("/csv", summary="Export données HACCP — CSV")
+@limiter.limit("10/minute", key_func=user_or_ip_key)
 async def export_csv(
+    request: Request,
     from_date: date = Query(..., alias="from", description="Date de début (YYYY-MM-DD)"),
     to_date: date = Query(..., alias="to", description="Date de fin (YYYY-MM-DD)"),
     data_type: Literal["all", "temperatures", "dlc", "nc", "reception", "cooling"] = Query(
