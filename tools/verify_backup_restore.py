@@ -82,6 +82,16 @@ destructive -- pg_restore --clean / mongorestore --drop) :
     7. --execute doit etre passe explicitement. Sans lui : dry-run, aucune commande
        destructive, le rapport decrit ce qui SERAIT fait.
 
+Secrets et argv : ni pg_dump/pg_restore ni mongodump/mongorestore ne recoivent jamais
+une URL de connexion complete (donc un mot de passe) comme argument de ligne de
+commande -- les arguments d'un processus sont visibles par tout autre processus du
+meme hote (``ps aux``, ``/proc/<pid>/cmdline``). PostgreSQL utilise un fichier
+``.pgpass`` temporaire (0600) + ``PGPASSFILE`` + ``--no-password`` ; Mongo utilise un
+fichier de config YAML temporaire (0600) + ``--config``. Ces deux fichiers vivent dans
+un repertoire prive (0700) supprime de maniere fiable (``finally``) meme si la
+commande echoue. stderr est en plus passe par ``scrub_secrets()`` avant d'atterrir
+dans un CheckResult, en defense en profondeur.
+
 Rapport : JSON ou texte, horodate, ecrit par defaut HORS du depot
 (~/.api-kitchen-backup-reports/) pour pouvoir etre archive sans jamais transiter par
 git. Contient : source et cible ANONYMISEES (identifiants et details d'hote masques),
@@ -97,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -181,6 +192,121 @@ def _dbname(url: str) -> str:
         return urlsplit(url).path.lstrip("/").lower()
     except ValueError:
         return ""
+
+
+def scrub_secrets(text: str, secrets: list[str]) -> str:
+    """[SECURITE] Derniere ligne de defense avant qu'un texte (stderr de
+    sous-processus, en general) n'atterrisse dans un CheckResult.detail --
+    et de la dans le rapport ecrit sur disque ou imprime sur stdout/stderr.
+    Remplace toute occurrence LITTERALE d'un secret connu (URL complete,
+    mot de passe isole) par ``***``. Les commandes construites par ce module
+    ne passent plus jamais de secret en argv (voir les context managers
+    ``_postgres_conn_env`` / ``_mongo_config_file`` ci-dessous), donc en
+    temps normal aucun de ces secrets ne devrait apparaitre dans stderr --
+    ce scrub est une garantie defensive supplementaire, pas le mecanisme
+    principal.
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+@contextlib.contextmanager
+def _secure_temp_dir(prefix: str):
+    """Repertoire temporaire prive (0700, cree ainsi par ``tempfile.mkdtemp``
+    puis force explicitement), utilise pour stocker des fichiers contenant
+    des secrets (PGPASSFILE, config Mongo avec URI). Supprime de maniere
+    fiable a la sortie du bloc ``with`` -- y compris si la commande echoue
+    ou leve une exception -- via ``finally``/``shutil.rmtree``.
+    """
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        os.chmod(path, 0o700)
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _pgpass_line(host: str, port: str, dbname: str, user: str, password: str) -> str:
+    """Formate une ligne au format ``.pgpass`` (man pgpass) : les caracteres
+    ``\\`` et ``:`` doivent y etre echappes par un antislash."""
+
+    def esc(value: str) -> str:
+        return value.replace("\\", "\\\\").replace(":", "\\:")
+
+    return f"{esc(host)}:{esc(port)}:{esc(dbname)}:{esc(user)}:{esc(password)}\n"
+
+
+@contextlib.contextmanager
+def _postgres_conn_env(url: str):
+    """[SECURITE] Traduit une URL de connexion Postgres en (env, args de
+    connexion SANS credentials) pour ``pg_dump``/``pg_restore``.
+
+    Ne JAMAIS passer l'URL complete (avec mot de passe) en argument argv a
+    ``pg_dump``/``pg_restore`` : les arguments d'un processus sont visibles
+    par tout autre processus du meme hote via ``ps aux``, ``/proc/<pid>/cmdline``,
+    ou tout outil d'inspection de process -- y compris pour un utilisateur
+    n'ayant pas acces direct au code ou aux variables d'environnement de ce
+    script. A la place : un fichier ``.pgpass`` temporaire (permissions 0600,
+    dans un repertoire prive 0700 -- voir ``_secure_temp_dir``) pointe par
+    ``PGPASSFILE``, et des arguments ``-h``/``-p``/``-U``/``-d`` qui ne
+    contiennent jamais le mot de passe. ``--no-password`` empeche en plus tout
+    fallback interactif silencieux (qui bloquerait le script indefiniment sur
+    un prompt jamais lu en environnement non interactif) si jamais le pgpass
+    ne matchait pas.
+
+    Supprime le fichier de maniere fiable a la sortie du bloc, meme si
+    ``pg_dump``/``pg_restore`` echoue.
+
+    Yields:
+        Tuple ``(env, conn_args, dbname)`` : ``env`` est une copie de
+        l'environnement courant avec ``PGPASSFILE`` positionne (et
+        ``PGPASSWORD`` retire, au cas ou il aurait ete herite) ; ``conn_args``
+        est la liste ``["-h", host, "-p", port, "-U", user, "--no-password"]`` ;
+        ``dbname`` est le nom de base a passer separement via ``-d``.
+    """
+    libpq_url = _to_libpq_url(url)
+    parts = urlsplit(libpq_url)
+    host = parts.hostname or "localhost"
+    port = str(parts.port or 5432)
+    dbname = parts.path.lstrip("/")
+    user = parts.username or ""
+    password = parts.password or ""
+
+    with _secure_temp_dir("verify_backup_pgpass_") as secrets_dir:
+        pgpass_path = secrets_dir / "pgpass"
+        pgpass_path.write_text(
+            _pgpass_line(host, port, dbname or "*", user or "*", password), encoding="utf-8"
+        )
+        os.chmod(pgpass_path, 0o600)
+
+        env = os.environ.copy()
+        env.pop("PGPASSWORD", None)
+        env["PGPASSFILE"] = str(pgpass_path)
+
+        conn_args = ["-h", host, "-p", port, "--no-password"]
+        if user:
+            conn_args += ["-U", user]
+
+        yield env, conn_args, dbname
+
+
+@contextlib.contextmanager
+def _mongo_config_file(uri: str):
+    """[SECURITE] Meme principe que ``_postgres_conn_env`` cote Mongo : un
+    fichier de configuration YAML temporaire (0600, repertoire prive 0700)
+    portant l'URI de connexion complete, lu par ``mongodump``/``mongorestore``
+    via ``--config=<path>`` -- jamais ``--uri=<URL>`` en argv (meme risque
+    d'exposition via inspection de process que pour Postgres). Supprime de
+    maniere fiable a la sortie du bloc, meme en cas d'echec de la commande.
+    """
+    escaped = uri.replace("\\", "\\\\").replace('"', '\\"')
+    with _secure_temp_dir("verify_backup_mongocfg_") as secrets_dir:
+        config_path = secrets_dir / "mongo_config.yaml"
+        config_path.write_text(f'uri: "{escaped}"\n', encoding="utf-8")
+        os.chmod(config_path, 0o600)
+        yield config_path
 
 
 # ---------------------------------------------------------------------------
@@ -406,14 +532,16 @@ def postgres_dump(source_url: str, work_dir: Path) -> tuple[Path, CheckResult]:
 
     dump_path = work_dir / f"postgres_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.dump"
     start = time.monotonic()
-    result = _run(["pg_dump", _to_libpq_url(source_url), "-F", "c", "-f", str(dump_path)])
+    with _postgres_conn_env(source_url) as (env, conn_args, dbname):
+        secrets = [source_url, urlsplit(_to_libpq_url(source_url)).password or ""]
+        result = _run(["pg_dump", *conn_args, "-d", dbname, "-F", "c", "-f", str(dump_path)], env=env)
     duration = time.monotonic() - start
 
     if result.returncode != 0:
         return None, CheckResult(
             "postgres_dump", "fail",
             f"pg_dump a echoue (code {result.returncode}) -- stderr tronque : "
-            f"{result.stderr[-300:]}",
+            f"{scrub_secrets(result.stderr[-300:], secrets)}",
             duration,
         )
     size = dump_path.stat().st_size if dump_path.exists() else 0
@@ -429,7 +557,9 @@ def postgres_dump(source_url: str, work_dir: Path) -> tuple[Path, CheckResult]:
 
 def postgres_restore(target_url: str, dump_path: Path) -> CheckResult:
     start = time.monotonic()
-    result = _run(["pg_restore", "-d", _to_libpq_url(target_url), "--clean", "--if-exists", str(dump_path)])
+    with _postgres_conn_env(target_url) as (env, conn_args, dbname):
+        secrets = [target_url, urlsplit(_to_libpq_url(target_url)).password or ""]
+        result = _run(["pg_restore", *conn_args, "-d", dbname, "--clean", "--if-exists", str(dump_path)], env=env)
     duration = time.monotonic() - start
 
     # pg_restore peut retourner un code non-nul pour des warnings benins (objets
@@ -441,7 +571,7 @@ def postgres_restore(target_url: str, dump_path: Path) -> CheckResult:
         return CheckResult(
             "postgres_restore", "fail",
             f"pg_restore code={result.returncode}, lignes ERROR presentes={has_error_lines} "
-            f"-- stderr tronque : {result.stderr[-500:]}",
+            f"-- stderr tronque : {scrub_secrets(result.stderr[-500:], secrets)}",
             duration,
         )
     return CheckResult("postgres_restore", "pass", "Restauration sans code d'erreur ni ligne ERROR.", duration)
@@ -590,12 +720,14 @@ def mongo_dump(source_url: str, work_dir: Path) -> tuple[Path | None, CheckResul
         )
     dump_dir = work_dir / "mongo_dump"
     start = time.monotonic()
-    result = _run(["mongodump", f"--uri={source_url}", f"--out={dump_dir}"])
+    with _mongo_config_file(source_url) as config_path:
+        result = _run(["mongodump", f"--config={config_path}", f"--out={dump_dir}"])
     duration = time.monotonic() - start
     if result.returncode != 0:
         return None, CheckResult(
             "mongo_dump", "fail",
-            f"mongodump a echoue (code {result.returncode}) -- stderr tronque : {result.stderr[-300:]}",
+            f"mongodump a echoue (code {result.returncode}) -- stderr tronque : "
+            f"{scrub_secrets(result.stderr[-300:], [source_url])}",
             duration,
         )
     return dump_dir, CheckResult("mongo_dump", "pass", f"Dump ecrit dans {dump_dir.name}/.", duration)
@@ -603,12 +735,14 @@ def mongo_dump(source_url: str, work_dir: Path) -> tuple[Path | None, CheckResul
 
 def mongo_restore(target_url: str, dump_dir: Path) -> CheckResult:
     start = time.monotonic()
-    result = _run(["mongorestore", f"--uri={target_url}", "--drop", str(dump_dir)])
+    with _mongo_config_file(target_url) as config_path:
+        result = _run(["mongorestore", f"--config={config_path}", "--drop", str(dump_dir)])
     duration = time.monotonic() - start
     if result.returncode != 0:
         return CheckResult(
             "mongo_restore", "fail",
-            f"mongorestore a echoue (code {result.returncode}) -- stderr tronque : {result.stderr[-500:]}",
+            f"mongorestore a echoue (code {result.returncode}) -- stderr tronque : "
+            f"{scrub_secrets(result.stderr[-500:], [target_url])}",
             duration,
         )
     return CheckResult("mongo_restore", "pass", "Restauration Mongo sans code d'erreur.", duration)
