@@ -85,6 +85,93 @@ ce dépôt ne peut l'exécuter à votre place (pas d'accès aux identifiants Rai
 environnement d'agent). **Ne pas accepter de données clients réelles tant que cette checklist n'a pas
 été cochée en entier au moins une fois.**
 
+`tools/verify_backup_restore.py` automatise les étapes 2, 4 et 5 (dump PostgreSQL, restore sur une
+cible isolée, validation des comptages) ainsi qu'un dump/restore MongoDB équivalent (optionnel) et
+un contrôle d'intégrité Cloudinary en lecture seule (voir son docstring pour le détail des
+garde-fous). **Il ne couvre PAS l'étape 1** (vérification du plan Railway — nécessite le dashboard) ni
+l'étape 8 (planification récurrente). Dry-run par défaut ; `--execute` exige `RESTORE_TEST_DATABASE_URL`
+(instance isolée, distincte de `DATABASE_URL` **et** de `TEST_DATABASE_URL`) et `--confirm-target`.
+Le rapport produit (JSON ou texte, horodaté, source/cible anonymisées) s'écrit hors dépôt par défaut
+(`~/.api-kitchen-backup-reports/`) pour pouvoir être archivé sans jamais transiter par git :
+
+```bash
+uv run python tools/verify_backup_restore.py                                    # dry-run
+RESTORE_TEST_DATABASE_URL="postgresql+asyncpg://...instance-isolee.../pizza_restore_test" \
+  uv run python tools/verify_backup_restore.py --execute --confirm-target <hote-cible>
+```
+
+**Exécuter ce script ne remplace pas l'étape 1** (vérifier que les backups automatiques du
+fournisseur sont réellement actifs) : une exécution réussie prouve qu'un dump pris à cet instant se
+restaure et se valide correctement sur la cible fournie, pas que les backups automatiques Railway
+fonctionnent ou qu'une restauration future réussira de la même manière — le rapport produit le
+rappelle explicitement.
+
+### Fréquence de sauvegarde et rétention
+
+**Backups automatiques (fournisseur)** — Railway propose des backups automatiques sur les plans
+PostgreSQL managés ; fréquence et rétention dépendent du plan souscrit et ne sont **pas vérifiables
+depuis ce dépôt ni depuis un environnement d'agent** (nécessite le dashboard Railway, étape 1
+ci-dessous). Tant que l'étape 1 n'a pas été cochée avec la fréquence/rétention réelles documentées
+ici, considérer qu'**aucun backup automatique n'est garanti**.
+
+**Backup manuel explicite (recommandé en complément, pas encore automatisé au 2026-09-08)** :
+- PostgreSQL : cible quotidienne via `pg_dump` (étape 2), déclenché par un cron externe (GitHub
+  Actions planifiée ou équivalent — étape 8, non encore mise en place). Rétention cible : 7 derniers
+  dumps quotidiens + 4 hebdomadaires (rotation simple), stockés hors de la machine qui les produit
+  (objet storage externe) et **jamais dans ce dépôt git**.
+- MongoDB (`login_events_{tenant_slug}`, snapshots catalogue) : même fréquence recommandée via
+  `mongodump` ; rétention alignée sur les 90 jours de rétention applicative déjà en place pour
+  `login_events_*` (section 6).
+- Médias Cloudinary : gérés par Cloudinary lui-même, pas de dump applicatif côté ce dépôt —
+  `tools/verify_backup_restore.py` vérifie seulement que les `cloudinary_public_id` référencés en
+  base résolvent toujours côté Cloudinary après une restauration PostgreSQL, pas une sauvegarde des
+  fichiers eux-mêmes.
+- Configuration non-secrète : versionnée nativement via `.env.example` dans ce dépôt, pas de
+  sauvegarde séparée nécessaire. Les secrets réels (`JWT_SECRET`, `STRIPE_SECRET_KEY`, identifiants
+  DB/Mongo/Cloudinary...) restent exclusivement dans les variables d'environnement Railway — jamais
+  dans ce dépôt ni dans un dump : un `pg_dump`/`mongodump` ne contient que des données applicatives.
+
+Ces chiffres sont des **cibles proposées, pas un engagement actif** — à valider/ajuster avec le
+plan Railway réel (étape 1) et à formaliser dans un cron (étape 8) avant d'être considérées
+opérationnelles.
+
+### Objectifs RPO / RTO (réalistes, à recalibrer sur des données de production)
+
+Mesurés localement le 2026-09-08 avec `tools/verify_backup_restore.py`, sur un jeu de test de 35
+schémas tenant (~9,7 Mo de dump) :
+
+| Étape | Durée mesurée (local, 35 tenants / 9,7 Mo) |
+|---|---|
+| `pg_dump` | ~7 s |
+| `pg_restore` | ~21 s |
+| Validation (connectivité + cohérence multi-tenant + données métier) | quelques secondes |
+
+**RPO** (perte de données maximale tolérée) — borné par la fréquence de backup *réelle*, pas par la
+vitesse du dump. Avec un backup manuel quotidien (cible ci-dessus) et sans confirmation des backups
+automatiques Railway (étape 1 non cochée), le RPO **actuel est de 24 h dans le meilleur cas,
+indéterminé tant que l'étape 1 n'est pas validée**.
+
+**RTO** (temps de restauration) — le total dump+restore+validation mesuré ci-dessus (~30 s) est une
+**borne basse non représentative** : petite base de test locale, sans latence réseau vers Railway,
+sans provisionnement d'une instance de test (étape 3), sans démarrage applicatif (étape 6), sans
+coordination humaine (étapes 1, 3, 7 sont manuelles). **Ne pas extrapoler ce chiffre local tel
+quel** à un engagement client — un RTO réaliste doit être remesuré en conditions réelles (volume de
+données de production, réseau Railway, provisionnement d'instance) avant d'être communiqué. Jusqu'à
+ce recalibrage, retenir un ordre de grandeur prudent de **quelques heures**, le temps humain de
+coordination et de provisionnement dominant très largement le temps machine.
+
+### Responsabilités
+
+- **Vérification des backups automatiques (étape 1)** : équipe ops/infra, accès dashboard Railway
+  requis — non délégable à un agent ou un script de ce dépôt.
+- **Exécution du test de restauration (checklist ci-dessous)** : à effectuer avant tout onboarding
+  d'un client avec des données réelles, puis périodiquement une fois l'étape 8 automatisée. Un
+  développeur backend disposant de `RESTORE_TEST_DATABASE_URL` peut l'exécuter seul via
+  `tools/verify_backup_restore.py`.
+- **Documentation du résultat (étape 7)** : la personne ayant exécuté le test, directement dans ce
+  fichier.
+- **Rotation des secrets en cas d'incident** : voir section 6.
+
 ### Checklist
 
 - [ ] **1. Vérifier les backups automatiques du plan Railway**
@@ -105,25 +192,44 @@ environnement d'agent). **Ne pas accepter de données clients réelles tant que 
 - [ ] **3. Provisionner une instance Postgres de test isolée**
   Ne jamais restaurer directement sur l'instance de production. Soit un second service Postgres
   Railway dédié aux tests, soit une instance locale/Docker temporaire. Exporter son URL dans
-  `TEST_DATABASE_URL` (déjà une variable connue du projet, voir `.env.example`).
+  `RESTORE_TEST_DATABASE_URL` — **jamais** `TEST_DATABASE_URL` : cette dernière est la base que la
+  suite pytest recrée/detruit à chaque run (`DROP SCHEMA ... CASCADE` par tenant, voir
+  `tests/conftest.py::bootstrap_default_tenant`) ; la partager avec la vérification de restore
+  ferait courir aux deux le risque de s'écraser mutuellement.
 
 - [ ] **4. Restaurer le dump sur l'instance de test**
   ```bash
-  pg_restore -d "$TEST_DATABASE_URL" --clean --if-exists backup_XXXXXXXX.dump
+  pg_restore -d "$RESTORE_TEST_DATABASE_URL" --clean --if-exists backup_XXXXXXXX.dump
   ```
   Un code de sortie non nul ou des lignes `ERROR` dans la sortie signifient un problème à
   diagnostiquer avant de considérer le backup fiable (version Postgres incompatible, droits
   insuffisants, dump tronqué...).
 
 - [ ] **5. Valider l'intégrité des données restaurées**
-  Sur l'instance de test restaurée, exécuter au minimum :
+  `tools/verify_backup_restore.py --execute` exécute automatiquement, dans l'ordre, après un restore
+  réussi :
+  - `postgres_connectivity_check` — la cible restaurée accepte bien des connexions applicatives.
+  - `postgres_tenant_coherence_check` — réutilise `tools/audit_tenant_schemas.py` (section 8) pour
+    confirmer que chaque tenant de `public.tenants` a bien son schéma `tenant_{slug}` restauré, sans
+    schéma orphelin ni table manquante par rapport à `Base.metadata`.
+  - `postgres_business_data_check` — échantillonne jusqu'à `--validate-tenant-limit` tenants
+    (défaut 25) et compte, via les modèles ORM réels (`User`, `Order`, `Product`), qu'il ne s'agit
+    pas d'un dump vide ou partiel.
+  - `cloudinary_media_cross_check` — pour les tenants échantillonnés, prend quelques
+    `cloudinary_public_id` réellement stockés en base et confirme côté API Cloudinary (lecture seule)
+    qu'ils résolvent toujours ; `skip` (pas un échec) si aucune image n'est présente dans
+    l'échantillon.
+  - `mongo_validate` — si `RESTORE_TEST_MONGO_URL` est fournie et qu'un restore Mongo a eu lieu :
+    liste les collections et leurs comptages sur la cible restaurée.
+
+  Si l'un de ces contrôles échoue, `overall_status` du rapport passe à `failure` (code de sortie non
+  nul) — ne pas considérer le backup fiable tant que ce n'est pas corrigé. Pour une vérification
+  manuelle complémentaire, les mêmes requêtes SQL directes restent valables :
   ```sql
   SELECT slug FROM public.tenants;                                    -- les tenants existent
   SELECT count(*) FROM tenant_<un_slug_reel>.users;                   -- des utilisateurs existent
   SELECT count(*) FROM tenant_<un_slug_reel>.orders;                  -- des commandes existent
   ```
-  Comparer les comptages avec des valeurs connues côté production (approximatives suffisent) pour
-  confirmer qu'il ne s'agit pas d'un dump vide ou partiel.
 
 - [ ] **6. Démarrer l'application contre l'instance restaurée (optionnel mais recommandé)**
   Pointer temporairement `DATABASE_URL` vers l'instance de test restaurée en local, lancer
@@ -132,13 +238,16 @@ environnement d'agent). **Ne pas accepter de données clients réelles tant que 
   l'application, pas seulement présentes en base.
 
 - [ ] **7. Documenter le résultat ci-dessous**
-  Une fois les 6 étapes validées avec succès, remplacer la ligne suivante :
+  `tools/verify_backup_restore.py` écrit déjà, à chaque exécution, un rapport horodaté hors dépôt
+  (`~/.api-kitchen-backup-reports/` par défaut, ou `--report-path`) — c'est la trace datée du
+  résultat, à archiver (ticket interne, stockage objet...), jamais dans ce dépôt git. Une fois les
+  6 étapes validées avec succès, remplacer la ligne suivante :
 
   > **Dernier test de restore réussi : jamais exécuté.**
 
   par : `Dernier test de restore réussi : <date> — dump de <taille>, restauré sur <instance de test>,
-  validé par <nom>.` Si une étape échoue, documenter l'échec et le blocage ici plutôt que de laisser
-  la ligne à « jamais exécuté » sans explication.
+  validé par <nom>, rapport : <chemin ou référence d'archive>.` Si une étape échoue, documenter
+  l'échec et le blocage ici plutôt que de laisser la ligne à « jamais exécuté » sans explication.
 
 - [ ] **8. Automatiser la récurrence**
   Une fois la procédure validée manuellement, planifier son exécution périodique (cron externe,

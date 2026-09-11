@@ -23,6 +23,7 @@ htmlcov/
 /scripts/_tmp_*.py
 /backups/
 *.dump
+*.rdb
 
 # OS / editor cruft
 .DS_Store
