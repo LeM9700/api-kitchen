@@ -609,9 +609,6 @@ def _refund_session(order, payment, already_refunded_cents: int):
 
 
 async def test_create_refund_requires_reason():
-    from app.modules.orders.models import Order
-
-    order = Order(id=1, status="delivered", total=12.5)
     session = AsyncMock()
 
     with pytest.raises(AppError) as exc:
@@ -964,16 +961,18 @@ async def test_handle_webhook_unhandled_event_type_dispatches_nothing():
 
 @pytest.fixture
 async def integration_db_session():
-    """Session DB reelle (schema tenant 'default') isolee par savepoint.
+    """Session DB reelle (schema tenant 'pizza_test') isolee par savepoint.
 
     Necessite une base Postgres avec les migrations appliquees (schema
-    tenant_default). Marque le test comme skip si indisponible en local.
+    tenant_pizza_test, cf. scripts/seed_pizza_test.sql -- meme tenant que
+    test_catalog_hub_sync_integration.py). Marque le test comme skip si
+    indisponible en local.
     """
     engine = create_async_engine(settings.test_database_url or settings.database_url)
     try:
         async with engine.connect() as conn:
             await conn.begin()
-            await conn.execute(text('SET search_path TO "tenant_default", public'))
+            await conn.execute(text('SET search_path TO "tenant_pizza_test", public'))
             session = AsyncSession(
                 bind=conn,
                 expire_on_commit=False,
