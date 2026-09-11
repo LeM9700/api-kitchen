@@ -42,8 +42,27 @@ ARQ_REDIS_URL=redis://localhost:6379
 STRIPE_SECRET_KEY=sk_test_xxx
 STRIPE_WEBHOOK_SECRET=whsec_xxx
 JWT_SECRET=change-me-32-chars-minimum
+SUPER_ADMIN_MFA_ENCRYPTION_KEY=<fernet key, see below>
+TENANT_MFA_ENCRYPTION_KEY=<fernet key, see below>
 ENVIRONMENT=local
 ```
+
+`SUPER_ADMIN_MFA_ENCRYPTION_KEY` and `TENANT_MFA_ENCRYPTION_KEY` are required for the super-admin
+MFA endpoints (`/super-admin/mfa/setup`, `/mfa/confirm`, login with `mfa_code`) and tenant-user MFA
+to work — without them, `encrypt_super_admin_mfa_secret`/`encrypt_tenant_mfa_secret` raise
+`CryptoNotConfigured` and the related tests fail. Generate two **distinct** Fernet keys (never reuse
+one for both):
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+**Important**: `DATABASE_URL` is the URL the running app actually connects through — pytest fixtures
+that verify DB state directly (`db_engine` in `tests/conftest.py`) use `TEST_DATABASE_URL` if set,
+*falling back to* `DATABASE_URL` otherwise. If you set both to different databases, the app under
+test writes to one while fixtures assert against the other, and integration tests will fail with
+misleading "missing table"/"tenant not found" errors. Point both at the same database (`pizza_test`)
+unless you specifically need to isolate them.
 
 ## 4. Run migrations
 
