@@ -342,26 +342,31 @@ async def list_temperature_logs(session: AsyncSession, session_id: int) -> list[
 
 # ─── DLC Checks ───────────────────────────────────────────────────────────────
 
-async def log_dlc_check(
+async def _create_dlc_check(
     session: AsyncSession,
-    session_id: int,
+    session_id: int | None,
     data: dict,
     user_id: int,
 ) -> HaccpDlcCheck:
-    """Enregistre une vérification DLC.
+    """Enregistre une vérification DLC, avec ou sans session rattachée.
 
-    Si ``is_compliant=False``, crée une non-conformité automatiquement.
+    Si ``is_compliant=False``, crée une non-conformité automatiquement
+    (``HaccpNonConformity.session_id`` est nullable, donc ceci fonctionne
+    aussi pour une vérification loguée hors session, ex. depuis l'onglet
+    Stock).
 
     Args:
         session: Session DB tenant.
-        session_id: ID de la session.
+        session_id: ID de la session HACCP, ou None si loguée hors session
+            (ex. onglet Stock).
         data: Champs depuis HaccpDlcCheckCreate.
         user_id: ID de l'utilisateur.
 
     Returns:
         Vérification DLC créée.
     """
-    await get_session_by_id(session, session_id)
+    if session_id is not None:
+        await get_session_by_id(session, session_id)
 
     check = HaccpDlcCheck(
         session_id=session_id,
@@ -390,12 +395,72 @@ async def log_dlc_check(
     return check
 
 
+async def log_dlc_check(
+    session: AsyncSession,
+    session_id: int,
+    data: dict,
+    user_id: int,
+) -> HaccpDlcCheck:
+    """Enregistre une vérification DLC rattachée à une session ouverture/fermeture."""
+    return await _create_dlc_check(session, session_id, data, user_id)
+
+
+async def create_standalone_dlc_check(
+    session: AsyncSession,
+    data: dict,
+    user_id: int,
+) -> HaccpDlcCheck:
+    """Enregistre une vérification DLC hors session (ex. onglet Stock)."""
+    return await _create_dlc_check(session, None, data, user_id)
+
+
 async def list_dlc_checks(session: AsyncSession, session_id: int) -> list[HaccpDlcCheck]:
     stmt = select(HaccpDlcCheck).where(
         HaccpDlcCheck.session_id == session_id
     ).order_by(HaccpDlcCheck.logged_at)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def list_all_dlc_checks(
+    session: AsyncSession,
+    ingredient_id: int | None = None,
+    is_compliant: bool | None = None,
+) -> list[HaccpDlcCheck]:
+    """Liste toutes les vérifications DLC du tenant (onglet Stock), les plus récentes d'abord."""
+    stmt = select(HaccpDlcCheck).order_by(HaccpDlcCheck.logged_at.desc())
+    if ingredient_id is not None:
+        stmt = stmt.where(HaccpDlcCheck.ingredient_id == ingredient_id)
+    if is_compliant is not None:
+        stmt = stmt.where(HaccpDlcCheck.is_compliant == is_compliant)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_dlc_check(session: AsyncSession, dlc_id: int) -> HaccpDlcCheck:
+    check = await session.get(HaccpDlcCheck, dlc_id)
+    if not check:
+        raise AppError("NOT_FOUND", "Vérification DLC introuvable.", 404)
+    return check
+
+
+async def update_dlc_check(
+    session: AsyncSession,
+    dlc_id: int,
+    data: dict,
+) -> HaccpDlcCheck:
+    check = await get_dlc_check(session, dlc_id)
+    for key, value in data.items():
+        setattr(check, key, value)
+    await session.commit()
+    await session.refresh(check)
+    return check
+
+
+async def delete_dlc_check(session: AsyncSession, dlc_id: int) -> None:
+    check = await get_dlc_check(session, dlc_id)
+    await session.delete(check)
+    await session.commit()
 
 
 # ─── Cleaning Tasks ───────────────────────────────────────────────────────────

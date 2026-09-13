@@ -42,6 +42,7 @@ from app.modules.haccp.schemas import (
     HaccpCoolingUpdate,
     HaccpDlcCheckCreate,
     HaccpDlcCheckResponse,
+    HaccpDlcCheckUpdate,
     HaccpEquipmentCreate,
     HaccpEquipmentResponse,
     HaccpEquipmentUpdate,
@@ -298,6 +299,69 @@ async def list_dlc(
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         checks = await service.list_dlc_checks(session, session_id)
         return [HaccpDlcCheckResponse.model_validate(c) for c in checks]
+
+
+@router.get(
+    "/dlc",
+    response_model=list[HaccpDlcCheckResponse],
+    summary="Lister toutes les vérifications DLC (onglet Stock)",
+)
+async def list_all_dlc(
+    ingredient_id: int | None = None,
+    is_compliant: bool | None = None,
+    current_user: dict = Depends(get_current_user),
+) -> list[HaccpDlcCheckResponse]:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        checks = await service.list_all_dlc_checks(
+            session, ingredient_id=ingredient_id, is_compliant=is_compliant
+        )
+        return [HaccpDlcCheckResponse.model_validate(c) for c in checks]
+
+
+@router.post(
+    "/dlc",
+    response_model=HaccpDlcCheckResponse,
+    status_code=201,
+    summary="Enregistrer une vérification DLC hors session (onglet Stock)",
+)
+async def create_standalone_dlc(
+    body: HaccpDlcCheckCreate,
+    current_user: dict = Depends(get_current_user),
+) -> HaccpDlcCheckResponse:
+    user_id = int(current_user["id"])
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        check = await service.create_standalone_dlc_check(session, body.model_dump(), user_id)
+        return HaccpDlcCheckResponse.model_validate(check)
+
+
+@router.patch(
+    "/dlc/{dlc_id}",
+    response_model=HaccpDlcCheckResponse,
+    summary="Modifier une vérification DLC (onglet Stock)",
+)
+async def update_dlc(
+    dlc_id: int,
+    body: HaccpDlcCheckUpdate,
+    current_user: dict = Depends(require_role("admin")),
+) -> HaccpDlcCheckResponse:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        check = await service.update_dlc_check(
+            session, dlc_id, body.model_dump(exclude_none=True)
+        )
+        return HaccpDlcCheckResponse.model_validate(check)
+
+
+@router.delete(
+    "/dlc/{dlc_id}",
+    status_code=204,
+    summary="Supprimer une vérification DLC (onglet Stock)",
+)
+async def delete_dlc(
+    dlc_id: int,
+    current_user: dict = Depends(require_role("admin")),
+) -> None:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.delete_dlc_check(session, dlc_id)
 
 
 # ─── Cleaning Tasks ───────────────────────────────────────────────────────────

@@ -138,7 +138,7 @@ class HaccpDlcCheckCreate(BaseModel):
 
 class HaccpDlcCheckResponse(BaseModel):
     id: int
-    session_id: int
+    session_id: int | None
     ingredient_id: int | None
     batch_id: int | None
     ingredient_name: str
@@ -151,6 +151,17 @@ class HaccpDlcCheckResponse(BaseModel):
     logged_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class HaccpDlcCheckUpdate(BaseModel):
+    ingredient_id: int | None = None
+    batch_id: int | None = None
+    ingredient_name: str | None = Field(None, max_length=128)
+    dlc_level: DlcLevel | None = None
+    dlc_date: date | None = None
+    location: str | None = Field(None, max_length=128)
+    is_compliant: bool | None = None
+    corrective_action: str | None = None
 
 
 # ─── Cleaning Tasks ───────────────────────────────────────────────────────────

@@ -123,11 +123,18 @@ class HaccpDlcCheck(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    session_id: Mapped[int] = mapped_column(
-        ForeignKey("haccp_check_sessions.id", ondelete="CASCADE"), nullable=False
+    # Nullable : une verification DLC loguee depuis l'onglet Stock (hors d'une
+    # session ouverture/fermeture) n'est rattachee a aucune session -- voir
+    # service.create_standalone_dlc_check.
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("haccp_check_sessions.id", ondelete="CASCADE"), nullable=True
     )
-    ingredient_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ingredient_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ingredients.id", ondelete="SET NULL"), nullable=True
+    )
+    batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ingredient_batches.id", ondelete="SET NULL"), nullable=True
+    )
     ingredient_name: Mapped[str] = mapped_column(String(128), nullable=False)
     dlc_level: Mapped[int] = mapped_column(Integer, nullable=False)
     dlc_date: Mapped[date] = mapped_column(Date, nullable=False)
