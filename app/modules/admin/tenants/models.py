@@ -131,6 +131,11 @@ class TenantConfig(Base):
     secondary_color: Mapped[str | None] = mapped_column(String(7), nullable=True)
     # Enum applicatif : inter | poppins | playfair_display — validé Pydantic.
     font_family: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Contacts publics affichables dans les apps client/admin.
+    contact_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    contact_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    instagram_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    google_business_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class BusinessHours(Base):

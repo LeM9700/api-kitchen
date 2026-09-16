@@ -897,8 +897,18 @@ async def update_branding(
     """
     config = await get_or_create_config(session)
 
-    branding_fields = ("display_name", "logo_url", "primary_color", "secondary_color", "font_family")
-    updates = data.model_dump(exclude_none=True)
+    branding_fields = (
+        "display_name",
+        "logo_url",
+        "primary_color",
+        "secondary_color",
+        "font_family",
+        "contact_phone",
+        "contact_email",
+        "instagram_url",
+        "google_business_url",
+    )
+    updates = data.model_dump(exclude_unset=True)
 
     for field in branding_fields:
         if field not in updates:
@@ -911,7 +921,7 @@ async def update_branding(
             user_id=user_id,
             field_name=f"branding.{field}",
             old_value=str(old_value) if old_value is not None else None,
-            new_value=str(new_value),
+            new_value=str(new_value) if new_value is not None else None,
             ip_address=ip_address,
             user_agent=user_agent,
             user_email=user_email,

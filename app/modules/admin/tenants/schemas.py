@@ -2,9 +2,10 @@
 """Schemas Pydantic pour le tableau de bord tenant self-service."""
 import re
 from datetime import date, datetime, time, timezone
+from urllib.parse import urlparse
 
 import pytz
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 # ── Branding — constantes de validation ──────────────────────────────────────
 _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -15,6 +16,23 @@ SUPPORTED_FONTS: frozenset[str] = frozenset({"inter", "poppins", "playfair_displ
 SUPPORTED_CURRENCIES: frozenset[str] = frozenset({"EUR", "USD", "GBP", "CAD", "CHF"})
 # Locales pour lesquelles un catalogue de traduction existe (voir app/core/i18n/).
 SUPPORTED_LANGUAGES: frozenset[str] = frozenset({"fr", "en"})
+
+
+def _blank_to_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _validate_public_url(value: str | None, field_label: str) -> str | None:
+    value = _blank_to_none(value)
+    if value is None:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_label} doit etre une URL http(s) valide")
+    return value
 
 
 class TenantConfigUpdate(BaseModel):
@@ -248,6 +266,10 @@ class TenantBrandingResponse(BaseModel):
     primary_color: str | None
     secondary_color: str | None
     font_family: str | None
+    contact_phone: str | None
+    contact_email: str | None
+    instagram_url: str | None
+    google_business_url: str | None
 
 
 class TenantBrandingUpdate(BaseModel):
@@ -261,19 +283,40 @@ class TenantBrandingUpdate(BaseModel):
     primary_color: str | None = None
     secondary_color: str | None = None
     font_family: str | None = None
+    contact_phone: str | None = Field(None, max_length=32)
+    contact_email: EmailStr | None = None
+    instagram_url: str | None = None
+    google_business_url: str | None = None
+
+    @field_validator("display_name", "contact_phone", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, v: str | None) -> str | None:
+        return _blank_to_none(v)
 
     @field_validator("primary_color", "secondary_color", mode="before")
     @classmethod
     def validate_hex_color(cls, v: str | None) -> str | None:
         """Vérifie le format #RRGGBB strict."""
+        v = _blank_to_none(v)
         if v is not None and not _HEX_COLOR_RE.match(v):
             raise ValueError(f"Couleur invalide : '{v}' — format attendu #RRGGBB")
         return v
+
+    @field_validator("logo_url", "instagram_url", "google_business_url", mode="before")
+    @classmethod
+    def validate_urls(cls, v: str | None, info) -> str | None:
+        return _validate_public_url(v, info.field_name)
+
+    @field_validator("contact_email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: str | None) -> str | None:
+        return _blank_to_none(v)
 
     @field_validator("font_family", mode="before")
     @classmethod
     def validate_font(cls, v: str | None) -> str | None:
         """Restreint aux fonts embarquées dans le binaire Flutter."""
+        v = _blank_to_none(v)
         if v is not None and v not in SUPPORTED_FONTS:
             raise ValueError(
                 f"Font non supportée : '{v}'. Valeurs autorisées : {sorted(SUPPORTED_FONTS)}"

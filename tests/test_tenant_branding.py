@@ -29,7 +29,17 @@ async def test_get_branding_returns_expected_fields(client: AsyncClient, demo_te
     assert response.status_code == 200
     data = response.json()
 
-    expected_keys = {"display_name", "logo_url", "primary_color", "secondary_color", "font_family"}
+    expected_keys = {
+        "display_name",
+        "logo_url",
+        "primary_color",
+        "secondary_color",
+        "font_family",
+        "contact_phone",
+        "contact_email",
+        "instagram_url",
+        "google_business_url",
+    }
     assert set(data.keys()) == expected_keys
 
     # [⚠️ PROD] Vérification explicite qu'aucun champ sensible n'est exposé.
@@ -76,6 +86,51 @@ async def test_patch_branding_updates_display_name(
     )
     assert response.status_code == 200
     assert response.json()["display_name"] == "La Bella Pizza"
+
+
+@pytest.mark.asyncio
+async def test_patch_branding_updates_public_contacts(
+    authed_client: AsyncClient,
+    demo_tenant_slug: str,
+):
+    """PATCH met a jour les contacts publics du restaurant."""
+    response = await authed_client.patch(
+        "/api/v1/tenant/branding",
+        params={"tenant_slug": demo_tenant_slug},
+        json={
+            "contact_phone": "06 12 34 56 78",
+            "contact_email": "contact@kodmome.fr",
+            "instagram_url": "https://instagram.com/kodmome",
+            "google_business_url": "https://maps.google.com/?cid=123",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["contact_phone"] == "06 12 34 56 78"
+    assert data["contact_email"] == "contact@kodmome.fr"
+    assert data["instagram_url"] == "https://instagram.com/kodmome"
+    assert data["google_business_url"] == "https://maps.google.com/?cid=123"
+
+
+@pytest.mark.asyncio
+async def test_patch_branding_validates_public_contacts(
+    authed_client: AsyncClient,
+    demo_tenant_slug: str,
+):
+    """Les emails et liens publics invalides sont rejetes."""
+    response = await authed_client.patch(
+        "/api/v1/tenant/branding",
+        params={"tenant_slug": demo_tenant_slug},
+        json={"contact_email": "pas-un-email"},
+    )
+    assert response.status_code == 422
+
+    response = await authed_client.patch(
+        "/api/v1/tenant/branding",
+        params={"tenant_slug": demo_tenant_slug},
+        json={"instagram_url": "instagram.com/kodmome"},
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
