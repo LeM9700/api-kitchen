@@ -1,0 +1,161 @@
+# English translations for PROJECT.
+# Copyright (C) 2026 ORGANIZATION
+# This file is distributed under the same license as the PROJECT project.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: PROJECT VERSION\n"
+"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
+"POT-Creation-Date: 2026-09-16 07:51+0200\n"
+"PO-Revision-Date: 2026-09-15 12:52+0200\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: en\n"
+"Language-Team: en <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: app/core/email/resend_service.py:107 app/core/email/resend_service.py:126
+msgid "Access suspended"
+msgstr "Access suspended"
+
+#: app/core/email/resend_service.py:108 app/core/email/resend_service.py:151
+#: app/core/email/resend_service.py:195
+msgid "Hello,"
+msgstr "Hello,"
+
+#: app/core/email/resend_service.py:110
+#, python-brace-format
+msgid ""
+"Access to your restaurant {tenant_name} on the platform has been "
+"temporarily suspended."
+msgstr ""
+"Access to your restaurant {tenant_name} on the platform has been "
+"temporarily suspended."
+
+#: app/core/email/resend_service.py:116
+msgid "Reason:"
+msgstr "Reason:"
+
+#: app/core/email/resend_service.py:118
+msgid "For any questions, contact platform support by replying to this email."
+msgstr "For any questions, contact platform support by replying to this email."
+
+#: app/core/email/resend_service.py:120 app/core/email/resend_service.py:159
+msgid "This email was sent automatically by the Pizza Platform."
+msgstr "This email was sent automatically by the Pizza Platform."
+
+#: app/core/email/resend_service.py:150 app/core/email/resend_service.py:165
+msgid "Access restored"
+msgstr "Access restored"
+
+#: app/core/email/resend_service.py:153
+#, python-brace-format
+msgid ""
+"Access to your restaurant {tenant_name} on the platform has been "
+"restored. You can log in normally."
+msgstr ""
+"Access to your restaurant {tenant_name} on the platform has been "
+"restored. You can log in normally."
+
+#: app/core/email/resend_service.py:194
+msgid "Password reset"
+msgstr "Password reset"
+
+#: app/core/email/resend_service.py:197
+#, python-brace-format
+msgid ""
+"Your password for {tenant_name} has been reset by the platform "
+"administrator."
+msgstr ""
+"Your password for {tenant_name} has been reset by the platform "
+"administrator."
+
+#: app/core/email/resend_service.py:203
+msgid "Temporary password"
+msgstr "Temporary password"
+
+#: app/core/email/resend_service.py:210
+msgid "You will be asked to change this password on your next login."
+msgstr "You will be asked to change this password on your next login."
+
+#: app/core/email/resend_service.py:213
+msgid "If you did not request this reset, contact support immediately."
+msgstr "If you did not request this reset, contact support immediately."
+
+#: app/core/email/resend_service.py:219
+msgid "New temporary password"
+msgstr "New temporary password"
+
+#: app/modules/orders/service.py:896 app/modules/orders/service.py:1359
+msgid "Ready for pickup"
+msgstr "Ready for pickup"
+
+#: app/modules/orders/service.py:897 app/modules/orders/service.py:1360
+#, python-brace-format
+msgid "Your order #{order_id} is ready!"
+msgstr "Your order #{order_id} is ready!"
+
+#: app/modules/orders/service.py:1031 app/modules/orders/service.py:1033
+#: app/modules/orders/service.py:1046 app/modules/orders/service.py:1069
+#: app/modules/orders/service.py:1071
+msgid "Order not found"
+msgstr "Order not found"
+
+#: app/modules/orders/service.py:1048
+msgid "Only pending orders can be cancelled by customer"
+msgstr "Only pending orders can be cancelled by customer"
+
+#: app/modules/orders/service.py:1295
+msgid "Your order has been cancelled"
+msgstr "Your order has been cancelled"
+
+#: app/modules/orders/service.py:1296 app/modules/orders/service.py:1382
+#, python-brace-format
+msgid "Your order #{order_id} has been cancelled."
+msgstr "Your order #{order_id} has been cancelled."
+
+#: app/modules/orders/service.py:1347
+msgid "Order confirmed"
+msgstr "Order confirmed"
+
+#: app/modules/orders/service.py:1348
+#, python-brace-format
+msgid "Your order #{order_id} has been confirmed."
+msgstr "Your order #{order_id} has been confirmed."
+
+#: app/modules/orders/service.py:1353
+msgid "Being prepared"
+msgstr "Being prepared"
+
+#: app/modules/orders/service.py:1354
+#, python-brace-format
+msgid "Your order #{order_id} is being prepared."
+msgstr "Your order #{order_id} is being prepared."
+
+#: app/modules/orders/service.py:1365 app/modules/orders/service.py:1371
+msgid "Delivered! Enjoy your meal"
+msgstr "Delivered! Enjoy your meal"
+
+#: app/modules/orders/service.py:1366 app/modules/orders/service.py:1372
+#, python-brace-format
+msgid "Your order #{order_id} has been delivered. Enjoy!"
+msgstr "Your order #{order_id} has been delivered. Enjoy!"
+
+#: app/modules/orders/service.py:1381
+msgid "Order cancelled"
+msgstr "Order cancelled"
+
+#: app/modules/payments/service.py:725
+msgid ""
+"Your payment was received, but the order could not be confirmed because a"
+" product or ingredient is unavailable. An automatic refund has been "
+"triggered."
+msgstr ""
+"Your payment was received, but the order could not be confirmed because a"
+" product or ingredient is unavailable. An automatic refund has been "
+"triggered."
+

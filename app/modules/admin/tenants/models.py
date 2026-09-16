@@ -73,6 +73,16 @@ class TenantConfig(Base):
         server_default="EUR",
     )
 
+    # Langue par defaut du tenant ("fr"/"en") — fallback pour les notifications
+    # et emails clients quand le header Accept-Language de la requete est absent
+    # ou non supporte (voir app/core/i18n/).
+    default_language: Mapped[str] = mapped_column(
+        String(2),
+        nullable=False,
+        default="fr",
+        server_default="fr",
+    )
+
     # [PROD] onupdate Python-side : appel callable a chaque UPDATE ORM.
     # Utilise timezone.utc explicitement (datetime.utcnow est deprecie en 3.12+).
     updated_at: Mapped[datetime] = mapped_column(

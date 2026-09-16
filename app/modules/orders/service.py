@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
+from app.core.i18n.translate import t
 from app.modules.admin.tenants.models import TenantConfig
 from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
 from app.modules.delivery.models import DeliveryZone
@@ -892,8 +893,8 @@ async def update_station_preparation(
                 tenant_slug=_effective_tenant,
                 user_id=order.user_id,
                 event="order.ready",
-                title="Prete a recuperer",
-                body=f"Votre commande #{order_id} est prete !",
+                title=t("Ready for pickup"),
+                body=t("Your order #{order_id} is ready!", order_id=order_id),
                 data={"order_id": order_id},
             )
         except Exception as exc:
@@ -1027,9 +1028,9 @@ async def get_order_detail(
 ) -> dict:
     order = await session.get(Order, order_id)
     if order is None:
-        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+        raise AppError("ORDER_NOT_FOUND", t("Order not found"), 404)
     if not is_staff and order.user_id != user_id:
-        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+        raise AppError("ORDER_NOT_FOUND", t("Order not found"), 404)
     return await _serialize_order_detail(session, order)
 
 
@@ -1042,9 +1043,9 @@ async def cancel_my_order(
 ) -> Order:
     order = await session.get(Order, order_id)
     if order is None or order.user_id != user_id:
-        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+        raise AppError("ORDER_NOT_FOUND", t("Order not found"), 404)
     if order.status != "pending":
-        raise AppError("ORDER_CANCEL_NOT_ALLOWED", "Only pending orders can be cancelled by customer", 422)
+        raise AppError("ORDER_CANCEL_NOT_ALLOWED", t("Only pending orders can be cancelled by customer"), 422)
     return await update_status(
         session,
         order_id,
@@ -1065,9 +1066,9 @@ async def build_reorder_payload(
 ) -> dict:
     order = await session.get(Order, order_id)
     if order is None:
-        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+        raise AppError("ORDER_NOT_FOUND", t("Order not found"), 404)
     if not is_staff and order.user_id != user_id:
-        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+        raise AppError("ORDER_NOT_FOUND", t("Order not found"), 404)
 
     items_result = await session.execute(
         select(OrderItem).where(OrderItem.order_id == order_id).order_by(OrderItem.id)
@@ -1284,13 +1285,15 @@ async def update_status(
             pass
 
     # Enqueue notification d'annulation post-commit.
+    # [i18n] Traduit AVANT l'enqueue : le worker arq tourne dans un process
+    # separe, le ContextVar de locale de cette requete n'y survit pas.
     if actual_status == "cancelled" and arq_pool is not None:
         try:
             await arq_pool.enqueue_job(
                 "send_email",
                 to=order.customer_email or "",
-                subject="Votre commande a ete annulee",
-                body=f"Votre commande #{order_id} a ete annulee.",
+                subject=t("Your order has been cancelled"),
+                body=t("Your order #{order_id} has been cancelled.", order_id=order_id),
             )
         except Exception:
             pass
@@ -1336,34 +1339,37 @@ async def update_status(
     try:
         # Table de routing : (previous_status, new_status) -> messages client + staff.
         # staff_title = None signifie pas de notification staff pour cette transition.
+        # [i18n] client_title/client_body traduits (t()) -- perimetre client
+        # uniquement. staff_title/staff_body restent en francais (hors perimetre,
+        # voir plan devise+locale).
         _notif_map: dict[tuple[str, str], dict] = {
             ("pending", "confirmed"): {
-                "client_title": "Commande confirmee",
-                "client_body": f"Votre commande #{order_id} a ete confirmee.",
+                "client_title": t("Order confirmed"),
+                "client_body": t("Your order #{order_id} has been confirmed.", order_id=order_id),
                 "staff_title": "Nouvelle commande",
                 "staff_body": f"Nouvelle commande #{order_id} recue.",
             },
             ("confirmed", "preparing"): {
-                "client_title": "En preparation",
-                "client_body": f"Votre commande #{order_id} est en cours de preparation.",
+                "client_title": t("Being prepared"),
+                "client_body": t("Your order #{order_id} is being prepared.", order_id=order_id),
                 "staff_title": None,
                 "staff_body": None,
             },
             ("preparing", "ready"): {
-                "client_title": "Prete a recuperer",
-                "client_body": f"Votre commande #{order_id} est prete !",
+                "client_title": t("Ready for pickup"),
+                "client_body": t("Your order #{order_id} is ready!", order_id=order_id),
                 "staff_title": None,
                 "staff_body": None,
             },
             ("ready", "delivered"): {
-                "client_title": "Livree ! Bon appetit",
-                "client_body": f"Votre commande #{order_id} a ete livree. Bonne degustation !",
+                "client_title": t("Delivered! Enjoy your meal"),
+                "client_body": t("Your order #{order_id} has been delivered. Enjoy!", order_id=order_id),
                 "staff_title": None,
                 "staff_body": None,
             },
             ("out_for_delivery", "delivered"): {
-                "client_title": "Livree ! Bon appetit",
-                "client_body": f"Votre commande #{order_id} a ete livree. Bonne degustation !",
+                "client_title": t("Delivered! Enjoy your meal"),
+                "client_body": t("Your order #{order_id} has been delivered. Enjoy!", order_id=order_id),
                 "staff_title": None,
                 "staff_body": None,
             },
@@ -1372,8 +1378,8 @@ async def update_status(
         # Transitions vers "cancelled" depuis n'importe quel etat.
         if actual_status == "cancelled":
             notif: dict | None = {
-                "client_title": "Commande annulee",
-                "client_body": f"Votre commande #{order_id} a ete annulee.",
+                "client_title": t("Order cancelled"),
+                "client_body": t("Your order #{order_id} has been cancelled.", order_id=order_id),
                 "staff_title": "Commande annulee",
                 "staff_body": f"Commande #{order_id} annulee (etait : {previous_status}).",
             }

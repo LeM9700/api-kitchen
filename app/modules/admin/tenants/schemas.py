@@ -13,6 +13,8 @@ SUPPORTED_FONTS: frozenset[str] = frozenset({"inter", "poppins", "playfair_displ
 # suppose un facteur x100 partout, les devises "zero-decimal" Stripe (JPY, etc.)
 # ne sont pas supportees pour l'instant.
 SUPPORTED_CURRENCIES: frozenset[str] = frozenset({"EUR", "USD", "GBP", "CAD", "CHF"})
+# Locales pour lesquelles un catalogue de traduction existe (voir app/core/i18n/).
+SUPPORTED_LANGUAGES: frozenset[str] = frozenset({"fr", "en"})
 
 
 class TenantConfigUpdate(BaseModel):
@@ -30,6 +32,7 @@ class TenantConfigUpdate(BaseModel):
     large_stock_adjustment_threshold: float | None = Field(None, ge=0)
     haccp_frying_oil_enabled: bool | None = None
     currency: str | None = None
+    default_language: str | None = None
 
     @field_validator("temporary_closure_message", "default_closure_message", mode="before")
     @classmethod
@@ -61,6 +64,18 @@ class TenantConfigUpdate(BaseModel):
             )
         return v
 
+    @field_validator("default_language", mode="before")
+    @classmethod
+    def validate_default_language(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.lower()
+        if v not in SUPPORTED_LANGUAGES:
+            raise ValueError(
+                f"Langue non supportee : {v!r}. Valeurs autorisees : {sorted(SUPPORTED_LANGUAGES)}"
+            )
+        return v
+
 
 class TenantConfigResponse(BaseModel):
     """Representation complete de la configuration tenant."""
@@ -78,6 +93,7 @@ class TenantConfigResponse(BaseModel):
     overhead_per_order_minutes: int
     timezone: str
     currency: str
+    default_language: str
     large_stock_adjustment_threshold: float
     print_enabled: bool = False
     print_config: dict | None = None

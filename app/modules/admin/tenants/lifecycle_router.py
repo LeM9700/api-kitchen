@@ -264,12 +264,15 @@ async def suspend_tenant(
                 text("SELECT email FROM users WHERE role = 'admin' AND is_active = true LIMIT 1")
             )
             admin = admin_row.mappings().first()
+            # [i18n] Langue du TENANT destinataire, pas celle du super-admin appelant.
+            config = await tenant_service.get_or_create_config(t_session)
         if admin:
             asyncio.ensure_future(
                 send_tenant_suspended(
                     admin_email=admin["email"],
                     tenant_name=dict(tenant_row._mapping)["name"],
                     reason=body.suspension_message or "Aucune raison spécifiée.",
+                    locale=config.default_language,
                 )
             )
     except Exception:
@@ -342,11 +345,14 @@ async def unsuspend_tenant(
                 text("SELECT email FROM users WHERE role = 'admin' AND is_active = true LIMIT 1")
             )
             admin = admin_row.mappings().first()
+            # [i18n] Langue du TENANT destinataire, pas celle du super-admin appelant.
+            config = await tenant_service.get_or_create_config(t_session)
         if admin:
             asyncio.ensure_future(
                 send_tenant_unsuspended(
                     admin_email=admin["email"],
                     tenant_name=dict(tenant_row._mapping)["name"],
+                    locale=config.default_language,
                 )
             )
     except Exception:

@@ -22,6 +22,7 @@ from app.core.http.errors import AppError, app_error_handler
 from app.core.http.limiter import limiter
 from app.core.http.logging_config import configure_logging, set_request_id
 from app.core.http.request_size_limit import RequestSizeLimitMiddleware
+from app.core.i18n.locale import resolve_locale_from_accept_language, set_locale
 from app.core.http.security_headers import SecurityHeadersMiddleware
 from app.core.tenancy.tenant import TenantMiddleware
 from app.modules.notifications import ws_router
@@ -244,6 +245,18 @@ def create_app() -> FastAPI:
             },
         )
         return response
+
+    @app.middleware("http")
+    async def _resolve_locale(request: Request, call_next):
+        """Resout la locale FR/EN de la requete depuis Accept-Language uniquement
+        (voir app/core/i18n/locale.py — resolution "legere", pas d'acces DB ici).
+
+        Alimente le ContextVar consomme par app.core.i18n.translate.t() pour les
+        notifications/emails clients declenches par cette requete.
+        """
+        accept_language = request.headers.get("Accept-Language", "")
+        set_locale(resolve_locale_from_accept_language(accept_language))
+        return await call_next(request)
 
     from app.modules.auth.router import router as auth_router
     from app.modules.catalog.allergen.allergen_router import router as allergen_router

@@ -40,6 +40,7 @@ from app.core.email.resend_service import send_temp_password_reset
 from app.core.http.deps import get_client_ip, get_current_user, require_role
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter
+from app.modules.admin.tenants.service import get_or_create_config
 from app.modules.super_admin import service
 from app.modules.super_admin.schemas import (
     SuperAdminLoginRequest,
@@ -377,6 +378,8 @@ async def reset_tenant_user_password(
             {"hash": get_password_hash(temp_password), "id": user_id},
         )
         await session.commit()
+        # [i18n] Langue du TENANT destinataire, pas celle du super-admin appelant.
+        config = await get_or_create_config(session)
 
     # Notification email (non-bloquante)
     try:
@@ -385,6 +388,7 @@ async def reset_tenant_user_password(
                 user_email=user["email"],
                 tenant_name=tenant["name"],
                 temp_password=temp_password,
+                locale=config.default_language,
             )
         )
     except Exception:

@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 from app.core.config import settings
 from app.core.database import get_public_session
 from app.core.http.errors import AppError
+from app.core.i18n.translate import t
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, set_cached_json
 from app.modules.loyalty.account.models import LoyaltyPointReservation
@@ -720,10 +721,10 @@ async def finalize_payment(
             order_confirmed=False,
             refund_attempted=True,
             refund=refund,
-            user_message=(
-                "Votre paiement a ete recu, mais la commande ne peut pas etre "
-                "confirmee car un produit ou ingredient est indisponible. "
-                "Un remboursement automatique a ete declenche."
+            user_message=t(
+                "Your payment was received, but the order could not be confirmed "
+                "because a product or ingredient is unavailable. An automatic "
+                "refund has been triggered."
             ),
             staff_alert=alert_payload,
         )
