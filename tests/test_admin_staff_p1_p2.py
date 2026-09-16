@@ -165,6 +165,12 @@ async def test_terminal_intent_uses_local_fallback_when_stripe_is_unavailable(mo
     session = AsyncMock()
     session.get = AsyncMock(return_value=order)
     session.add = MagicMock(side_effect=added.append)
+    # get_or_create_config() lit TenantConfig via session.scalar() (devise du
+    # tenant, voir _tenant_currency dans payments/service.py) -- sans ce
+    # return_value explicite, un AsyncMock non configure renvoie un mock
+    # dont .currency.upper() resout en coroutine, pas une string (echec Pydantic
+    # sur PaymentOut.currency). None fait prendre le chemin "config par defaut".
+    session.scalar = AsyncMock(return_value=None)
 
     async def fake_flush():
         added[-1].id = 55

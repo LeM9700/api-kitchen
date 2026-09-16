@@ -4,12 +4,15 @@ import stripe
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
+from sqlalchemy import select
+
 from app.core.config import settings
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_current_user, get_pagination, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse, PaginationParams
 from app.modules.payments import service
+from app.modules.payments.models import Payment
 from app.modules.payments.schemas import (
     LocalTestPaymentRequest,
     PaymentConfirmRequest,
@@ -309,8 +312,13 @@ async def create_refund(
     Raises:
         AppError: Voir ``payments.service.create_refund`` pour les codes d'erreur.
     """
-    response.headers["X-Refund-Currency"] = "EUR"
     async with get_tenant_session(current_user["tenant_slug"]) as session:
+        payment_currency = await session.scalar(
+            select(Payment.currency)
+            .where(Payment.order_id == order_id)
+            .order_by(Payment.created_at.desc(), Payment.id.desc())
+        )
+        response.headers["X-Refund-Currency"] = payment_currency or "EUR"
         return await service.create_refund(
             session,
             tenant_slug=current_user["tenant_slug"],

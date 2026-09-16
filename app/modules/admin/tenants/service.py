@@ -26,8 +26,14 @@ from app.modules.admin.tenants.schemas import (
     TenantStatusResponse,
 )
 from app.modules.orders.models import Order
+from app.modules.payments.models import Payment
 
 _ACTIVE_ORDER_STATUSES = ("confirmed", "in_preparation")
+# Statuts Payment indiquant un encaissement reel (voir PAYMENT_STATUS_PAID dans
+# payments/service.py) — bloque le changement de devise si l'un d'eux existe,
+# pour eviter des paiements historiques dans une devise et une config tenant
+# actuelle dans une autre.
+_REAL_PAYMENT_STATUSES = ("paid", "partially_refunded", "refunded")
 _DAY_NAMES_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 
 # [🔒 SÉCURITÉ] Whitelist strict — aucun tag HTML autorisé dans les messages de fermeture.
@@ -166,6 +172,19 @@ async def update_config(
                     status_code=429,
                     detail="Trop de changements de statut. Attendez 2 minutes avant de modifier is_temporarily_closed.",
                 )
+
+    # [🔒 FINANCE] Devise verrouillee des qu'un paiement reel existe — evite des
+    # paiements historiques dans une devise et une config tenant actuelle dans
+    # une autre.
+    if "currency" in updates and updates["currency"] != config.currency:
+        has_real_payment = await session.scalar(
+            select(Payment.id).where(Payment.status.in_(_REAL_PAYMENT_STATUSES)).limit(1)
+        )
+        if has_real_payment is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Impossible de changer la devise : ce tenant a deja des paiements reels.",
+            )
 
     # [🔒 SÉCURITÉ] Sanitisation XSS avant toute persistance.
     for msg_field in ("temporary_closure_message", "default_closure_message"):

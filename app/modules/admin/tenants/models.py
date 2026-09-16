@@ -63,6 +63,16 @@ class TenantConfig(Base):
         server_default="Europe/Paris",
     )
 
+    # Devise de facturation du tenant (ISO 4217, ex: "EUR", "USD") — une seule
+    # devise par tenant, verrouillee des qu'un paiement reel existe (voir
+    # update_config() dans service.py).
+    currency: Mapped[str] = mapped_column(
+        String(3),
+        nullable=False,
+        default="EUR",
+        server_default="EUR",
+    )
+
     # [PROD] onupdate Python-side : appel callable a chaque UPDATE ORM.
     # Utilise timezone.utc explicitement (datetime.utcnow est deprecie en 3.12+).
     updated_at: Mapped[datetime] = mapped_column(

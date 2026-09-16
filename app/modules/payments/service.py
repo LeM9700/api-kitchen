@@ -41,6 +41,18 @@ WEBHOOK_TOLERANCE_SECONDS = 300
 EXPIRED_PAYMENT_HOURS = 24
 
 
+async def _tenant_currency(session: AsyncSession) -> str:
+    """Devise configuree du tenant courant (ISO 4217, majuscules).
+
+    Fallback "EUR" si la config est absente — get_or_create_config() la cree
+    de toute facon avec ce defaut, ce n'est jamais atteint en pratique.
+    """
+    from app.modules.admin.tenants.service import get_or_create_config
+
+    config = await get_or_create_config(session)
+    return (config.currency or "EUR").upper()
+
+
 @dataclass(frozen=True)
 class StripeContext:
     account_id: str | None = None
@@ -51,6 +63,10 @@ class StripeContext:
 
 
 def _money_to_cents(value: Any) -> int:
+    # Suppose une devise a 2 decimales (x100). Valide pour toutes les devises de
+    # SUPPORTED_CURRENCIES (admin/tenants/schemas.py). Une devise "zero-decimal"
+    # Stripe (JPY, etc.) casserait ce calcul — a traiter en meme temps que
+    # l'allowlist si elle est etendue un jour.
     return int(round(float(value) * 100))
 
 
@@ -193,6 +209,8 @@ def _validate_payment_intent_payload(
     if amount_received is not None and int(amount_received) < expected_amount:
         raise AppError("PAYMENT_AMOUNT_NOT_RECEIVED", "Stripe payment amount has not been fully received.", 409)
 
+    # Fallback purement defensif pour d'anciennes lignes sans devise — payment.currency
+    # est desormais toujours renseigne depuis TenantConfig.currency a la creation.
     expected_currency = str(payment.currency or "EUR").lower()
     if str(intent.get("currency") or "").lower() != expected_currency:
         raise AppError("PAYMENT_CURRENCY_MISMATCH", "Stripe payment currency does not match the order.", 409)
@@ -345,11 +363,12 @@ async def create_intent(
         client_secret = await _client_secret_for_existing_intent(existing_payment, stripe_context)
         return {"payment": existing_payment, "client_secret": client_secret}
 
+    currency = await _tenant_currency(session)
     payment = Payment(
         order_id=order.id,
         provider="stripe",
         amount=order.total,
-        currency="EUR",
+        currency=currency,
         provider_account_id=stripe_context.account_id,
         created_by_user_id=user_id,
         expires_at=now + timedelta(hours=EXPIRED_PAYMENT_HOURS),
@@ -362,7 +381,7 @@ async def create_intent(
         intent = await anyio.to_thread.run_sync(
             lambda: stripe.PaymentIntent.create(
                 amount=_money_to_cents(order.total),
-                currency="eur",
+                currency=currency.lower(),
                 metadata={
                     "tenant_slug": tenant_slug,
                     "order_id": str(order.id),
@@ -416,11 +435,12 @@ async def create_terminal_intent(
         raise AppError("TERMINAL_READER_REQUIRED", "reader_id is required to process on reader", 422, "reader_id")
 
     stripe_context = await get_stripe_context(session, tenant_slug)
+    currency = await _tenant_currency(session)
     payment = Payment(
         order_id=order.id,
         provider="stripe_terminal",
         amount=order.total,
-        currency="EUR",
+        currency=currency,
         provider_account_id=stripe_context.account_id,
         created_by_user_id=user_id,
         expires_at=datetime.now(timezone.utc) + timedelta(hours=EXPIRED_PAYMENT_HOURS),
@@ -434,7 +454,7 @@ async def create_terminal_intent(
         intent = await anyio.to_thread.run_sync(
             lambda: stripe.PaymentIntent.create(
                 amount=_money_to_cents(order.total),
-                currency="eur",
+                currency=currency.lower(),
                 payment_method_types=["card_present"],
                 capture_method="automatic",
                 metadata={
@@ -608,7 +628,7 @@ async def confirm_local_test_payment(
         order_id=order.id,
         provider="local_web_test",
         amount=order.total,
-        currency="EUR",
+        currency=await _tenant_currency(session),
         status="pending",
         created_by_user_id=user_id,
     )

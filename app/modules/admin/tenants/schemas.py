@@ -9,6 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # ── Branding — constantes de validation ──────────────────────────────────────
 _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 SUPPORTED_FONTS: frozenset[str] = frozenset({"inter", "poppins", "playfair_display"})
+# Devises a 2 decimales uniquement — _money_to_cents() dans payments/service.py
+# suppose un facteur x100 partout, les devises "zero-decimal" Stripe (JPY, etc.)
+# ne sont pas supportees pour l'instant.
+SUPPORTED_CURRENCIES: frozenset[str] = frozenset({"EUR", "USD", "GBP", "CAD", "CHF"})
 
 
 class TenantConfigUpdate(BaseModel):
@@ -25,6 +29,7 @@ class TenantConfigUpdate(BaseModel):
     timezone: str | None = None
     large_stock_adjustment_threshold: float | None = Field(None, ge=0)
     haccp_frying_oil_enabled: bool | None = None
+    currency: str | None = None
 
     @field_validator("temporary_closure_message", "default_closure_message", mode="before")
     @classmethod
@@ -44,6 +49,18 @@ class TenantConfigUpdate(BaseModel):
             raise ValueError(f"Timezone inconnue : {v!r}")
         return v
 
+    @field_validator("currency", mode="before")
+    @classmethod
+    def validate_currency(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.upper()
+        if v not in SUPPORTED_CURRENCIES:
+            raise ValueError(
+                f"Devise non supportee : {v!r}. Valeurs autorisees : {sorted(SUPPORTED_CURRENCIES)}"
+            )
+        return v
+
 
 class TenantConfigResponse(BaseModel):
     """Representation complete de la configuration tenant."""
@@ -60,6 +77,7 @@ class TenantConfigResponse(BaseModel):
     auto_calc_prep_time: bool
     overhead_per_order_minutes: int
     timezone: str
+    currency: str
     large_stock_adjustment_threshold: float
     print_enabled: bool = False
     print_config: dict | None = None

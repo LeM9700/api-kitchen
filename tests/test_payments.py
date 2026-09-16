@@ -449,6 +449,99 @@ async def test_create_intent_rejects_guest_order_for_authenticated_user():
     session.scalar.assert_not_called()
 
 
+def _patch_tenant_currency(monkeypatch, currency: str):
+    """Simule TenantConfig.currency sans toucher a la DB (import local dans
+    service._tenant_currency)."""
+    fake_config = MagicMock(currency=currency)
+
+    async def fake_get_or_create_config(session):
+        return fake_config
+
+    monkeypatch.setattr(
+        "app.modules.admin.tenants.service.get_or_create_config",
+        fake_get_or_create_config,
+    )
+
+
+async def test_create_intent_uses_tenant_configured_currency(monkeypatch):
+    order = Order(id=1, user_id=7, status="pending", payment_status="pending", total=12.5)
+    session = AsyncMock()
+    session.execute.return_value = _ScalarOneResult(order)
+    session.scalar.return_value = None  # aucun paiement pending existant
+    session.add = MagicMock()  # session.add() est synchrone dans la vraie API SQLAlchemy
+    _patch_tenant_currency(monkeypatch, "USD")
+
+    with (
+        patch.object(
+            service,
+            "get_stripe_context",
+            new=AsyncMock(return_value=service.StripeContext()),
+        ),
+        patch(
+            "app.modules.payments.service.stripe.PaymentIntent.create",
+            return_value={"id": "pi_usd_1", "client_secret": "secret_usd_1"},
+        ) as create_intent,
+    ):
+        result = await service.create_intent(session, 1, tenant_slug="acme", user_id=7)
+
+    assert result["payment"].currency == "USD"
+    _, kwargs = create_intent.call_args
+    assert kwargs["currency"] == "usd"
+
+
+async def test_create_intent_defaults_to_eur_when_config_absent(monkeypatch):
+    order = Order(id=1, user_id=7, status="pending", payment_status="pending", total=12.5)
+    session = AsyncMock()
+    session.execute.return_value = _ScalarOneResult(order)
+    session.scalar.return_value = None
+    session.add = MagicMock()  # session.add() est synchrone dans la vraie API SQLAlchemy
+    _patch_tenant_currency(monkeypatch, "EUR")
+
+    with (
+        patch.object(
+            service,
+            "get_stripe_context",
+            new=AsyncMock(return_value=service.StripeContext()),
+        ),
+        patch(
+            "app.modules.payments.service.stripe.PaymentIntent.create",
+            return_value={"id": "pi_eur_1", "client_secret": "secret_eur_1"},
+        ) as create_intent,
+    ):
+        result = await service.create_intent(session, 1, tenant_slug="acme", user_id=7)
+
+    assert result["payment"].currency == "EUR"
+    _, kwargs = create_intent.call_args
+    assert kwargs["currency"] == "eur"
+
+
+async def test_create_terminal_intent_uses_tenant_configured_currency(monkeypatch):
+    order = Order(id=1, user_id=7, status="pending", payment_status="pending", total=12.5)
+    session = AsyncMock()
+    session.get.return_value = order
+    # session.add() est synchrone (comme la vraie API SQLAlchemy) — on l'utilise
+    # pour assigner un id, requis par PaymentOut (_payment_out()) en sortie.
+    session.add = MagicMock(side_effect=lambda obj: setattr(obj, "id", 99))
+    _patch_tenant_currency(monkeypatch, "GBP")
+
+    with (
+        patch.object(
+            service,
+            "get_stripe_context",
+            new=AsyncMock(return_value=service.StripeContext()),
+        ),
+        patch(
+            "app.modules.payments.service.stripe.PaymentIntent.create",
+            return_value={"id": "pi_gbp_1", "client_secret": "secret_gbp_1"},
+        ) as create_intent,
+    ):
+        result = await service.create_terminal_intent(session, 1, tenant_slug="acme", user_id=7)
+
+    assert result["payment"].currency == "GBP"
+    _, kwargs = create_intent.call_args
+    assert kwargs["currency"] == "gbp"
+
+
 def _stripe_intent_payload(payment: Payment, order: Order, tenant_slug: str = "acme", **overrides):
     payload = {
         "id": payment.provider_payment_id,
