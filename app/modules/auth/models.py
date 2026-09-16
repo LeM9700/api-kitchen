@@ -22,6 +22,12 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="customer", server_default="customer")
     permissions: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    marketing_email_opt_in: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    marketing_push_opt_in: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # Vérification email — token UUID4 nullable (None = déjà vérifié ou non initié).
     email_verification_token: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

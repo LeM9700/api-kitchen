@@ -47,6 +47,8 @@ def _build_customer_out(user: User) -> CustomerOut:
         phone=user.phone,
         role=user.role,
         email_verified=user.email_verified_at is not None,
+        marketing_email_opt_in=bool(getattr(user, "marketing_email_opt_in", False)),
+        marketing_push_opt_in=bool(getattr(user, "marketing_push_opt_in", False)),
         created_at=user.created_at,
     )
 
@@ -222,6 +224,10 @@ async def update_profile(
             user.full_name = body.full_name
         if body.phone is not None:
             user.phone = body.phone
+        if body.marketing_email_opt_in is not None:
+            user.marketing_email_opt_in = body.marketing_email_opt_in
+        if body.marketing_push_opt_in is not None:
+            user.marketing_push_opt_in = body.marketing_push_opt_in
 
         await session.commit()
         await session.refresh(user)

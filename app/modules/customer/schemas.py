@@ -58,12 +58,16 @@ class CustomerOut(BaseModel):
     phone: str | None
     role: str
     email_verified: bool
+    marketing_email_opt_in: bool = False
+    marketing_push_opt_in: bool = False
     created_at: datetime
 
 
 class CustomerUpdateRequest(BaseModel):
     full_name: str | None = Field(default=None, min_length=1, max_length=255)
     phone: str | None = None
+    marketing_email_opt_in: bool | None = None
+    marketing_push_opt_in: bool | None = None
 
     @field_validator("phone")
     @classmethod

@@ -9,6 +9,7 @@ from worker.tasks.fx_rates_sync import refresh_fx_rates
 from worker.tasks.haccp_alerts import check_haccp_cooling_alerts, check_haccp_nc_alerts
 from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
+from worker.tasks.order_expiration import cancel_stale_pending_orders
 from worker.tasks.scheduled_closures import process_scheduled_closures
 from worker.tasks.stats import aggregate_live_stats, aggregate_monthly_stats
 from worker.tasks.stock_snapshot import aggregate_stock_snapshot
@@ -24,6 +25,7 @@ class WorkerSettings:
         "worker.tasks.hr_alerts.send_hr_late_alert",
         "worker.tasks.hr_alerts.send_hr_overrun_alert",
         "worker.tasks.emails.send_email",
+        "worker.tasks.emails.send_customer_communication_email",
         "worker.tasks.emails.send_verification_email",
         "worker.tasks.emails.send_password_reset_email",
         "worker.tasks.emails.send_stock_alert_email",
@@ -60,6 +62,7 @@ class WorkerSettings:
             process_scheduled_closures,
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
         ),
+        cron(cancel_stale_pending_orders, minute=set(range(60))),
         # Synchronisation catalogue POS (hub) — filet de securite horaire, en
         # complement du webhook et de la resynchronisation paresseuse sur
         # snapshot perime (HubCatalogProvider.get_catalog).

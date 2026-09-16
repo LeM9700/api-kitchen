@@ -5,6 +5,7 @@ from email.mime.text import MIMEText
 
 from app.core.config import settings
 from app.core.database import get_tenant_session
+from app.modules.admin.customers.models import CustomerCommunication
 from app.modules.auth.models import User
 from worker.tasks.worker_utils import with_dead_letter
 
@@ -62,6 +63,58 @@ async def send_email(ctx, to: str, subject: str, body: str) -> None:
     except Exception as exc:
         logger.error("EMAIL echec to=%s subject=%s error=%s", to, subject, exc)
         raise  # Propage pour que ARQ puisse retry
+
+
+@with_dead_letter
+async def send_customer_communication_email(ctx, tenant_slug: str, communication_id: int) -> None:
+    """Envoie un email client persistant et met a jour son historique.
+
+    La task relit le destinataire depuis la DB tenant plutot que d'accepter une
+    adresse email arbitraire depuis Redis. Cela limite le risque d'injection de
+    jobs email si la queue est compromise.
+    """
+    async with get_tenant_session(tenant_slug) as session:
+        communication = await session.get(CustomerCommunication, communication_id)
+        if communication is None or communication.channel != "email":
+            return
+        user = await session.get(User, communication.user_id)
+        if user is None or user.role != "customer" or not user.is_active:
+            communication.status = "skipped"
+            communication.error = "customer_unavailable"
+            await session.commit()
+            return
+
+        to_email = user.email
+        subject = communication.subject or "Message"
+        body = communication.body
+
+        if not settings.smtp_host:
+            logger.info("CUSTOMER EMAIL (SMTP non configure) to=%s subject=%s", to_email, subject)
+            communication.status = "skipped"
+            communication.error = "smtp_not_configured"
+            await session.commit()
+            return
+
+        try:
+            _send_smtp(to_email, subject, body)
+            communication.status = "sent"
+            from datetime import datetime, timezone
+
+            communication.sent_at = datetime.now(timezone.utc)
+            communication.error = None
+            await session.commit()
+            logger.info("CUSTOMER EMAIL envoye tenant=%s communication_id=%s", tenant_slug, communication_id)
+        except Exception as exc:
+            communication.status = "failed"
+            communication.error = str(exc)[:1000]
+            await session.commit()
+            logger.error(
+                "CUSTOMER EMAIL echec tenant=%s communication_id=%s error=%s",
+                tenant_slug,
+                communication_id,
+                exc,
+            )
+            raise
 
 
 @with_dead_letter

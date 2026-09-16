@@ -9,6 +9,7 @@ que de dupliquer la liste chacun de leur cote.
 """
 
 from app.modules.admin.tenants import models as admin_tenants_models  # noqa: F401
+from app.modules.admin.customers import models as admin_customers_models  # noqa: F401
 from app.modules.auth import models as auth_models  # noqa: F401
 from app.modules.catalog.allergen import allergen_models as catalog_allergen_models  # noqa: F401
 from app.modules.catalog.image import image_model as catalog_image_model  # noqa: F401
