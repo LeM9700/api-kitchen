@@ -95,6 +95,12 @@ class ProductOut(BaseModel):
     # docs/superpowers/specs/2026-08-11-hub-catalog-sync-design.md.
     tax_rate: float | None = None
     is_featured: bool = False
+    # Conversion indicative dans la devise demandee via ?display_currency=
+    # (voir app/core/services/fx_rates.py) -- purement informatif, n'affecte
+    # jamais la devise reellement facturee (TenantConfig.currency, verrouillee).
+    # None/None si non demande ou taux indisponible (degradation silencieuse).
+    display_price: float | None = None
+    display_currency: str | None = None
 
 
 class ExtraCreate(BaseModel):

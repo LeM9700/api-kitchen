@@ -5,6 +5,7 @@ from arq.connections import RedisSettings
 
 from app.core.config import settings
 from worker.tasks.catalog_sync import sync_catalog_from_hub, sync_stale_catalog_connections
+from worker.tasks.fx_rates_sync import refresh_fx_rates
 from worker.tasks.haccp_alerts import check_haccp_cooling_alerts, check_haccp_nc_alerts
 from worker.tasks.hr_alerts import check_labor_cost_risk, check_weekly_overtime
 from worker.tasks.loyalty import expire_loyalty_points
@@ -63,6 +64,9 @@ class WorkerSettings:
         # complement du webhook et de la resynchronisation paresseuse sur
         # snapshot perime (HubCatalogProvider.get_catalog).
         cron(sync_stale_catalog_connections, hour=set(range(24)), minute={0}),
+        # Taux de change indicatifs (affichage multi-devise catalogue) —
+        # rafraichissement quotidien, TTL cache 26h (voir fx_rates.py).
+        cron(refresh_fx_rates, hour=4, minute=0, timeout=120),
     ]
     redis_settings = get_redis_settings()
     on_startup = None

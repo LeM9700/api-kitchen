@@ -7,6 +7,9 @@ from app.core.http.errors import AppError
 from app.core.http.limiter import limiter, user_or_ip_key
 from app.core.http.schemas import PaginationParams
 from app.core.services.cache import get_cached_json, invalidate_prefix, set_cached_json
+from app.core.services.fx_rates import get_cached_rate
+from app.modules.admin.tenants.schemas import SUPPORTED_CURRENCIES
+from app.modules.admin.tenants.service import get_or_create_config
 from app.modules.catalog import override_repository, service
 from app.modules.catalog.deps import get_catalog_provider, require_catalog_writable
 from app.modules.catalog.models import Product
@@ -54,6 +57,35 @@ def _tenant_slug_from_header(request: Request) -> str:
     if not slug:
         raise AppError("MISSING_TENANT_SLUG", "X-Tenant-Slug header is required", 400)
     return slug
+
+
+async def _apply_display_currency(items: list[dict], display_currency: str | None, session, redis) -> None:
+    """Ajoute display_price/display_currency a chaque item catalogue (mutation
+    en place) si demande, valide et qu'un taux est disponible en cache.
+
+    [⚠️ PROD] Purement indicatif -- ne touche jamais au prix reellement
+    facture (base_price reste inchange, Stripe charge toujours dans
+    TenantConfig.currency verrouillee). No-op silencieux dans tous les cas
+    d'echec (devise non supportee, taux indisponible) : cette fonctionnalite
+    de confort ne doit jamais faire echouer une requete catalogue.
+    """
+    if not display_currency:
+        return
+    display_currency = display_currency.upper()
+    if display_currency not in SUPPORTED_CURRENCIES:
+        return
+
+    config = await get_or_create_config(session)
+    base_currency = (config.currency or "EUR").upper()
+    rate = await get_cached_rate(redis, base_currency, display_currency)
+    if rate is None:
+        return
+
+    for item in items:
+        base_price = item.get("base_price")
+        if base_price is not None:
+            item["display_price"] = round(float(base_price) * rate, 2)
+            item["display_currency"] = display_currency
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +160,12 @@ async def products(
     price_min: float | None = Query(None, ge=0, description="Prix minimum (inclus)"),
     price_max: float | None = Query(None, ge=0, description="Prix maximum (inclus)"),
     allergen_free: bool = Query(False, description="Ne retourner que les produits sans allergene declare"),
+    display_currency: str | None = Query(
+        None,
+        min_length=3,
+        max_length=3,
+        description="Devise d'affichage indicative (ex: USD) — purement informatif, n'affecte jamais la devise facturee",
+    ),
     redis=Depends(get_arq_pool),
 ):
     slug = _tenant_slug_from_header(request)
@@ -151,6 +189,9 @@ async def products(
     if is_default_listing:
         cached = await get_cached_json(redis, cache_key)
         if cached is not None:
+            if display_currency:
+                async with get_tenant_session(slug) as session:
+                    await _apply_display_currency(cached["items"], display_currency, session, redis)
             return cached
 
     provider = await get_catalog_provider(slug) if is_default_listing else None
@@ -173,9 +214,16 @@ async def products(
             )
             summaries = await service.build_product_summaries(session, items, include_availability=True)
 
-    response = CatalogPaginatedResponse.build(summaries, total, pagination)
-    if is_default_listing:
-        await set_cached_json(redis, cache_key, response.model_dump(mode="json"), ttl_seconds=30)
+        response = CatalogPaginatedResponse.build(summaries, total, pagination)
+        response_dict = response.model_dump(mode="json")
+        if is_default_listing:
+            # [PERF] Le cache stocke la reponse SANS conversion devise -- la
+            # conversion est appliquee apres lecture/ecriture cache, jamais
+            # baquee dedans (elle depend du parametre par-requete display_currency).
+            await set_cached_json(redis, cache_key, response_dict, ttl_seconds=30)
+        if display_currency:
+            await _apply_display_currency(response_dict["items"], display_currency, session, redis)
+            return response_dict
     return response
 
 
@@ -196,19 +244,51 @@ async def product_suggestions(
 async def featured_products(
     request: Request,
     limit: int = Query(10, ge=1, le=50),
+    display_currency: str | None = Query(
+        None,
+        min_length=3,
+        max_length=3,
+        description="Devise d'affichage indicative (ex: USD) — purement informatif, n'affecte jamais la devise facturee",
+    ),
 ):
     slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
         items = await service.list_featured_products(session, limit=limit)
-        return await service.build_product_summaries(session, items, include_availability=True)
+        summaries = await service.build_product_summaries(session, items, include_availability=True)
+        if display_currency:
+            # [PERF] Pas de Depends(get_arq_pool) ici : cet endpoint n'a jamais eu
+            # besoin de redis avant display_currency (fonctionnalite optionnelle),
+            # forcer la dependance casserait tout appel sans arq_pool configure.
+            # get_cached_json degrade deja gracieusement si redis est None.
+            redis = getattr(request.app.state, "arq_pool", None)
+            summaries_dicts = [s.model_dump(mode="json") for s in summaries]
+            await _apply_display_currency(summaries_dicts, display_currency, session, redis)
+            return summaries_dicts
+        return summaries
 
 
 @router.get("/products/{product_id}", response_model=ProductDetailOut)
 @limiter.limit("60/minute")
-async def product_detail(request: Request, product_id: int):
+async def product_detail(
+    request: Request,
+    product_id: int,
+    display_currency: str | None = Query(
+        None,
+        min_length=3,
+        max_length=3,
+        description="Devise d'affichage indicative (ex: USD) — purement informatif, n'affecte jamais la devise facturee",
+    ),
+):
     slug = _tenant_slug_from_header(request)
     async with get_tenant_session(slug) as session:
-        return await service.get_product_detail(session, product_id)
+        detail = await service.get_product_detail(session, product_id)
+        if display_currency:
+            # [PERF] Pas de Depends(get_arq_pool) ici, meme raison que featured_products.
+            redis = getattr(request.app.state, "arq_pool", None)
+            detail_dict = detail.model_dump(mode="json")
+            await _apply_display_currency([detail_dict], display_currency, session, redis)
+            return detail_dict
+        return detail
 
 
 # ---------------------------------------------------------------------------
