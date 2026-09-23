@@ -17,7 +17,7 @@ Routes admin :
 from math import ceil
 
 from fastapi import APIRouter, Depends, Query, Request, status
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.core.database import get_public_session, get_tenant_session
 from app.core.http.deps import get_arq_pool, get_client_ip, require_permission, require_role
@@ -37,12 +37,14 @@ from app.modules.admin.tenants.schemas import (
     TenantClosureToggle,
     TenantConfigAuditResponse,
     TenantConfigResponse,
+    TenantEstablishmentResponse,
     TenantPrintConfigResponse,
     TenantPrintConfigUpdate,
     TenantScheduledClosureRequest,
     TenantConfigUpdate,
     TenantStatusResponse,
 )
+from app.modules.hr.models import Establishment
 
 router = APIRouter()
 
@@ -221,6 +223,26 @@ async def patch_tenant_branding(
 # ---------------------------------------------------------------------------
 # Routes admin -- config
 # ---------------------------------------------------------------------------
+
+
+@router.get("/establishments", response_model=list[TenantEstablishmentResponse])
+async def list_establishments(
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> list[TenantEstablishmentResponse]:
+    """Retourne les etablissements du tenant courant pour le contexte UI.
+
+    L'app admin/staff charge cette route au boot pour choisir le contexte
+    d'etablissement actif utilise par les modules Service, Cuisine, Paiements
+    et Dashboard. La route est volontairement lisible par staff et admin.
+    """
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        result = await session.execute(
+            select(Establishment).order_by(Establishment.is_active.desc(), Establishment.id)
+        )
+        return [
+            TenantEstablishmentResponse.model_validate(establishment)
+            for establishment in result.scalars()
+        ]
 
 
 @router.get("/config", response_model=TenantConfigResponse)

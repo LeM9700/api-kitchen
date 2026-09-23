@@ -195,6 +195,11 @@ async def test_tenant_config_requires_admin(client):
     assert response.status_code == 401
 
 
+async def test_tenant_establishments_route_exists_and_requires_auth(client):
+    response = await client.get("/api/v1/tenant/establishments")
+    assert response.status_code == 401
+
+
 async def test_suspend_requires_super_admin(client):
     response = await client.get("/api/v1/admin/tenants")
     assert response.status_code == 401

@@ -233,6 +233,15 @@ class TenantPrintConfigResponse(BaseModel):
     print_config: dict | None = None
 
 
+class TenantEstablishmentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    timezone: str
+    is_active: bool
+
+
 class TenantSuspendRequest(BaseModel):
     suspension_message: str = Field(..., min_length=1, max_length=500)
 
