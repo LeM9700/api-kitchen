@@ -16,6 +16,7 @@ from app.modules.hr.schemas import (
     EmployeeProfileSelfOut,
     EmployeeProfileUpdate,
     HrAlertOut,
+    LateReportRequest,
     ShiftCreate,
     ShiftOut,
     ShiftUpdate,
@@ -270,6 +271,46 @@ async def clock_out_endpoint(
             tenant_slug=current_user["tenant_slug"],
         )
         return TimeClockEntryOut.model_validate(entry)
+
+
+@router.post("/timeclock/break/start", response_model=TimeClockEntryOut)
+async def start_break_endpoint(
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> TimeClockEntryOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        profile = await hr_service.get_employee_profile_by_user_id(
+            session,
+            user_id=int(current_user["id"]),
+        )
+        entry = await hr_service.start_break(session, profile.id)
+        return TimeClockEntryOut.model_validate(entry)
+
+
+@router.post("/timeclock/break/end", response_model=TimeClockEntryOut)
+async def end_break_endpoint(
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> TimeClockEntryOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        profile = await hr_service.get_employee_profile_by_user_id(
+            session,
+            user_id=int(current_user["id"]),
+        )
+        entry = await hr_service.end_break(session, profile.id)
+        return TimeClockEntryOut.model_validate(entry)
+
+
+@router.post("/alerts/late-report", response_model=HrAlertOut, status_code=201)
+async def report_late_endpoint(
+    body: LateReportRequest,
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> HrAlertOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        profile = await hr_service.get_employee_profile_by_user_id(
+            session,
+            user_id=int(current_user["id"]),
+        )
+        alert = await hr_service.report_late(session, profile, body)
+        return HrAlertOut.model_validate(alert)
 
 
 @router.get("/timeclock/entries", response_model=list[TimeClockEntryOut])

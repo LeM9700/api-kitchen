@@ -110,7 +110,7 @@ async def test_create_order_ignores_client_delivery_fee_without_zone():
 
     product = Product(id=1, name="Margherita", base_price=10, is_active=True)
     session = AsyncMock()
-    session.scalar = AsyncMock(side_effect=[None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, 1])
     session.get = AsyncMock(return_value=product)
     session.add = MagicMock()
     session.flush = AsyncMock()
@@ -125,6 +125,7 @@ async def test_create_order_ignores_client_delivery_fee_without_zone():
     order = await service.create_order(session, body, user_id=1, idempotency_key="abc")
 
     assert isinstance(order, Order)
+    assert order.establishment_id == 1
     assert float(order.delivery_fee) == 0
     assert float(order.total) == 20
 
@@ -137,7 +138,7 @@ async def test_create_order_prices_allowed_extras_server_side():
     product = Product(id=1, name="Margherita", base_price=10, is_active=True)
     extra = Extra(id=5, name="Mozzarella", price=2.5, is_active=True)
     session = AsyncMock()
-    session.scalar = AsyncMock(side_effect=[None, extra, None])
+    session.scalar = AsyncMock(side_effect=[None, extra, None, 1])
     session.get = AsyncMock(return_value=product)
     session.add = MagicMock()
     session.flush = AsyncMock()
@@ -157,6 +158,7 @@ async def test_create_order_prices_allowed_extras_server_side():
     order = await service.create_order(session, body, user_id=1, idempotency_key="abc")
 
     assert float(order.subtotal) == 30
+    assert order.establishment_id == 1
     added_item = session.add.call_args_list[1].args[0]
     assert float(added_item.extras_total) == 10
     assert added_item.extras_snapshot[0]["name"] == "Mozzarella"

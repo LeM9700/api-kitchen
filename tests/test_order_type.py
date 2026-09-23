@@ -90,7 +90,7 @@ async def test_create_pickup_order_has_no_delivery_fee_and_no_address():
     product = Product(id=1, name="Margherita", base_price=10, is_active=True)
     session = AsyncMock()
     # 1) idempotency dedupe check -> None  2) TenantConfig lookup (_estimate_delivery_at) -> None
-    session.scalar = AsyncMock(side_effect=[None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, 1])
     session.get = AsyncMock(return_value=product)
     session.add = MagicMock()
     session.flush = AsyncMock()
@@ -105,6 +105,7 @@ async def test_create_pickup_order_has_no_delivery_fee_and_no_address():
     order = await service.create_order(session, body, user_id=1, idempotency_key="abc")
 
     assert isinstance(order, Order)
+    assert order.establishment_id == 1
     assert order.order_type == "pickup"
     assert float(order.delivery_fee) == 0
     assert order.delivery_address is None
@@ -121,7 +122,7 @@ async def test_create_pickup_order_does_not_look_up_delivery_zone():
 
     product = Product(id=1, name="Margherita", base_price=10, is_active=True)
     session = AsyncMock()
-    session.scalar = AsyncMock(side_effect=[None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, 1])
     session.get = AsyncMock(return_value=product)
     session.add = MagicMock()
     session.flush = AsyncMock()
@@ -148,7 +149,7 @@ async def test_create_dine_in_order_has_no_delivery_fee_and_no_zone():
 
     product = Product(id=1, name="Margherita", base_price=10, is_active=True)
     session = AsyncMock()
-    session.scalar = AsyncMock(side_effect=[None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, 1])
     session.get = AsyncMock(return_value=product)
     session.add = MagicMock()
     session.flush = AsyncMock()

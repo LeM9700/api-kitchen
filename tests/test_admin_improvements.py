@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.modules.admin.tenants.schemas import TenantConfigUpdate, TenantScheduledClosureRequest
-from app.modules.admin.dashboard.schemas import DailyStatsResponse, LiveStatsResponse
+from app.modules.admin.dashboard.schemas import DailyStatsResponse, GroupOverviewResponse, LiveStatsResponse
 
 
 def test_tenant_config_update_valid_timezone():
@@ -69,6 +69,29 @@ def test_live_stats_response_extra_fields_ignored():
     }
     resp = LiveStatsResponse(**{k: v for k, v in data.items() if k != "_id"})
     assert resp.pending_orders == 2
+
+
+def test_group_overview_response_parsing():
+    resp = GroupOverviewResponse(
+        establishment_count=1,
+        ok_count=0,
+        warning_count=1,
+        critical_count=0,
+        items=[
+            {
+                "establishment_id": 1,
+                "establishment_name": "Etablissement principal",
+                "status": "warning",
+                "active_orders": 4,
+                "pending_orders": 2,
+                "late_orders": 0,
+                "revenue_today": 125.5,
+                "staff_present": 1,
+                "staff_expected": 2,
+            }
+        ],
+    )
+    assert resp.items[0].status == "warning"
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +234,11 @@ async def test_stats_summary_requires_admin(client):
     assert response.status_code == 401
 
 
+async def test_group_overview_requires_admin(client):
+    response = await client.get("/api/v1/admin/stats/group-overview")
+    assert response.status_code == 401
+
+
 async def test_suspend_tenant_requires_super_admin(client):
     response = await client.patch(
         "/api/v1/admin/tenants/1/suspend",
@@ -298,12 +326,14 @@ def test_notify_config_change_registered():
         f if isinstance(f, str) else f.__name__
         for f in worker_main.WorkerSettings.functions
     ]
-    assert "worker.tasks.emails.notify_config_change" in func_names
+    assert "notify_config_change" in func_names
 
 
 def test_worker_settings_has_notify_config_change():
     from worker.main import WorkerSettings
-    assert "worker.tasks.emails.notify_config_change" in WorkerSettings.functions
+    from worker.tasks.emails import notify_config_change
+
+    assert notify_config_change in WorkerSettings.functions
 
 
 def test_worker_settings_has_stock_snapshot_cron():

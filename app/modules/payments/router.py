@@ -136,9 +136,10 @@ async def payment_summary(
     current_user: dict = Depends(require_permission("payments:read", "staff", "admin")),
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    establishment_id: int | None = Query(None, ge=1),
 ) -> PaymentSummaryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        return await service.get_payment_summary(session, date_from, date_to)
+        return await service.get_payment_summary(session, date_from, date_to, establishment_id=establishment_id)
 
 
 @router.get("", response_model=PaginatedResponse[PaymentListItemOut])
@@ -152,6 +153,7 @@ async def list_payments(
     provider: str | None = None,
     min_amount: float | None = None,
     max_amount: float | None = None,
+    establishment_id: int | None = Query(None, ge=1),
 ) -> PaginatedResponse[PaymentListItemOut]:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         items, total = await service.list_payments(
@@ -164,6 +166,7 @@ async def list_payments(
             provider=provider,
             min_amount=min_amount,
             max_amount=max_amount,
+            establishment_id=establishment_id,
         )
     return PaginatedResponse.build(items, total, pagination)
 
@@ -175,6 +178,7 @@ async def export_payments_csv(
     provider: str | None = None,
     payment_status: str | None = Query(None, description="Comma-separated order payment statuses"),
     order_type: str | None = None,
+    establishment_id: int | None = Query(None, ge=1),
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> PlainTextResponse:
@@ -185,6 +189,7 @@ async def export_payments_csv(
             provider=provider,
             payment_status=payment_status,
             order_type=order_type,
+            establishment_id=establishment_id,
             date_from=date_from,
             date_to=date_to,
         )

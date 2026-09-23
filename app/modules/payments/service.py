@@ -1331,6 +1331,7 @@ async def list_payments(
     provider: str | None = None,
     min_amount: float | None = None,
     max_amount: float | None = None,
+    establishment_id: int | None = None,
 ) -> tuple[list[PaymentListItemOut], int]:
     def apply_filters(query):
         if status:
@@ -1348,6 +1349,8 @@ async def list_payments(
             query = query.where(Payment.amount >= min_amount)
         if max_amount is not None:
             query = query.where(Payment.amount <= max_amount)
+        if establishment_id is not None:
+            query = query.join(Order, Payment.order_id == Order.id).where(Order.establishment_id == establishment_id)
         return query
 
     stmt = apply_filters(select(Payment))
@@ -1392,6 +1395,7 @@ async def export_payments_csv(
     provider: str | None = None,
     payment_status: str | None = None,
     order_type: str | None = None,
+    establishment_id: int | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> str:
@@ -1406,6 +1410,8 @@ async def export_payments_csv(
         )
     if order_type:
         filters.append(Order.order_type == order_type)
+    if establishment_id is not None:
+        filters.append(Order.establishment_id == establishment_id)
     if date_from:
         filters.append(Payment.created_at >= date_from)
     if date_to:
@@ -1467,9 +1473,17 @@ async def get_payment_summary(
     session: AsyncSession,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    establishment_id: int | None = None,
 ) -> PaymentSummaryOut:
     payment_stmt = select(Payment)
     refund_stmt = select(Refund)
+    if establishment_id is not None:
+        payment_stmt = payment_stmt.join(Order, Payment.order_id == Order.id).where(
+            Order.establishment_id == establishment_id
+        )
+        refund_stmt = refund_stmt.join(Order, Refund.order_id == Order.id).where(
+            Order.establishment_id == establishment_id
+        )
     if date_from:
         payment_stmt = payment_stmt.where(Payment.created_at >= date_from)
         refund_stmt = refund_stmt.where(Refund.created_at >= date_from)

@@ -26,6 +26,7 @@ class Order(Base):
         Index("ix_orders_status", "status"),
         Index("ix_orders_created_at", "created_at"),
         Index("ix_orders_status_created_at", "status", "created_at"),
+        Index("ix_orders_establishment_id", "establishment_id"),
         UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_id_idempotency_key"),
         CheckConstraint("order_type IN ('delivery', 'pickup', 'dine_in')", name="ck_orders_order_type"),
         CheckConstraint("source IN ('customer', 'manual', 'system')", name="ck_orders_source"),
@@ -36,6 +37,7 @@ class Order(Base):
     customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     customer_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    establishment_id: Mapped[int | None] = mapped_column(ForeignKey("establishments.id"), nullable=True)
     # 'delivery' | 'pickup' | 'dine_in' -- contrainte CHECK en base (cf. migrations et
     # _TENANT_DDL_STATEMENTS). String plutot qu'un type ENUM Postgres natif, pour
     # rester coherent avec status/payment_status/role deja en place dans ce module.

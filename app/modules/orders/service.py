@@ -14,6 +14,7 @@ from app.core.i18n.translate import t
 from app.modules.admin.tenants.models import TenantConfig
 from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
 from app.modules.delivery.models import DeliveryZone
+from app.modules.hr.models import Establishment
 from app.modules.loyalty.account.models import LoyaltyTransaction
 from app.modules.loyalty.account.service import get_or_create_account
 from app.modules.loyalty.config.service import credit_points_for_order, get_or_create_loyalty_config
@@ -147,6 +148,7 @@ def _serialize_order_list(order: Order) -> dict:
         "customer_email": order.customer_email,
         "customer_name": getattr(order, "customer_name", None),
         "customer_phone": getattr(order, "customer_phone", None),
+        "establishment_id": getattr(order, "establishment_id", None),
         "order_type": getattr(order, "order_type", None) or "delivery",
         "status": order.status,
         "payment_status": getattr(order, "payment_status", "pending") or "pending",
@@ -254,6 +256,29 @@ async def _estimate_delivery_at(
         else:
             prep_minutes = config.prep_time_normal_minutes
     return datetime.now(timezone.utc) + timedelta(minutes=prep_minutes + delivery_minutes)
+
+
+async def _resolve_establishment_id(session: AsyncSession, establishment_id: int | None) -> int | None:
+    if establishment_id is not None:
+        existing_id = await session.scalar(
+            select(Establishment.id).where(
+                Establishment.id == establishment_id,
+                Establishment.is_active.is_(True),
+            )
+        )
+        if existing_id is None:
+            raise AppError("ESTABLISHMENT_NOT_FOUND", "Establishment not found or inactive", 404, "establishment_id")
+        return int(existing_id)
+
+    default_id = await session.scalar(
+        select(Establishment.id)
+        .where(Establishment.is_active.is_(True))
+        .order_by(Establishment.id)
+        .limit(1)
+    )
+    if default_id is None:
+        raise AppError("ESTABLISHMENT_REQUIRED", "No active establishment available for this order", 409)
+    return int(default_id)
 
 
 async def _resolve_delivery(
@@ -509,6 +534,7 @@ async def create_order(
         session, order_type, getattr(body, "delivery_zone_id", None), subtotal
     )
     estimated_delivery_at = await _estimate_delivery_at(session, delivery_minutes)
+    establishment_id = await _resolve_establishment_id(session, getattr(body, "establishment_id", None))
 
     total = _money(subtotal - discount_total + delivery_fee)
     order = Order(
@@ -516,6 +542,7 @@ async def create_order(
         customer_email=body.customer_email,
         customer_name=customer_name,
         customer_phone=customer_phone,
+        establishment_id=establishment_id,
         order_type=order_type,
         source=source,
         created_by_user_id=created_by_user_id,
@@ -909,6 +936,7 @@ async def list_orders(
     statuses: list[str] | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    establishment_id: int | None = None,
 ) -> tuple[list[dict], int]:
     """Retourne une page de commandes triees par date decroissante.
 
@@ -926,6 +954,8 @@ async def list_orders(
         filters.append(Order.created_at >= date_from)
     if date_to is not None:
         filters.append(Order.created_at <= date_to)
+    if establishment_id is not None:
+        filters.append(Order.establishment_id == establishment_id)
 
     stmt = select(Order)
     count_stmt = select(func.count()).select_from(Order)

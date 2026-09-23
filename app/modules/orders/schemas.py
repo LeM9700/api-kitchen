@@ -26,6 +26,7 @@ class OrderItemCreate(BaseModel):
 
 
 class OrderCreate(BaseModel):
+    establishment_id: int | None = Field(None, ge=1)
     order_type: OrderType = "delivery"
     customer_email: str | None = None
     delivery_address: str | None = None
@@ -102,6 +103,7 @@ class OrderListOut(BaseModel):
     customer_email: str | None
     customer_name: str | None = None
     customer_phone: str | None = None
+    establishment_id: int | None = None
     order_type: str = "delivery"
     status: str
     payment_status: str = "pending"

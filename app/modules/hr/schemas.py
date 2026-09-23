@@ -86,6 +86,11 @@ class ClockInRequest(BaseModel):
     shift_id: int | None = None
 
 
+class LateReportRequest(BaseModel):
+    shift_id: int | None = None
+    reason: str | None = Field(None, max_length=512)
+
+
 class TimeClockEntryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

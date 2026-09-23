@@ -129,12 +129,20 @@ async def list_orders(
     current_user=Depends(require_permission("orders:read", "staff", "admin")),
     pagination: PaginationParams = Depends(get_pagination),
     status: str | None = Query(None, description="Comma-separated statuses"),
+    establishment_id: int | None = Query(None, ge=1),
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         statuses = [part.strip() for part in status.split(",") if part.strip()] if status else None
-        items, total = await service.list_orders(session, pagination, statuses, date_from, date_to)
+        items, total = await service.list_orders(
+            session,
+            pagination,
+            statuses,
+            date_from,
+            date_to,
+            establishment_id=establishment_id,
+        )
     return PaginatedResponse.build(items, total, pagination)
 
 

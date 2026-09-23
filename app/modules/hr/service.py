@@ -22,6 +22,7 @@ from app.modules.hr.schemas import (
     ClockInRequest,
     EmployeeProfileCreate,
     EmployeeProfileUpdate,
+    LateReportRequest,
     ShiftCreate,
     ShiftUpdate,
     TimeClockCorrectionRequest,
@@ -168,7 +169,7 @@ async def clock_in(
     existing = await session.execute(
         select(TimeClockEntry).where(
             TimeClockEntry.employee_id == employee_id,
-            TimeClockEntry.status == "open",
+            TimeClockEntry.status.in_(("open", "break")),
         )
     )
     if existing.scalar_one_or_none() is not None:
@@ -215,7 +216,7 @@ async def clock_out(
     result = await session.execute(
         select(TimeClockEntry).where(
             TimeClockEntry.employee_id == employee_id,
-            TimeClockEntry.status == "open",
+            TimeClockEntry.status.in_(("open", "break")),
         )
     )
     entry = result.scalar_one_or_none()
@@ -241,6 +242,68 @@ async def clock_out(
             pass
 
     return entry
+
+
+async def start_break(
+    session: AsyncSession,
+    employee_id: int,
+) -> TimeClockEntry:
+    result = await session.execute(
+        select(TimeClockEntry).where(
+            TimeClockEntry.employee_id == employee_id,
+            TimeClockEntry.status == "open",
+        )
+    )
+    entry = result.scalar_one_or_none()
+    if entry is None:
+        raise AppError("NOT_CLOCKED_IN", "No open time clock entry for this employee", 409)
+
+    entry.status = "break"
+    await session.commit()
+    await session.refresh(entry)
+    return entry
+
+
+async def end_break(
+    session: AsyncSession,
+    employee_id: int,
+) -> TimeClockEntry:
+    result = await session.execute(
+        select(TimeClockEntry).where(
+            TimeClockEntry.employee_id == employee_id,
+            TimeClockEntry.status == "break",
+        )
+    )
+    entry = result.scalar_one_or_none()
+    if entry is None:
+        raise AppError("NOT_ON_BREAK", "No break in progress for this employee", 409)
+
+    entry.status = "open"
+    await session.commit()
+    await session.refresh(entry)
+    return entry
+
+
+async def report_late(
+    session: AsyncSession,
+    profile: EmployeeProfile,
+    body: LateReportRequest,
+) -> HrAlert:
+    alert = HrAlert(
+        employee_id=profile.id,
+        establishment_id=profile.establishment_id,
+        type="late_reported",
+        severity="warning",
+        payload={
+            "shift_id": body.shift_id,
+            "reason": (body.reason or "").strip() or None,
+            "reported_by_user_id": profile.user_id,
+        },
+    )
+    session.add(alert)
+    await session.commit()
+    await session.refresh(alert)
+    return alert
 
 
 async def list_time_clock_entries(

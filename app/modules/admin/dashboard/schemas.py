@@ -54,3 +54,23 @@ class TopProductResponse(BaseModel):
     product_name: str
     quantity: int
     revenue: float
+
+
+class EstablishmentGroupOverviewItem(BaseModel):
+    establishment_id: int
+    establishment_name: str
+    status: str
+    active_orders: int
+    pending_orders: int
+    late_orders: int
+    revenue_today: float
+    staff_present: int
+    staff_expected: int
+
+
+class GroupOverviewResponse(BaseModel):
+    establishment_count: int
+    ok_count: int
+    warning_count: int
+    critical_count: int
+    items: list[EstablishmentGroupOverviewItem]
