@@ -1,7 +1,7 @@
 """Fix kod-mome tenant currency from EUR (wrong) to RSD (real menu prices)
 
 Revision ID: 0064
-Revises: 0063
+Revises: 0062
 Create Date: 2026-09-23
 
 Contexte : le tenant kod-mome a ses vrais prix catalogue en RSD (dinar serbe
@@ -25,7 +25,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "0064"
-down_revision = "0063"
+down_revision = "0062"
 branch_labels = None
 depends_on = None
 
