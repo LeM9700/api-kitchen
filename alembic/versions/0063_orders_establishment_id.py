@@ -1,7 +1,7 @@
 """Attach orders to establishments
 
 Revision ID: 0063
-Revises: 0062
+Revises: 0065
 Create Date: 2026-09-17
 """
 
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "0063"
-down_revision = "0062"
+down_revision = "0065"
 branch_labels = None
 depends_on = None
 
