@@ -12,8 +12,9 @@ _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 SUPPORTED_FONTS: frozenset[str] = frozenset({"inter", "poppins", "playfair_display"})
 # Devises a 2 decimales uniquement — _money_to_cents() dans payments/service.py
 # suppose un facteur x100 partout, les devises "zero-decimal" Stripe (JPY, etc.)
-# ne sont pas supportees pour l'instant.
-SUPPORTED_CURRENCIES: frozenset[str] = frozenset({"EUR", "USD", "GBP", "CAD", "CHF"})
+# ne sont pas supportees pour l'instant. RSD (dinar serbe, tenant kod-mome)
+# est a 2 decimales cote Stripe -- safe a ajouter ici.
+SUPPORTED_CURRENCIES: frozenset[str] = frozenset({"EUR", "USD", "GBP", "CAD", "CHF", "RSD"})
 # Locales pour lesquelles un catalogue de traduction existe (voir app/core/i18n/).
 SUPPORTED_LANGUAGES: frozenset[str] = frozenset({"fr", "en"})
 

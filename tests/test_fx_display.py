@@ -19,16 +19,31 @@ from app.core.services import fx_rates
 
 async def test_fetch_latest_rates_parses_response():
     fake_response = MagicMock()
-    fake_response.json.return_value = {"rates": {"USD": 1.08, "GBP": 0.86}}
+    fake_response.json.return_value = {
+        "result": "success",
+        "base_code": "EUR",
+        "rates": {"USD": 1.08, "GBP": 0.86, "CHF": 0.95},
+    }
     fake_response.raise_for_status = MagicMock()
 
     with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=fake_response)) as mock_get:
         rates = await fx_rates.fetch_latest_rates("EUR", symbols=["USD", "GBP"])
 
+    # Filtrage cote client : l'API ne supporte pas de parametre "symbols",
+    # elle renvoie toutes les devises (CHF ici) -- seules USD/GBP sont gardees.
     assert rates == {"USD": 1.08, "GBP": 0.86}
-    _, kwargs = mock_get.call_args
-    assert kwargs["params"]["base"] == "EUR"
-    assert kwargs["params"]["symbols"] == "GBP,USD"
+    args, _ = mock_get.call_args
+    assert args[0] == "https://open.er-api.com/v6/latest/EUR"
+
+
+async def test_fetch_latest_rates_raises_on_api_failure_result():
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"result": "error", "error-type": "unsupported-code"}
+    fake_response.raise_for_status = MagicMock()
+
+    with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=fake_response)):
+        with pytest.raises(ValueError):
+            await fx_rates.fetch_latest_rates("RSD")
 
 
 async def test_fetch_latest_rates_raises_on_http_error():

@@ -6,11 +6,14 @@ charge toujours dans TenantConfig.currency (verrouillee, voir
 admin/tenants/service.py::update_config). Ceci est une conversion
 AFFICHAGE SEULEMENT pour aider un client etranger a se reperer.
 
-Fournisseur : Frankfurter (https://frankfurter.dev), taux de reference BCE,
-gratuit, sans cle API -- pas de nouveau secret a configurer. Degradation
-gracieuse systematique : toute erreur (reseau, timeout, format) est loguee
-et traitee comme "taux indisponible", jamais une exception qui remonte a
-l'appelant (voir get_cached_rate -- retourne None, ne leve jamais).
+Fournisseur : open.er-api.com (https://www.exchangerate-api.com/docs/free),
+gratuit, sans cle API -- pas de nouveau secret a configurer. Choisi a la
+place de Frankfurter (taux BCE) car ce dernier ne couvre pas le RSD (dinar
+serbe), la devise reelle du tenant kod-mome -- open.er-api.com couvre ~160
+devises, RSD inclus. Degradation gracieuse systematique : toute erreur
+(reseau, timeout, format, echec API) est loguee et traitee comme "taux
+indisponible", jamais une exception qui remonte a l'appelant (voir
+get_cached_rate -- retourne None, ne leve jamais).
 """
 import logging
 
@@ -20,7 +23,7 @@ from app.core.services.cache import get_cached_json, set_cached_json
 
 logger = logging.getLogger(__name__)
 
-_FRANKFURTER_ENDPOINT = "https://api.frankfurter.dev/v1/latest"
+_ER_API_ENDPOINT = "https://open.er-api.com/v6/latest"
 # Rafraichi quotidiennement par worker/tasks/fx_rates_sync.py (4h00 UTC) --
 # marge de securite sur la fraicheur, bien au-dela des TTL courts (10-60s)
 # utilises ailleurs dans ce module pour du contenu qui change par requete.
@@ -32,28 +35,37 @@ def _cache_key(base_currency: str) -> str:
 
 
 async def fetch_latest_rates(base_currency: str, symbols: list[str] | None = None) -> dict[str, float]:
-    """Recupere les taux de change actuels depuis Frankfurter (base_currency -> *).
+    """Recupere les taux de change actuels depuis open.er-api.com (base_currency -> *).
 
     Args:
         base_currency: Devise de base (ISO 4217).
-        symbols: Devises cibles a restreindre (defaut : toutes celles connues
-            de Frankfurter).
+        symbols: Devises cibles a restreindre (defaut : toutes celles
+            renvoyees par le fournisseur). L'API ne supporte pas de filtre
+            cote serveur (pas de parametre "symbols") -- le filtrage se fait
+            cote client sur la reponse complete.
 
     Returns:
         Mapping devise cible -> taux (ex: {"USD": 1.08}).
 
     Raises:
-        httpx.HTTPError: si l'appel echoue -- a l'appelant de degrader
-            gracieusement (voir refresh_and_cache_rates).
+        httpx.HTTPError: si l'appel HTTP echoue.
+        ValueError: si l'API repond avec un statut d'echec applicatif
+            (``result != "success"``).
+        -- dans tous les cas, a l'appelant de degrader gracieusement (voir
+        refresh_and_cache_rates).
     """
-    params: dict[str, str] = {"base": base_currency.upper()}
-    if symbols:
-        params["symbols"] = ",".join(sorted(s.upper() for s in symbols))
+    url = f"{_ER_API_ENDPOINT}/{base_currency.upper()}"
     async with httpx.AsyncClient() as client:
-        response = await client.get(_FRANKFURTER_ENDPOINT, params=params, timeout=10.0)
+        response = await client.get(url, timeout=10.0)
     response.raise_for_status()
     data = response.json()
-    return {code: float(rate) for code, rate in (data.get("rates") or {}).items()}
+    if data.get("result") != "success":
+        raise ValueError(f"open.er-api.com a renvoye un echec pour base={base_currency!r}: {data!r}")
+    rates = {code: float(rate) for code, rate in (data.get("rates") or {}).items()}
+    if symbols:
+        wanted = {s.upper() for s in symbols}
+        rates = {code: rate for code, rate in rates.items() if code in wanted}
+    return rates
 
 
 async def refresh_and_cache_rates(redis, base_currency: str, symbols: list[str] | None = None) -> bool:
