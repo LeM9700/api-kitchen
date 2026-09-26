@@ -9,6 +9,9 @@ from app.modules.customer.schemas import (
     CustomerDataExportOut,
     CustomerDeleteRequest,
     CustomerOut,
+    CustomerPhoneRegisterRequest,
+    CustomerPhoneStartRequest,
+    CustomerPhoneVerifyRequest,
     CustomerRegisterRequest,
     CustomerUpdateRequest,
 )
@@ -27,6 +30,45 @@ async def register(
         raise AppError("MISSING_TENANT_SLUG", "X-Tenant-Slug header is required", 400)
     arq_pool = getattr(request.app.state, "arq_pool", None)
     _, access, refresh, session_id = await service.register(x_tenant_slug, body, arq_pool=arq_pool)
+    return TokenResponse(access_token=access, refresh_token=refresh, session_id=session_id)
+
+
+@router.post("/phone/start", status_code=202)
+@limiter.limit("5/minute")
+async def start_phone_auth(
+    request: Request,
+    body: CustomerPhoneStartRequest,
+    x_tenant_slug: str | None = Header(default=None, alias="x-tenant-slug"),
+):
+    if x_tenant_slug is None:
+        raise AppError("MISSING_TENANT_SLUG", "X-Tenant-Slug header is required", 400)
+    arq_pool = getattr(request.app.state, "arq_pool", None)
+    return await service.start_phone_auth(x_tenant_slug, body, arq_pool=arq_pool)
+
+
+@router.post("/register-phone", status_code=202)
+@limiter.limit("5/minute")
+async def register_phone(
+    request: Request,
+    body: CustomerPhoneRegisterRequest,
+    x_tenant_slug: str | None = Header(default=None, alias="x-tenant-slug"),
+):
+    if x_tenant_slug is None:
+        raise AppError("MISSING_TENANT_SLUG", "X-Tenant-Slug header is required", 400)
+    arq_pool = getattr(request.app.state, "arq_pool", None)
+    return await service.register_phone(x_tenant_slug, body, arq_pool=arq_pool)
+
+
+@router.post("/phone/verify", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def verify_phone_auth(
+    request: Request,
+    body: CustomerPhoneVerifyRequest,
+    x_tenant_slug: str | None = Header(default=None, alias="x-tenant-slug"),
+):
+    if x_tenant_slug is None:
+        raise AppError("MISSING_TENANT_SLUG", "X-Tenant-Slug header is required", 400)
+    _, access, refresh, session_id = await service.verify_phone_auth(x_tenant_slug, body)
     return TokenResponse(access_token=access, refresh_token=refresh, session_id=session_id)
 
 

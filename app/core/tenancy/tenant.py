@@ -27,6 +27,9 @@ BYPASS_PATHS = {
     "/api/v1/auth/reset-password",
     "/api/v1/auth/verify-email",
     "/api/v1/customer/register",
+    "/api/v1/customer/register-phone",
+    "/api/v1/customer/phone/start",
+    "/api/v1/customer/phone/verify",
 }
 
 CHANGE_PASSWORD_PATHS = {
@@ -147,7 +150,12 @@ async def create_tenant_schema_on(executor, tenant_slug: str) -> None:
     await _execute_create_schema(executor, schema)
 
 
-async def user_belongs_to_tenant(user_id: int, tenant_slug: str, email: str | None) -> bool:
+async def user_belongs_to_tenant(
+    user_id: int,
+    tenant_slug: str,
+    email: str | None,
+    phone_e164: str | None = None,
+) -> bool:
     """Verifie que ``user_id`` appartient bien au tenant ``tenant_slug`` ET que
     son email correspond au claim ``email`` du JWT.
 
@@ -170,7 +178,11 @@ async def user_belongs_to_tenant(user_id: int, tenant_slug: str, email: str | No
     tout en renvoyant l'etat courant (role/permissions/is_active).
     """
     state = await get_live_tenant_user_state(user_id, tenant_slug)
-    return state is not None and email is not None and state.email == email
+    if state is None:
+        return False
+    if email is not None:
+        return state.email == email
+    return phone_e164 is not None and state.phone_e164 == phone_e164
 
 
 class LiveTenantUserState:
@@ -187,11 +199,20 @@ class LiveTenantUserState:
     autoritaire plutot que de faire confiance a une copie figee dans le JWT.
     """
 
-    __slots__ = ("id", "email", "role", "permissions", "is_active")
+    __slots__ = ("id", "email", "phone_e164", "role", "permissions", "is_active")
 
-    def __init__(self, id: int, email: str, role: str, permissions: list[str] | None, is_active: bool):
+    def __init__(
+        self,
+        id: int,
+        email: str | None,
+        role: str,
+        permissions: list[str] | None,
+        is_active: bool,
+        phone_e164: str | None = None,
+    ):
         self.id = id
         self.email = email
+        self.phone_e164 = phone_e164
         self.role = role
         self.permissions = permissions
         self.is_active = is_active
@@ -218,6 +239,7 @@ async def get_live_tenant_user_state(user_id: int, tenant_slug: str) -> LiveTena
         return LiveTenantUserState(
             id=user.id,
             email=user.email,
+            phone_e164=user.phone_e164,
             role=user.role,
             permissions=user.permissions,
             is_active=user.is_active,

@@ -85,6 +85,9 @@ class Settings(BaseSettings):
 
     # URL publique de l'application (utilisée dans les liens d'email).
     app_base_url: str = "http://localhost:8000"
+    # URL publique envoyee par SMS aux clients crees depuis la caisse. Vide =
+    # fallback sur app_base_url.
+    client_app_download_url: str = ""
 
     # CORS — origines autorisées (JSON array dans le .env).
     # Ex : CORS_ORIGINS=["https://app.monsite.com","https://admin.monsite.com"]
@@ -121,6 +124,23 @@ class Settings(BaseSettings):
     resend_from_email: str = "Super Admin <noreply@pizza-platform.com>"
     # URL publique du super-admin (utilisée dans les liens d'email).
     super_admin_base_url: str = "http://localhost:3001"
+
+    # SMS transactionnels — vide = desactive en local/test. Le lot 1 pose le
+    # contrat d'envoi; le provider reel sera branche via worker.tasks.sms.
+    sms_provider: str = ""
+    default_phone_country_code: str = "+33"
+    ovh_endpoint: str = "ovh-eu"
+    ovh_sms_service_name: str = ""
+    ovh_application_key: str = ""
+    ovh_application_secret: str = ""
+    ovh_consumer_key: str = ""
+    ovh_sms_sender: str = ""
+    ovh_sms_no_stop_clause: bool = True
+
+    # QR fidelite client: token signe, court, sans donnees personnelles.
+    # loyalty_qr_secret vide = fallback sur jwt_secret.
+    loyalty_qr_secret: str = ""
+    loyalty_qr_ttl_seconds: int = 120
 
     # Hub POS OAuth 2.0 — HubRise (https://www.hubrise.com/developers). Chaine
     # vide sur client_id = feature desactivee (comme smtp_host,

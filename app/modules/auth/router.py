@@ -270,9 +270,12 @@ async def me(current_user: dict = Depends(get_current_user)):
             email=user.email,
             full_name=user.full_name,
             phone=user.phone,
+            phone_e164=user.phone_e164,
             role=user.role,
             permissions=user.permissions,
             is_active=user.is_active,
             email_verified=user.email_verified_at is not None,
+            phone_verified=user.phone_verified_at is not None,
+            pending_profile_completion=user.pending_profile_completion,
             must_change_password=user.must_change_password,
         )

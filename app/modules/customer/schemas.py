@@ -53,18 +53,62 @@ class CustomerOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    email: EmailStr
+    email: EmailStr | None
     full_name: str | None
     phone: str | None
+    phone_e164: str | None = None
     role: str
     email_verified: bool
+    phone_verified: bool = False
+    pending_profile_completion: bool = False
     marketing_email_opt_in: bool = False
     marketing_push_opt_in: bool = False
     created_at: datetime
 
 
+class CustomerPhoneStartRequest(BaseModel):
+    phone: str
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        if not PHONE_RE.fullmatch(v.strip()):
+            raise ValueError("Numero de telephone invalide")
+        return v.strip()
+
+
+class CustomerPhoneVerifyRequest(BaseModel):
+    phone: str
+    code: str = Field(min_length=4, max_length=8)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        if not PHONE_RE.fullmatch(v.strip()):
+            raise ValueError("Numero de telephone invalide")
+        return v.strip()
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        stripped = v.strip().replace(" ", "")
+        if not stripped.isdigit():
+            raise ValueError("Code SMS invalide")
+        return stripped
+
+
+class CustomerPhoneRegisterRequest(CustomerPhoneStartRequest):
+    first_name: str = Field(min_length=1, max_length=120)
+    last_name: str = Field(min_length=1, max_length=120)
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name.strip()} {self.last_name.strip()}".strip()
+
+
 class CustomerUpdateRequest(BaseModel):
     full_name: str | None = Field(default=None, min_length=1, max_length=255)
+    email: EmailStr | None = None
     phone: str | None = None
     marketing_email_opt_in: bool | None = None
     marketing_push_opt_in: bool | None = None

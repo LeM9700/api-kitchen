@@ -28,6 +28,7 @@ from worker.tasks.stats import aggregate_live_stats, aggregate_monthly_stats
 from worker.tasks.stats import aggregate_daily_stats
 from worker.tasks.stock_alerts import send_stock_alert
 from worker.tasks.stock_snapshot import aggregate_stock_snapshot
+from worker.tasks.sms import send_sms
 from worker.tasks.worker_utils import dead_letter_handler
 
 
@@ -44,6 +45,7 @@ class WorkerSettings:
         send_customer_communication_email,
         send_verification_email,
         send_password_reset_email,
+        send_sms,
         send_stock_alert_email,
         notify_config_change,
         aggregate_daily_stats,

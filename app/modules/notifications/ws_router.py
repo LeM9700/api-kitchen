@@ -764,7 +764,12 @@ async def notifications_ws(
     # [SECURITE] Revalide que le sub appartient bien au tenant reclame -- meme
     # controle que app.core.http.deps.get_current_user, necessaire ici car ce
     # handler WS ne passe pas par get_current_user (voir user_belongs_to_tenant).
-    if payload_tenant and not await user_belongs_to_tenant(user_id, payload_tenant, payload.get("email")):
+    if payload_tenant and not await user_belongs_to_tenant(
+        user_id,
+        payload_tenant,
+        payload.get("email"),
+        payload.get("phone_e164"),
+    ):
         await websocket.send_json({
             "type": "error",
             "code": "unauthorized",

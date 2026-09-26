@@ -88,7 +88,16 @@ async def get_current_user(
         from app.core.tenancy.tenant import get_live_tenant_user_state
 
         live_state = await get_live_tenant_user_state(int(user_id_str), tenant_slug)
-        if live_state is None or live_state.email != payload.get("email"):
+        identity_matches = False
+        if live_state is not None:
+            if payload.get("email") is not None:
+                identity_matches = live_state.email == payload.get("email")
+            else:
+                identity_matches = (
+                    payload.get("phone_e164") is not None
+                    and live_state.phone_e164 == payload.get("phone_e164")
+                )
+        if not identity_matches:
             raise AppError("UNAUTHORIZED", "Invalid token", 401)
         # [🔒 SÉCURITÉ] N'accorde JAMAIS confiance aux claims role/permissions du
         # JWT au-dela de l'instant de son emission : un retrait de permission ou
@@ -128,6 +137,7 @@ async def get_current_user(
         "role": payload.get("role"),
         "permissions": payload.get("permissions"),
         "email": payload.get("email"),
+        "phone_e164": payload.get("phone_e164"),
         "must_change_password": payload.get("must_change_password", False),
         "jti": jti,
         "exp": payload.get("exp"),

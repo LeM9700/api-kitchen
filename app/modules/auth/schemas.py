@@ -125,13 +125,16 @@ class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    email: EmailStr
+    email: EmailStr | None
     full_name: str | None
     phone: str | None
+    phone_e164: str | None = None
     role: str
     permissions: list[str] | None = None
     is_active: bool
     email_verified: bool
+    phone_verified: bool = False
+    pending_profile_completion: bool = False
     must_change_password: bool
 
 

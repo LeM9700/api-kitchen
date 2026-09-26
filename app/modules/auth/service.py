@@ -348,6 +348,7 @@ async def issue_tokens(
     payload = {
         "sub": str(user.id),
         "email": user.email,
+        "phone_e164": user.phone_e164,
         "role": user.role,
         "permissions": user.permissions,
         "tenant_id": tenant_id,

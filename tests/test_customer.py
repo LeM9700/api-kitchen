@@ -23,6 +23,9 @@ from app.modules.customer.schemas import CustomerDataExportOut, CustomerOrderExp
 # ---------------------------------------------------------------------------
 
 REGISTER_URL = "/api/v1/customer/register"
+REGISTER_PHONE_URL = "/api/v1/customer/register-phone"
+PHONE_START_URL = "/api/v1/customer/phone/start"
+PHONE_VERIFY_URL = "/api/v1/customer/phone/verify"
 ME_URL = "/api/v1/customer/me"
 
 VALID_REGISTER_BODY = {
@@ -151,6 +154,72 @@ async def test_register_missing_tenant_header(client):
     response = await client.post(REGISTER_URL, json=VALID_REGISTER_BODY)
     assert response.status_code == 400
     assert response.json()["code"] == "MISSING_TENANT_SLUG"
+
+
+async def test_phone_start_requires_tenant_header(client):
+    response = await client.post(PHONE_START_URL, json={"phone": "+33612345678"})
+    assert response.status_code == 400
+    assert response.json()["code"] == "MISSING_TENANT_SLUG"
+
+
+async def test_phone_start_returns_202(client, monkeypatch):
+    async def fake_start(tenant_slug, body, arq_pool=None):
+        assert tenant_slug == "test-tenant"
+        assert body.phone == "+33612345678"
+        return {"message": "sent"}
+
+    monkeypatch.setattr("app.modules.customer.router.service.start_phone_auth", fake_start)
+
+    response = await client.post(
+        PHONE_START_URL,
+        json={"phone": "+33612345678"},
+        headers={"x-tenant-slug": "test-tenant"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["message"] == "sent"
+
+
+async def test_register_phone_returns_202(client, monkeypatch):
+    async def fake_register_phone(tenant_slug, body, arq_pool=None):
+        assert tenant_slug == "test-tenant"
+        assert body.phone == "+33612345678"
+        assert body.full_name == "Ada Lovelace"
+        return {"message": "sent"}
+
+    monkeypatch.setattr("app.modules.customer.router.service.register_phone", fake_register_phone)
+
+    response = await client.post(
+        REGISTER_PHONE_URL,
+        json={"phone": "+33612345678", "first_name": "Ada", "last_name": "Lovelace"},
+        headers={"x-tenant-slug": "test-tenant"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["message"] == "sent"
+
+
+async def test_phone_verify_returns_tokens(client, monkeypatch):
+    mock_user = MagicMock()
+
+    async def fake_verify(tenant_slug, body):
+        assert tenant_slug == "test-tenant"
+        assert body.phone == "+33612345678"
+        assert body.code == "123456"
+        return (mock_user, "access_phone", "refresh_phone", 101)
+
+    monkeypatch.setattr("app.modules.customer.router.service.verify_phone_auth", fake_verify)
+
+    response = await client.post(
+        PHONE_VERIFY_URL,
+        json={"phone": "+33612345678", "code": "123456"},
+        headers={"x-tenant-slug": "test-tenant"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["access_token"] == "access_phone"
+    assert response.json()["refresh_token"] == "refresh_phone"
+    assert response.json()["session_id"] == 101
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -12,13 +12,22 @@ class User(Base):
         UniqueConstraint("email", name="uq_users_email"),
         UniqueConstraint("email_verification_token", name="users_email_verification_token_key"),
         UniqueConstraint("password_reset_token", name="users_password_reset_token_key"),
+        Index("ix_users_phone_e164", "phone_e164", unique=True),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    email: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_e164: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    phone_otp_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone_otp_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    phone_otp_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    pending_profile_completion: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="customer", server_default="customer")
     permissions: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
