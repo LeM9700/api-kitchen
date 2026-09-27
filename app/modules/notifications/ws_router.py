@@ -836,6 +836,14 @@ async def notifications_ws(
     except Exception as exc:
         logger.error("check_and_record_credential_stuffing failed: %s", exc)
 
+    # La limite IP protege les handshakes rates/bruteforce. Une authentification
+    # complete et valide remet le compteur a zero pour ne pas penaliser les
+    # reconnexions legitimes d'une meme caisse/tablette derriere la meme IP.
+    try:
+        await redis.delete(ip_attempts_key)
+    except Exception as exc:
+        logger.debug("WS ip_attempts reset failed ip=%s error=%s", client_ip, exc)
+
     # -------------------------------------------------------------------------
     # Phase 3 : limite de connexions par user (SCARD + Lock pour eviter race)
     # -------------------------------------------------------------------------
