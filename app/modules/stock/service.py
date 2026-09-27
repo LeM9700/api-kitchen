@@ -15,6 +15,7 @@ from app.modules.catalog.models import (
     ProductExtra,
     ProductVariant,
 )
+from app.modules.haccp.models import HaccpDlcCheck
 from app.modules.orders.models import OrderItem
 from app.modules.stock.models import (
     Ingredient,
@@ -54,12 +55,59 @@ _UNIT_FACTORS: dict[str, tuple[str, float]] = {
 
 _AUTO_STOCK_USER_ID = 0
 _AUTO_STOCK_REASON_PREFIX = "Stock insuffisant"
+_AUTO_DLC_REASON_PREFIX = "DLC expiree"
+_USABLE_BATCH_STATUSES = {"sealed", "opened"}
 
 
 def _stock_unavailable_reason(limiting_ingredient: str | None) -> str:
     if limiting_ingredient:
         return f"{_AUTO_STOCK_REASON_PREFIX} : {limiting_ingredient}"
     return _AUTO_STOCK_REASON_PREFIX
+
+
+def _dlc_unavailable_reason(limiting_ingredient: str | None) -> str:
+    if limiting_ingredient:
+        return f"{_AUTO_DLC_REASON_PREFIX} : {limiting_ingredient}"
+    return _AUTO_DLC_REASON_PREFIX
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _validate_primary_dlc(expires_at: datetime | None, *, now: datetime | None = None) -> datetime:
+    if expires_at is None:
+        raise AppError(
+            "BATCH_DLC_REQUIRED",
+            "Primary DLC is required to create or update an ingredient batch",
+            422,
+            "expires_at",
+        )
+
+    checked_at = now or datetime.now(timezone.utc)
+    normalized = _as_aware_utc(expires_at)
+    if normalized <= checked_at:
+        raise AppError(
+            "BATCH_DLC_EXPIRED",
+            "Primary DLC must be in the future",
+            422,
+            "expires_at",
+        )
+    return normalized
+
+
+def _secondary_batch_expires_at(batch: IngredientBatch) -> datetime | None:
+    opened_at = getattr(batch, "opened_at", None)
+    use_within = getattr(batch, "use_within_hours_after_opening", None)
+    return opened_at + timedelta(hours=int(use_within)) if opened_at and use_within else None
+
+
+def _tertiary_batch_expires_at(batch: IngredientBatch) -> datetime | None:
+    started_at = getattr(batch, "tertiary_started_at", None)
+    use_within = getattr(batch, "tertiary_use_within_hours", None)
+    return started_at + timedelta(hours=int(use_within)) if started_at and use_within else None
 
 
 def _clean_unit(unit: str) -> str:
@@ -92,16 +140,122 @@ def _normalize_quantity(
 
 
 def _effective_batch_expires_at(batch: IngredientBatch) -> datetime | None:
-    opened_at = getattr(batch, "opened_at", None)
-    use_within = getattr(batch, "use_within_hours_after_opening", None)
-    after_open = opened_at + timedelta(hours=int(use_within)) if opened_at and use_within else None
-    expires_at = getattr(batch, "expires_at", None)
-    if after_open and expires_at:
-        return min(after_open, expires_at)
-    return after_open or expires_at
+    deadline = _effective_batch_dlc(batch)
+    return deadline[1] if deadline is not None else None
+
+
+def _effective_batch_dlc(batch: IngredientBatch) -> tuple[str, datetime] | None:
+    deadlines: list[tuple[str, datetime]] = []
+    if batch.expires_at is not None:
+        deadlines.append(("primary", _as_aware_utc(batch.expires_at)))
+    secondary_expires_at = _secondary_batch_expires_at(batch)
+    if secondary_expires_at is not None:
+        deadlines.append(("secondary", _as_aware_utc(secondary_expires_at)))
+    tertiary_expires_at = _tertiary_batch_expires_at(batch)
+    if tertiary_expires_at is not None:
+        deadlines.append(("tertiary", _as_aware_utc(tertiary_expires_at)))
+    if not deadlines:
+        return None
+    return min(deadlines, key=lambda item: item[1])
+
+
+def _batch_is_expired(batch: IngredientBatch, now: datetime) -> bool:
+    effective = _effective_batch_expires_at(batch)
+    return effective is not None and _as_aware_utc(effective) <= now
+
+
+def _batch_needs_dlc_regularization(batch: IngredientBatch) -> bool:
+    return batch.status in _USABLE_BATCH_STATUSES and batch.expires_at is None
+
+
+def _batch_is_usable(batch: IngredientBatch, now: datetime) -> bool:
+    return (
+        batch.status in _USABLE_BATCH_STATUSES
+        and batch.expires_at is not None
+        and not _batch_is_expired(batch, now)
+    )
+
+
+async def _mark_expired_batches(
+    session: AsyncSession,
+    ingredient_ids: set[int] | None = None,
+    *,
+    now: datetime | None = None,
+    commit: bool = False,
+) -> int:
+    checked_at = now or datetime.now(timezone.utc)
+    stmt = select(IngredientBatch).where(IngredientBatch.status.in_(tuple(_USABLE_BATCH_STATUSES)))
+    if ingredient_ids:
+        stmt = stmt.where(IngredientBatch.ingredient_id.in_(tuple(ingredient_ids)))
+
+    result = await session.execute(stmt)
+    expired_count = 0
+    for batch in result.scalars():
+        if _batch_is_expired(batch, checked_at):
+            batch.status = "expired"
+            expired_count += 1
+
+    if expired_count:
+        if commit:
+            await session.commit()
+        else:
+            await session.flush()
+    return expired_count
+
+
+def _usable_stock_payload(ingredient: Ingredient, batches: list[IngredientBatch], now: datetime) -> dict:
+    usable_qty = sum(float(batch.quantity) for batch in batches if _batch_is_usable(batch, now))
+    usable_qty = max(0.0, min(float(ingredient.current_qty), usable_qty))
+    current_qty = float(ingredient.current_qty)
+    return {
+        "ingredient_id": ingredient.id,
+        "current_qty": current_qty,
+        "usable_qty": usable_qty,
+        "blocked_qty": max(0.0, current_qty - usable_qty),
+        "expired_batch_count": sum(1 for batch in batches if batch.status == "expired" or _batch_is_expired(batch, now)),
+        "regularize_batch_count": sum(1 for batch in batches if _batch_needs_dlc_regularization(batch)),
+    }
+
+
+async def _batches_for_ingredients(
+    session: AsyncSession,
+    ingredient_ids: set[int],
+) -> dict[int, list[IngredientBatch]]:
+    if not ingredient_ids:
+        return {}
+    result = await session.execute(
+        select(IngredientBatch).where(IngredientBatch.ingredient_id.in_(tuple(ingredient_ids)))
+    )
+    batches_by_ingredient: dict[int, list[IngredientBatch]] = {ingredient_id: [] for ingredient_id in ingredient_ids}
+    for batch in result.scalars():
+        batches_by_ingredient.setdefault(batch.ingredient_id, []).append(batch)
+    return batches_by_ingredient
+
+
+async def _usable_quantities_for_ingredients(
+    session: AsyncSession,
+    ingredients_by_id: dict[int, Ingredient],
+    *,
+    now: datetime | None = None,
+) -> dict[int, dict]:
+    checked_at = now or datetime.now(timezone.utc)
+    ingredient_ids = set(ingredients_by_id)
+    await _mark_expired_batches(session, ingredient_ids, now=checked_at)
+    batches_by_ingredient = await _batches_for_ingredients(session, ingredient_ids)
+    return {
+        ingredient_id: _usable_stock_payload(
+            ingredient,
+            batches_by_ingredient.get(ingredient_id, []),
+            checked_at,
+        )
+        for ingredient_id, ingredient in ingredients_by_id.items()
+    }
 
 
 def _batch_payload(batch: IngredientBatch) -> dict:
+    secondary_expires_at = _secondary_batch_expires_at(batch)
+    tertiary_expires_at = _tertiary_batch_expires_at(batch)
+    effective_dlc = _effective_batch_dlc(batch)
     return {
         "id": batch.id,
         "ingredient_id": batch.ingredient_id,
@@ -110,7 +264,15 @@ def _batch_payload(batch: IngredientBatch) -> dict:
         "expires_at": batch.expires_at,
         "opened_at": batch.opened_at,
         "use_within_hours_after_opening": batch.use_within_hours_after_opening,
-        "effective_expires_at": _effective_batch_expires_at(batch),
+        "primary_expires_at": batch.expires_at,
+        "secondary_started_at": batch.opened_at,
+        "secondary_use_within_hours": batch.use_within_hours_after_opening,
+        "secondary_expires_at": secondary_expires_at,
+        "tertiary_started_at": batch.tertiary_started_at,
+        "tertiary_use_within_hours": batch.tertiary_use_within_hours,
+        "tertiary_expires_at": tertiary_expires_at,
+        "effective_expires_at": effective_dlc[1] if effective_dlc is not None else None,
+        "effective_dlc_level": effective_dlc[0] if effective_dlc is not None else None,
         "status": batch.status,
         "created_by_user_id": batch.created_by_user_id,
         "created_at": batch.created_at,
@@ -729,7 +891,7 @@ async def sync_auto_stock_availability_overrides(
         override = ProductAvailabilityOverride(
             product_id=product_id,
             available=False,
-            reason=_stock_unavailable_reason(item.get("limiting_ingredient")),
+            reason=item.get("reason") or _stock_unavailable_reason(item.get("limiting_ingredient")),
             changed_by_user_id=_AUTO_STOCK_USER_ID,
         )
         session.add(override)
@@ -744,14 +906,22 @@ async def supply(
     session: AsyncSession,
     ingredient_id: int,
     quantity: float,
+    expires_at: datetime,
+    received_at: datetime | None = None,
+    use_within_hours_after_opening: int | None = None,
+    tertiary_use_within_hours: int | None = None,
     user_id: int | None = None,
 ) -> Ingredient:
-    """Approvisionne un ingredient (ajoute du stock).
+    """Approvisionne un ingredient via un lot avec DLC primaire obligatoire.
 
     Args:
         session: Session SQLAlchemy async dans le schema tenant courant.
         ingredient_id: Cle primaire de l'ingredient.
         quantity: Quantite a ajouter (doit etre positive).
+        expires_at: DLC primaire du lot, obligatoire.
+        received_at: Date de reception, par defaut maintenant.
+        use_within_hours_after_opening: Delai DLC secondaire configure au lot.
+        tertiary_use_within_hours: Delai DLC tertiaire configure au lot.
         user_id: Cle primaire de l'utilisateur authentifie qui effectue l'ajout.
 
     Returns:
@@ -763,12 +933,26 @@ async def supply(
     ingredient = await session.get(Ingredient, ingredient_id)
     if ingredient is None:
         raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+    expires_at = _validate_primary_dlc(expires_at)
+
+    batch = IngredientBatch(
+        ingredient_id=ingredient_id,
+        quantity=quantity,
+        received_at=received_at or datetime.now(timezone.utc),
+        expires_at=expires_at,
+        use_within_hours_after_opening=use_within_hours_after_opening,
+        tertiary_use_within_hours=tertiary_use_within_hours,
+        status="sealed",
+        created_by_user_id=user_id,
+    )
+    session.add(batch)
+    await session.flush()
     ingredient.current_qty = float(ingredient.current_qty) + quantity
     session.add(
         StockMovement(
             ingredient_id=ingredient.id,
             quantity_delta=quantity,
-            reason="supply",
+            reason=f"batch:{batch.id}",
             user_id=user_id,
         )
     )
@@ -784,12 +968,213 @@ async def list_batches(
     ingredient = await session.get(Ingredient, ingredient_id)
     if ingredient is None:
         raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+    await _mark_expired_batches(session, {ingredient_id}, commit=True)
     result = await session.execute(
         select(IngredientBatch)
         .where(IngredientBatch.ingredient_id == ingredient_id)
         .order_by(IngredientBatch.received_at.desc(), IngredientBatch.id.desc())
     )
     return [_batch_payload(batch) for batch in result.scalars()]
+
+
+async def get_ingredient_usable_stock(
+    session: AsyncSession,
+    ingredient_id: int,
+) -> dict:
+    ingredient = await session.get(Ingredient, ingredient_id)
+    if ingredient is None:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+
+    checked_at = datetime.now(timezone.utc)
+    await _mark_expired_batches(session, {ingredient_id}, now=checked_at, commit=True)
+    batches_by_ingredient = await _batches_for_ingredients(session, {ingredient_id})
+    return _usable_stock_payload(
+        ingredient,
+        batches_by_ingredient.get(ingredient_id, []),
+        checked_at,
+    )
+
+
+def _dlc_overview_severity(
+    *,
+    batch: IngredientBatch,
+    effective_expires_at: datetime | None,
+    has_noncompliant_check: bool,
+    now: datetime,
+    warning_deadline: datetime,
+    critical_deadline: datetime,
+) -> str:
+    if _batch_needs_dlc_regularization(batch):
+        return "regularize"
+    if batch.status == "expired" or (effective_expires_at is not None and _as_aware_utc(effective_expires_at) <= now):
+        return "expired"
+    if has_noncompliant_check:
+        return "critical"
+    if effective_expires_at is not None:
+        effective_expires_at = _as_aware_utc(effective_expires_at)
+        if effective_expires_at <= critical_deadline:
+            return "critical"
+        if effective_expires_at <= warning_deadline:
+            return "warning"
+    return "ok"
+
+
+def _dlc_overview_blocked_reason(
+    *,
+    batch: IngredientBatch,
+    ingredient_name: str,
+    severity: str,
+    has_noncompliant_check: bool,
+) -> str | None:
+    if _batch_needs_dlc_regularization(batch):
+        return "DLC primaire a regulariser"
+    if severity == "expired":
+        return _dlc_unavailable_reason(ingredient_name)
+    if has_noncompliant_check:
+        return "Controle DLC non conforme"
+    return None
+
+
+def _dlc_overview_item(
+    batch: IngredientBatch,
+    ingredient: Ingredient,
+    checks: list[HaccpDlcCheck],
+    *,
+    now: datetime,
+    warning_deadline: datetime,
+    critical_deadline: datetime,
+) -> dict:
+    payload = _batch_payload(batch)
+    noncompliant_count = sum(1 for check in checks if check.is_compliant is False)
+    severity = _dlc_overview_severity(
+        batch=batch,
+        effective_expires_at=payload["effective_expires_at"],
+        has_noncompliant_check=noncompliant_count > 0,
+        now=now,
+        warning_deadline=warning_deadline,
+        critical_deadline=critical_deadline,
+    )
+    return {
+        "batch_id": batch.id,
+        "ingredient_id": ingredient.id,
+        "ingredient_name": ingredient.name,
+        "quantity": float(batch.quantity),
+        "status": batch.status,
+        "dlc_level": payload["effective_dlc_level"],
+        "severity": severity,
+        "primary_expires_at": payload["primary_expires_at"],
+        "secondary_expires_at": payload["secondary_expires_at"],
+        "tertiary_expires_at": payload["tertiary_expires_at"],
+        "effective_expires_at": payload["effective_expires_at"],
+        "has_dlc_check": bool(checks),
+        "noncompliant_check_count": noncompliant_count,
+        "blocked_reason": _dlc_overview_blocked_reason(
+            batch=batch,
+            ingredient_name=ingredient.name,
+            severity=severity,
+            has_noncompliant_check=noncompliant_count > 0,
+        ),
+    }
+
+
+async def get_dlc_overview(
+    session: AsyncSession,
+    *,
+    ingredient_id: int | None = None,
+    dlc_level: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    horizon_hours: int = 72,
+) -> dict:
+    valid_levels = {"primary", "secondary", "tertiary"}
+    valid_severities = {"expired", "regularize", "critical", "warning", "ok"}
+    valid_statuses = {"sealed", "opened", "expired", "consumed", "discarded"}
+    if dlc_level is not None and dlc_level not in valid_levels:
+        raise AppError("INVALID_DLC_LEVEL", "Invalid DLC level filter", 422, "dlc_level")
+    if severity is not None and severity not in valid_severities:
+        raise AppError("INVALID_DLC_SEVERITY", "Invalid DLC severity filter", 422, "severity")
+    if status is not None and status not in valid_statuses:
+        raise AppError("INVALID_BATCH_STATUS", "Invalid batch status filter", 422, "status")
+
+    checked_at = datetime.now(timezone.utc)
+    warning_deadline = checked_at + timedelta(hours=horizon_hours)
+    critical_deadline = checked_at + timedelta(hours=24)
+    await _mark_expired_batches(
+        session,
+        {ingredient_id} if ingredient_id is not None else None,
+        now=checked_at,
+    )
+
+    stmt = select(IngredientBatch, Ingredient).join(
+        Ingredient,
+        Ingredient.id == IngredientBatch.ingredient_id,
+    )
+    if ingredient_id is not None:
+        stmt = stmt.where(IngredientBatch.ingredient_id == ingredient_id)
+    if status is not None:
+        stmt = stmt.where(IngredientBatch.status == status)
+
+    result = await session.execute(stmt)
+    rows = list(result.all())
+    batch_ids = {batch.id for batch, _ingredient in rows if batch.id is not None}
+
+    checks_by_batch: dict[int, list[HaccpDlcCheck]] = {batch_id: [] for batch_id in batch_ids}
+    if batch_ids:
+        checks_result = await session.execute(
+            select(HaccpDlcCheck).where(HaccpDlcCheck.batch_id.in_(tuple(batch_ids)))
+        )
+        for check in checks_result.scalars():
+            if check.batch_id is not None:
+                checks_by_batch.setdefault(check.batch_id, []).append(check)
+
+    items = [
+        _dlc_overview_item(
+            batch,
+            ingredient,
+            checks_by_batch.get(batch.id, []),
+            now=checked_at,
+            warning_deadline=warning_deadline,
+            critical_deadline=critical_deadline,
+        )
+        for batch, ingredient in rows
+    ]
+    if dlc_level is not None:
+        items = [item for item in items if item["dlc_level"] == dlc_level]
+    if severity is not None:
+        items = [item for item in items if item["severity"] == severity]
+
+    severity_rank = {"expired": 0, "regularize": 1, "critical": 2, "warning": 3, "ok": 4}
+    items.sort(
+        key=lambda item: (
+            severity_rank[item["severity"]],
+            item["effective_expires_at"] or datetime.max.replace(tzinfo=timezone.utc),
+            item["ingredient_name"],
+            item["batch_id"],
+        )
+    )
+
+    def _is_near(item: dict, level: str) -> bool:
+        expires_at = item["effective_expires_at"]
+        return (
+            item["dlc_level"] == level
+            and expires_at is not None
+            and checked_at < _as_aware_utc(expires_at) <= warning_deadline
+        )
+
+    counters = {
+        "total_batches": len(items),
+        "regularize_batch_count": sum(1 for item in items if item["severity"] == "regularize"),
+        "primary_near_count": sum(1 for item in items if _is_near(item, "primary")),
+        "secondary_near_count": sum(1 for item in items if _is_near(item, "secondary")),
+        "tertiary_near_count": sum(1 for item in items if _is_near(item, "tertiary")),
+        "expired_batch_count": sum(1 for item in items if item["severity"] == "expired"),
+        "missing_or_noncompliant_check_count": sum(
+            1
+            for item in items
+            if item["has_dlc_check"] is False or item["noncompliant_check_count"] > 0
+        ),
+    }
+    return {"counters": counters, "items": items}
 
 
 async def create_batch(
@@ -801,14 +1186,16 @@ async def create_batch(
     ingredient = await session.get(Ingredient, ingredient_id)
     if ingredient is None:
         raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
+    expires_at = _validate_primary_dlc(body.expires_at)
 
     received_at = body.received_at or datetime.now(timezone.utc)
     batch = IngredientBatch(
         ingredient_id=ingredient_id,
         quantity=body.quantity,
         received_at=received_at,
-        expires_at=body.expires_at,
+        expires_at=expires_at,
         use_within_hours_after_opening=body.use_within_hours_after_opening,
+        tertiary_use_within_hours=body.tertiary_use_within_hours,
         status="sealed",
         created_by_user_id=user_id,
     )
@@ -833,6 +1220,8 @@ async def patch_batch(session: AsyncSession, batch_id: int, body) -> dict:
     if batch is None:
         raise AppError("BATCH_NOT_FOUND", "Ingredient batch not found", 404)
     updates = body.model_dump(exclude_unset=True)
+    if "expires_at" in updates:
+        updates["expires_at"] = _validate_primary_dlc(updates["expires_at"])
     if "quantity" in updates and float(updates["quantity"]) != float(batch.quantity):
         ingredient = await session.get(Ingredient, batch.ingredient_id)
         if ingredient is None:
@@ -869,6 +1258,44 @@ async def open_batch(
         raise AppError("BATCH_CLOSED", "Batch cannot be opened from its current status", 409)
     if batch.opened_at is None:
         batch.opened_at = datetime.now(timezone.utc)
+    batch.status = "opened"
+    await session.commit()
+    await session.refresh(batch)
+    return _batch_payload(batch)
+
+
+async def start_batch_use(
+    session: AsyncSession,
+    batch_id: int,
+    body,
+    user_id: int | None,
+) -> dict:
+    batch = await session.get(IngredientBatch, batch_id)
+    if batch is None:
+        raise AppError("BATCH_NOT_FOUND", "Ingredient batch not found", 404)
+    if batch.status in {"discarded", "consumed", "expired"}:
+        raise AppError("BATCH_CLOSED", "Batch cannot be used from its current status", 409)
+    if batch.opened_at is None:
+        raise AppError(
+            "BATCH_NOT_OPENED",
+            "Batch must be opened before starting tertiary use",
+            409,
+            "opened_at",
+        )
+
+    requested_use_within = getattr(body, "tertiary_use_within_hours", None)
+    if requested_use_within is not None:
+        batch.tertiary_use_within_hours = requested_use_within
+    if batch.tertiary_use_within_hours is None:
+        raise AppError(
+            "BATCH_TERTIARY_DLC_REQUIRED",
+            "Tertiary DLC duration is required before starting use",
+            422,
+            "tertiary_use_within_hours",
+        )
+
+    if batch.tertiary_started_at is None:
+        batch.tertiary_started_at = datetime.now(timezone.utc)
     batch.status = "opened"
     await session.commit()
     await session.refresh(batch)
@@ -1174,27 +1601,55 @@ async def deduct_for_order(
         AppError: INSUFFICIENT_STOCK (409) si un ingredient n'a pas assez de stock.
     """
     items = await session.execute(select(OrderItem).where(OrderItem.order_id == order_id))
+    order_items = list(items.scalars())
     low_stock: list[Ingredient] = []
     touched_ingredient_ids: set[int] = set()
-    for item in items.scalars():
+
+    all_deltas: list[tuple[int, float]] = []
+    required_by_ingredient: dict[int, float] = {}
+    for item in order_items:
         for ingredient_id, delta in await _item_recipe_deltas(session, item):
-            ingredient = await session.get(Ingredient, ingredient_id)
-            if ingredient is None:
-                continue
-            if float(ingredient.current_qty) < delta:
-                raise AppError("INSUFFICIENT_STOCK", f"Not enough stock for {ingredient.name}", 409)
-            ingredient.current_qty = float(ingredient.current_qty) - delta
-            session.add(
-                StockMovement(
-                    ingredient_id=ingredient.id,
-                    quantity_delta=-delta,
-                    reason=f"order:{order_id}",
-                    user_id=actor_user_id,
-                )
+            all_deltas.append((ingredient_id, delta))
+            required_by_ingredient[ingredient_id] = required_by_ingredient.get(ingredient_id, 0.0) + delta
+
+    ingredients_by_id: dict[int, Ingredient] = {}
+    for ingredient_id in required_by_ingredient:
+        ingredient = await session.get(Ingredient, ingredient_id)
+        if ingredient is not None:
+            ingredients_by_id[ingredient_id] = ingredient
+
+    usable_by_ingredient = await _usable_quantities_for_ingredients(session, ingredients_by_id)
+    for ingredient_id, required_qty in required_by_ingredient.items():
+        ingredient = ingredients_by_id.get(ingredient_id)
+        if ingredient is None:
+            continue
+        current_qty = float(ingredient.current_qty)
+        usable_qty = float(usable_by_ingredient.get(ingredient_id, {}).get("usable_qty", current_qty))
+        if current_qty < required_qty:
+            raise AppError("INSUFFICIENT_STOCK", f"Not enough stock for {ingredient.name}", 409)
+        if usable_qty < required_qty:
+            raise AppError(
+                "INSUFFICIENT_STOCK",
+                f"DLC expired stock blocks {ingredient.name}",
+                409,
             )
-            touched_ingredient_ids.add(ingredient.id)
-            if float(ingredient.current_qty) <= float(ingredient.alert_threshold):
-                low_stock.append(ingredient)
+
+    for ingredient_id, delta in all_deltas:
+        ingredient = ingredients_by_id.get(ingredient_id)
+        if ingredient is None:
+            continue
+        ingredient.current_qty = float(ingredient.current_qty) - delta
+        session.add(
+            StockMovement(
+                ingredient_id=ingredient.id,
+                quantity_delta=-delta,
+                reason=f"order:{order_id}",
+                user_id=actor_user_id,
+            )
+        )
+        touched_ingredient_ids.add(ingredient.id)
+        if float(ingredient.current_qty) <= float(ingredient.alert_threshold):
+            low_stock.append(ingredient)
 
     await sync_auto_stock_availability_overrides(
         session,
@@ -1352,6 +1807,7 @@ async def get_products_availability(
             select(Ingredient).where(Ingredient.id.in_(ingredient_ids))
         )
         ingredients_by_id = {ingredient.id: ingredient for ingredient in ingredients_result.scalars()}
+    usable_by_ingredient = await _usable_quantities_for_ingredients(session, ingredients_by_id)
 
     availability: dict[int, dict] = {}
     for product_id in product_ids:
@@ -1361,18 +1817,26 @@ async def get_products_availability(
             continue
 
         limiting_ingredient: str | None = None
+        reason: str | None = None
         for ingredient_id, required_qty in required.items():
             ingredient = ingredients_by_id.get(ingredient_id)
             if ingredient is None:
                 continue
-            if float(ingredient.current_qty) < required_qty:
+            current_qty = float(ingredient.current_qty)
+            usable_qty = float(usable_by_ingredient.get(ingredient_id, {}).get("usable_qty", current_qty))
+            if current_qty < required_qty:
                 limiting_ingredient = ingredient.name
+                reason = _stock_unavailable_reason(limiting_ingredient)
+                break
+            if usable_qty < required_qty:
+                limiting_ingredient = ingredient.name
+                reason = _dlc_unavailable_reason(limiting_ingredient)
                 break
 
         availability[product_id] = {
             "product_id": product_id,
             "available": limiting_ingredient is None,
             "limiting_ingredient": limiting_ingredient,
-            "reason": None if limiting_ingredient is None else _stock_unavailable_reason(limiting_ingredient),
+            "reason": reason,
         }
     return availability

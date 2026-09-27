@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 
@@ -18,6 +19,34 @@ def test_batch_effective_expiration_uses_earliest_deadline():
     )
 
     assert _effective_batch_expires_at(batch) == opened_at + timedelta(hours=24)
+
+
+def test_batch_payload_exposes_tertiary_deadline_as_effective_level():
+    from app.modules.stock.models import IngredientBatch
+    from app.modules.stock.service import _batch_payload
+
+    opened_at = datetime(2026, 7, 21, 10, tzinfo=timezone.utc)
+    batch = IngredientBatch(
+        id=3,
+        ingredient_id=1,
+        quantity=2,
+        received_at=opened_at - timedelta(days=1),
+        expires_at=opened_at + timedelta(days=3),
+        opened_at=opened_at,
+        use_within_hours_after_opening=24,
+        tertiary_started_at=opened_at + timedelta(hours=2),
+        tertiary_use_within_hours=4,
+        status="opened",
+    )
+
+    payload = _batch_payload(batch)
+
+    assert payload["primary_expires_at"] == opened_at + timedelta(days=3)
+    assert payload["secondary_started_at"] == opened_at
+    assert payload["secondary_expires_at"] == opened_at + timedelta(hours=24)
+    assert payload["tertiary_expires_at"] == opened_at + timedelta(hours=6)
+    assert payload["effective_expires_at"] == opened_at + timedelta(hours=6)
+    assert payload["effective_dlc_level"] == "tertiary"
 
 
 async def test_admin_approval_applies_stock_adjustment_and_audit_movement():
@@ -59,6 +88,135 @@ async def test_admin_approval_applies_stock_adjustment_and_audit_movement():
     assert payload["status"] == "approved"
     assert payload["reviewed_by_user_id"] == 9
     assert payload["is_large_adjustment"] is True
+
+
+async def test_create_batch_rejects_expired_primary_dlc():
+    from app.core.http.errors import AppError
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient
+
+    session = AsyncMock()
+    session.get = AsyncMock(
+        return_value=Ingredient(id=1, name="Mozzarella", unit="kg", current_qty=0, alert_threshold=1)
+    )
+    body = SimpleNamespace(
+        quantity=2,
+        received_at=None,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        use_within_hours_after_opening=None,
+    )
+
+    try:
+        await service.create_batch(session, 1, body, user_id=9)
+    except AppError as exc:
+        assert exc.code == "BATCH_DLC_EXPIRED"
+        assert exc.status_code == 422
+        assert exc.field == "expires_at"
+    else:
+        raise AssertionError("create_batch should reject an expired primary DLC")
+
+
+async def test_supply_creates_batch_with_required_primary_dlc():
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient, IngredientBatch, StockMovement
+
+    ingredient = Ingredient(id=1, name="Pate", unit="piece", current_qty=3, alert_threshold=1)
+    added: list[object] = []
+
+    async def fake_flush():
+        for item in added:
+            if isinstance(item, IngredientBatch):
+                item.id = 42
+
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=ingredient)
+    session.add = MagicMock(side_effect=added.append)
+    session.flush = AsyncMock(side_effect=fake_flush)
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=2)
+    result = await service.supply(
+        session,
+        ingredient_id=1,
+        quantity=5,
+        expires_at=expires_at,
+        user_id=9,
+    )
+
+    batch = next(item for item in added if isinstance(item, IngredientBatch))
+    movement = next(item for item in added if isinstance(item, StockMovement))
+    assert result is ingredient
+    assert float(ingredient.current_qty) == 8
+    assert batch.expires_at == expires_at
+    assert batch.created_by_user_id == 9
+    assert movement.reason == "batch:42"
+    assert movement.user_id == 9
+
+
+async def test_start_batch_use_sets_tertiary_clock_and_deadline():
+    from app.modules.stock import service
+    from app.modules.stock.models import IngredientBatch
+
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    batch = IngredientBatch(
+        id=5,
+        ingredient_id=1,
+        quantity=2,
+        received_at=opened_at - timedelta(days=1),
+        expires_at=opened_at + timedelta(days=3),
+        opened_at=opened_at,
+        use_within_hours_after_opening=48,
+        status="opened",
+    )
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=batch)
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+
+    payload = await service.start_batch_use(
+        session,
+        5,
+        SimpleNamespace(tertiary_use_within_hours=4),
+        user_id=9,
+    )
+
+    assert batch.tertiary_started_at is not None
+    assert batch.tertiary_use_within_hours == 4
+    assert payload["effective_dlc_level"] == "tertiary"
+    assert payload["tertiary_expires_at"] == batch.tertiary_started_at + timedelta(hours=4)
+
+
+async def test_start_batch_use_requires_opened_batch():
+    from app.core.http.errors import AppError
+    from app.modules.stock import service
+    from app.modules.stock.models import IngredientBatch
+
+    now = datetime.now(timezone.utc)
+    batch = IngredientBatch(
+        id=6,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now,
+        expires_at=now + timedelta(days=3),
+        status="sealed",
+    )
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=batch)
+
+    try:
+        await service.start_batch_use(
+            session,
+            6,
+            SimpleNamespace(tertiary_use_within_hours=4),
+            user_id=9,
+        )
+    except AppError as exc:
+        assert exc.code == "BATCH_NOT_OPENED"
+        assert exc.status_code == 409
+        assert exc.field == "opened_at"
+    else:
+        raise AssertionError("start_batch_use should require an opened batch")
 
 
 async def test_reject_adjustment_request_leaves_stock_unchanged():
@@ -217,6 +375,7 @@ def test_p1_p2_openapi_paths_are_registered():
 
     paths = set(app.openapi()["paths"])
 
+    assert "/api/v1/stock/dlc/overview" in paths
     assert "/api/v1/stock/ingredients/{ingredient_id}/batches" in paths
     assert "/api/v1/stock/adjustment-requests" in paths
     assert "/api/v1/orders/export/csv" in paths

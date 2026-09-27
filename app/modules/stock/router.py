@@ -16,14 +16,17 @@ from app.modules.stock.schemas import (
     IngredientBatchDiscardRequest,
     IngredientBatchOut,
     IngredientBatchPatch,
+    IngredientBatchStartUseRequest,
     IngredientCreate,
     IngredientPatch,
     IngredientOut,
+    IngredientUsableStockOut,
     MissingStockRecipeOut,
     ProductIngredientCreate,
     StockAdjustmentRequestCreate,
     StockAdjustmentRequestOut,
     StockAdjustmentReviewRequest,
+    StockDlcOverviewOut,
     StockRecipeLineCreate,
     StockRecipeOut,
     StockRecipeReplace,
@@ -81,6 +84,26 @@ async def alerts(
         return await service.list_alerts(session)
 
 
+@router.get("/dlc/overview", response_model=StockDlcOverviewOut)
+async def dlc_overview(
+    current_user=Depends(require_permission("stock:read", "staff", "admin")),
+    ingredient_id: int | None = Query(default=None),
+    dlc_level: Literal["primary", "secondary", "tertiary"] | None = Query(default=None),
+    severity: Literal["expired", "regularize", "critical", "warning", "ok"] | None = Query(default=None),
+    status: Literal["sealed", "opened", "expired", "consumed", "discarded"] | None = Query(default=None),
+    horizon_hours: int = Query(default=72, ge=1, le=8760),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_dlc_overview(
+            session,
+            ingredient_id=ingredient_id,
+            dlc_level=dlc_level,
+            severity=severity,
+            status=status,
+            horizon_hours=horizon_hours,
+        )
+
+
 @router.post("/ingredients", response_model=IngredientOut, status_code=201)
 async def create_ingredient(
     body: IngredientCreate,
@@ -130,6 +153,10 @@ async def supply(
             session,
             body.ingredient_id,
             body.quantity,
+            body.expires_at,
+            received_at=body.received_at,
+            use_within_hours_after_opening=body.use_within_hours_after_opening,
+            tertiary_use_within_hours=body.tertiary_use_within_hours,
             user_id=int(current_user["id"]),
         )
 
@@ -141,6 +168,15 @@ async def ingredient_batches(
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.list_batches(session, ingredient_id)
+
+
+@router.get("/ingredients/{ingredient_id}/usable-stock", response_model=IngredientUsableStockOut)
+async def ingredient_usable_stock(
+    ingredient_id: int,
+    current_user=Depends(require_permission("stock:read", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_ingredient_usable_stock(session, ingredient_id)
 
 
 @router.post("/ingredients/{ingredient_id}/batches", response_model=IngredientBatchOut, status_code=201)
@@ -175,6 +211,21 @@ async def open_ingredient_batch(
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.open_batch(session, batch_id, user_id=int(current_user["id"]))
+
+
+@router.post("/batches/{batch_id}/start-use", response_model=IngredientBatchOut)
+async def start_ingredient_batch_use(
+    batch_id: int,
+    body: IngredientBatchStartUseRequest,
+    current_user=Depends(require_permission("stock:write", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.start_batch_use(
+            session,
+            batch_id,
+            body,
+            user_id=int(current_user["id"]),
+        )
 
 
 @router.post("/batches/{batch_id}/discard", response_model=IngredientBatchOut)

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -18,14 +19,41 @@ class FakeResult:
 
 
 class FakeSession:
-    def __init__(self, order_items, product_recipes, variant_recipes, extra_recipes, ingredients):
+    def __init__(
+        self,
+        order_items,
+        product_recipes,
+        variant_recipes,
+        extra_recipes,
+        ingredients,
+        batches=None,
+        dlc_checks=None,
+    ):
         self.order_items = order_items
         self.product_recipes = product_recipes
         self.variant_recipes = variant_recipes
         self.extra_recipes = extra_recipes
         self.ingredients = ingredients
+        self.batches = batches if batches is not None else self._default_batches(ingredients)
+        self.dlc_checks = dlc_checks or []
         self.added = []
         self.committed = False
+
+    def _default_batches(self, ingredients):
+        from app.modules.stock.models import IngredientBatch
+
+        now = datetime.now(timezone.utc)
+        return [
+            IngredientBatch(
+                id=5000 + index,
+                ingredient_id=ingredient.id,
+                quantity=float(ingredient.current_qty),
+                received_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=1),
+                status="sealed",
+            )
+            for index, ingredient in enumerate(ingredients.values(), start=1)
+        ]
 
     async def execute(self, statement):
         entity = statement.column_descriptions[0].get("entity")
@@ -43,6 +71,18 @@ class FakeSession:
             return FakeResult(self.extra_recipes)
         if entity_name == "Ingredient":
             return FakeResult(self.ingredients.values())
+        if entity_name == "IngredientBatch":
+            if len(statement.column_descriptions) > 1:
+                return FakeResult(
+                    [
+                        (batch, self.ingredients[batch.ingredient_id])
+                        for batch in self.batches
+                        if batch.ingredient_id in self.ingredients
+                    ]
+                )
+            return FakeResult(self.batches)
+        if entity_name == "HaccpDlcCheck":
+            return FakeResult(self.dlc_checks)
         if entity_name == "ProductVariant":
             rows = []
             for recipe in self.variant_recipes:
@@ -186,6 +226,273 @@ async def test_deduct_for_order_creates_auto_unavailable_override_when_stock_blo
     assert overrides[0].product_id == 100
     assert overrides[0].available is False
     assert overrides[0].reason == "Stock insuffisant : Pate"
+
+
+@pytest.mark.asyncio
+async def test_product_availability_blocks_when_only_expired_dlc_stock_is_available():
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient, IngredientBatch, ProductIngredient
+
+    now = datetime.now(timezone.utc)
+    ingredient = Ingredient(id=1, name="Mozzarella", unit="kg", current_qty=5, alert_threshold=1)
+    expired_batch = IngredientBatch(
+        id=1,
+        ingredient_id=1,
+        quantity=5,
+        received_at=now - timedelta(days=3),
+        expires_at=now - timedelta(minutes=1),
+        status="sealed",
+    )
+    session = FakeSession(
+        order_items=[],
+        product_recipes=[ProductIngredient(product_id=100, ingredient_id=1, quantity=1)],
+        variant_recipes=[],
+        extra_recipes=[],
+        ingredients={1: ingredient},
+        batches=[expired_batch],
+    )
+
+    availability = await service.get_products_availability(session, [100])
+
+    assert availability[100] == {
+        "product_id": 100,
+        "available": False,
+        "limiting_ingredient": "Mozzarella",
+        "reason": "DLC expiree : Mozzarella",
+    }
+    assert expired_batch.status == "expired"
+
+
+@pytest.mark.asyncio
+async def test_deduct_for_order_rejects_when_usable_dlc_stock_is_insufficient():
+    from app.core.http.errors import AppError
+    from app.modules.orders.models import OrderItem
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient, IngredientBatch, ProductIngredient
+
+    now = datetime.now(timezone.utc)
+    ingredient = Ingredient(id=1, name="Mozzarella", unit="kg", current_qty=5, alert_threshold=1)
+    expired_batch = IngredientBatch(
+        id=1,
+        ingredient_id=1,
+        quantity=5,
+        received_at=now - timedelta(days=3),
+        expires_at=now - timedelta(minutes=1),
+        status="sealed",
+    )
+    item = OrderItem(order_id=10, product_id=100, quantity=1, unit_price=10, total=10)
+    session = FakeSession(
+        order_items=[item],
+        product_recipes=[ProductIngredient(product_id=100, ingredient_id=1, quantity=1)],
+        variant_recipes=[],
+        extra_recipes=[],
+        ingredients={1: ingredient},
+        batches=[expired_batch],
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        await service.deduct_for_order(session, 10, auto_commit=False)
+
+    assert exc_info.value.code == "INSUFFICIENT_STOCK"
+    assert "DLC expired stock blocks Mozzarella" in exc_info.value.detail
+    assert float(ingredient.current_qty) == 5
+    assert expired_batch.status == "expired"
+    assert session.added == []
+
+
+def test_usable_stock_payload_reports_blocked_dlc_quantities():
+    from app.modules.stock.models import Ingredient, IngredientBatch
+    from app.modules.stock.service import _usable_stock_payload
+
+    now = datetime.now(timezone.utc)
+    ingredient = Ingredient(id=1, name="Pate", unit="piece", current_qty=6, alert_threshold=1)
+    valid_batch = IngredientBatch(
+        id=1,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=1),
+        status="sealed",
+    )
+    expired_batch = IngredientBatch(
+        id=2,
+        ingredient_id=1,
+        quantity=3,
+        received_at=now - timedelta(days=3),
+        expires_at=now - timedelta(hours=1),
+        status="expired",
+    )
+    regularize_batch = IngredientBatch(
+        id=3,
+        ingredient_id=1,
+        quantity=1,
+        received_at=now - timedelta(days=2),
+        expires_at=None,
+        status="sealed",
+    )
+
+    payload = _usable_stock_payload(ingredient, [valid_batch, expired_batch, regularize_batch], now)
+
+    assert payload["current_qty"] == 6
+    assert payload["usable_qty"] == 2
+    assert payload["blocked_qty"] == 4
+    assert payload["expired_batch_count"] == 1
+    assert payload["regularize_batch_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dlc_overview_counts_risks_by_dlc_level_and_checks():
+    from app.modules.haccp.models import HaccpDlcCheck
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient, IngredientBatch
+
+    now = datetime.now(timezone.utc)
+    ingredient = Ingredient(id=1, name="Mozzarella", unit="kg", current_qty=10, alert_threshold=1)
+    primary_warning = IngredientBatch(
+        id=1,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now - timedelta(days=1),
+        expires_at=now + timedelta(hours=48),
+        status="sealed",
+    )
+    secondary_critical = IngredientBatch(
+        id=2,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now - timedelta(days=2),
+        expires_at=now + timedelta(days=5),
+        opened_at=now - timedelta(hours=20),
+        use_within_hours_after_opening=24,
+        status="opened",
+    )
+    tertiary_critical = IngredientBatch(
+        id=3,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now - timedelta(days=2),
+        expires_at=now + timedelta(days=5),
+        opened_at=now - timedelta(hours=2),
+        use_within_hours_after_opening=48,
+        tertiary_started_at=now - timedelta(hours=1),
+        tertiary_use_within_hours=3,
+        status="opened",
+    )
+    expired = IngredientBatch(
+        id=4,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now - timedelta(days=3),
+        expires_at=now - timedelta(minutes=1),
+        status="sealed",
+    )
+    regularize = IngredientBatch(
+        id=5,
+        ingredient_id=1,
+        quantity=2,
+        received_at=now - timedelta(days=3),
+        expires_at=None,
+        status="sealed",
+    )
+    session = FakeSession(
+        order_items=[],
+        product_recipes=[],
+        variant_recipes=[],
+        extra_recipes=[],
+        ingredients={1: ingredient},
+        batches=[primary_warning, secondary_critical, tertiary_critical, expired, regularize],
+        dlc_checks=[
+            HaccpDlcCheck(
+                batch_id=1,
+                ingredient_id=1,
+                ingredient_name="Mozzarella",
+                dlc_level=1,
+                dlc_date=now.date(),
+                is_compliant=True,
+            ),
+            HaccpDlcCheck(
+                batch_id=2,
+                ingredient_id=1,
+                ingredient_name="Mozzarella",
+                dlc_level=2,
+                dlc_date=now.date(),
+                is_compliant=False,
+            ),
+        ],
+    )
+
+    overview = await service.get_dlc_overview(session, horizon_hours=72)
+
+    assert overview["counters"] == {
+        "total_batches": 5,
+        "regularize_batch_count": 1,
+        "primary_near_count": 1,
+        "secondary_near_count": 1,
+        "tertiary_near_count": 1,
+        "expired_batch_count": 1,
+        "missing_or_noncompliant_check_count": 4,
+    }
+    severities_by_batch = {item["batch_id"]: item["severity"] for item in overview["items"]}
+    assert severities_by_batch == {
+        1: "warning",
+        2: "critical",
+        3: "critical",
+        4: "expired",
+        5: "regularize",
+    }
+    assert expired.status == "expired"
+    assert next(item for item in overview["items"] if item["batch_id"] == 2)["blocked_reason"] == "Controle DLC non conforme"
+
+
+@pytest.mark.asyncio
+async def test_dlc_overview_filters_by_level_severity_status_and_ingredient():
+    from app.modules.stock import service
+    from app.modules.stock.models import Ingredient, IngredientBatch
+
+    now = datetime.now(timezone.utc)
+    mozzarella = Ingredient(id=1, name="Mozzarella", unit="kg", current_qty=3, alert_threshold=1)
+    pate = Ingredient(id=2, name="Pate", unit="piece", current_qty=3, alert_threshold=1)
+    tertiary_batch = IngredientBatch(
+        id=1,
+        ingredient_id=1,
+        quantity=1,
+        received_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=5),
+        opened_at=now - timedelta(hours=1),
+        use_within_hours_after_opening=48,
+        tertiary_started_at=now - timedelta(minutes=30),
+        tertiary_use_within_hours=2,
+        status="opened",
+    )
+    other_batch = IngredientBatch(
+        id=2,
+        ingredient_id=2,
+        quantity=1,
+        received_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=5),
+        status="sealed",
+    )
+    session = FakeSession(
+        order_items=[],
+        product_recipes=[],
+        variant_recipes=[],
+        extra_recipes=[],
+        ingredients={1: mozzarella, 2: pate},
+        batches=[tertiary_batch, other_batch],
+    )
+
+    overview = await service.get_dlc_overview(
+        session,
+        ingredient_id=1,
+        dlc_level="tertiary",
+        severity="critical",
+        status="opened",
+    )
+
+    assert overview["counters"]["total_batches"] == 1
+    assert overview["counters"]["tertiary_near_count"] == 1
+    assert overview["items"][0]["batch_id"] == 1
+    assert overview["items"][0]["ingredient_name"] == "Mozzarella"
 
 
 @pytest.mark.asyncio
@@ -335,10 +642,17 @@ async def test_create_recipe_endpoint_rejects_non_positive_quantity(client, staf
 
 
 class RecipeServiceSession:
-    def __init__(self, *, targets=None, ingredients=None, recipes=None):
+    def __init__(self, *, targets=None, ingredients=None, recipes=None, batches=None):
         self.targets = targets or {}
         self.ingredients = ingredients or {}
         self.recipes = recipes or []
+        self.batches = batches if batches is not None else FakeSession(
+            order_items=[],
+            product_recipes=[],
+            variant_recipes=[],
+            extra_recipes=[],
+            ingredients=self.ingredients,
+        ).batches
         self.added = []
         self.deleted = []
         self.committed = False
@@ -364,6 +678,8 @@ class RecipeServiceSession:
             return FakeResult([recipe.product_id for recipe in self.recipes])
         if entity_name in {"ProductIngredient", "VariantIngredient", "ExtraIngredient"}:
             return FakeResult(self.recipes)
+        if entity_name == "IngredientBatch":
+            return FakeResult(self.batches)
         if entity_name in {"ProductVariant", "ProductExtra", "ProductAvailabilityOverride"}:
             return FakeResult([])
         raise AssertionError(entity_name)

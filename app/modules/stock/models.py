@@ -121,6 +121,8 @@ class IngredientBatch(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     use_within_hours_after_opening: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tertiary_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tertiary_use_within_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="sealed", server_default="sealed")
     created_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

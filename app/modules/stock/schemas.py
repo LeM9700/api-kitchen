@@ -27,6 +27,10 @@ class IngredientOut(IngredientCreate):
 class SupplyRequest(BaseModel):
     ingredient_id: int
     quantity: float = Field(gt=0, description="Must be strictly positive")
+    expires_at: datetime
+    received_at: datetime | None = None
+    use_within_hours_after_opening: int | None = Field(None, ge=1, le=8760)
+    tertiary_use_within_hours: int | None = Field(None, ge=1, le=8760)
 
 
 class ProductIngredientCreate(BaseModel):
@@ -121,8 +125,9 @@ class IngredientAdjustRequest(BaseModel):
 class IngredientBatchCreate(BaseModel):
     quantity: float = Field(gt=0)
     received_at: datetime | None = None
-    expires_at: datetime | None = None
+    expires_at: datetime
     use_within_hours_after_opening: int | None = Field(None, ge=1, le=8760)
+    tertiary_use_within_hours: int | None = Field(None, ge=1, le=8760)
 
 
 class IngredientBatchPatch(BaseModel):
@@ -130,7 +135,13 @@ class IngredientBatchPatch(BaseModel):
     expires_at: datetime | None = None
     opened_at: datetime | None = None
     use_within_hours_after_opening: int | None = Field(None, ge=1, le=8760)
+    tertiary_started_at: datetime | None = None
+    tertiary_use_within_hours: int | None = Field(None, ge=1, le=8760)
     status: BatchStatus | None = None
+
+
+class IngredientBatchStartUseRequest(BaseModel):
+    tertiary_use_within_hours: int | None = Field(None, ge=1, le=8760)
 
 
 class IngredientBatchDiscardRequest(BaseModel):
@@ -147,10 +158,63 @@ class IngredientBatchOut(BaseModel):
     expires_at: datetime | None = None
     opened_at: datetime | None = None
     use_within_hours_after_opening: int | None = None
+    primary_expires_at: datetime | None = None
+    secondary_started_at: datetime | None = None
+    secondary_use_within_hours: int | None = None
+    secondary_expires_at: datetime | None = None
+    tertiary_started_at: datetime | None = None
+    tertiary_use_within_hours: int | None = None
+    tertiary_expires_at: datetime | None = None
     effective_expires_at: datetime | None = None
+    effective_dlc_level: Literal["primary", "secondary", "tertiary"] | None = None
     status: BatchStatus
     created_by_user_id: int | None = None
     created_at: datetime | None = None
+
+
+class IngredientUsableStockOut(BaseModel):
+    ingredient_id: int
+    current_qty: float
+    usable_qty: float
+    blocked_qty: float
+    expired_batch_count: int
+    regularize_batch_count: int
+
+
+DlcLevelName = Literal["primary", "secondary", "tertiary"]
+DlcSeverity = Literal["expired", "regularize", "critical", "warning", "ok"]
+
+
+class StockDlcOverviewCounters(BaseModel):
+    total_batches: int
+    regularize_batch_count: int
+    primary_near_count: int
+    secondary_near_count: int
+    tertiary_near_count: int
+    expired_batch_count: int
+    missing_or_noncompliant_check_count: int
+
+
+class StockDlcOverviewItemOut(BaseModel):
+    batch_id: int
+    ingredient_id: int
+    ingredient_name: str
+    quantity: float
+    status: BatchStatus
+    dlc_level: DlcLevelName | None = None
+    severity: DlcSeverity
+    primary_expires_at: datetime | None = None
+    secondary_expires_at: datetime | None = None
+    tertiary_expires_at: datetime | None = None
+    effective_expires_at: datetime | None = None
+    has_dlc_check: bool = False
+    noncompliant_check_count: int = 0
+    blocked_reason: str | None = None
+
+
+class StockDlcOverviewOut(BaseModel):
+    counters: StockDlcOverviewCounters
+    items: list[StockDlcOverviewItemOut]
 
 
 class StockAdjustmentRequestCreate(BaseModel):
