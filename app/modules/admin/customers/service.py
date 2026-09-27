@@ -78,6 +78,45 @@ async def record_admin_audit(
     )
 
 
+def _admin_audit_filters(
+    *,
+    action: str | None = None,
+    target_type: str | None = None,
+    loyalty_only: bool = False,
+) -> list:
+    filters = []
+    if action:
+        filters.append(AdminAuditLog.action == action)
+    if target_type:
+        filters.append(AdminAuditLog.target_type == target_type)
+    if loyalty_only:
+        filters.append(AdminAuditLog.action.like("loyalty_%"))
+    return filters
+
+
+async def list_admin_audit_logs(
+    session: AsyncSession,
+    pagination: PaginationParams,
+    *,
+    action: str | None = None,
+    target_type: str | None = None,
+    loyalty_only: bool = False,
+) -> tuple[list[AdminAuditLog], int]:
+    filters = _admin_audit_filters(
+        action=action,
+        target_type=target_type,
+        loyalty_only=loyalty_only,
+    )
+    base = select(AdminAuditLog).where(*filters)
+    total = await session.scalar(select(func.count()).select_from(base.subquery()))
+    result = await session.execute(
+        base.order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
+        .offset((pagination.page - 1) * pagination.page_size)
+        .limit(pagination.page_size)
+    )
+    return list(result.scalars()), int(total or 0)
+
+
 def list_templates() -> list[MessageTemplateOut]:
     return list(MESSAGE_TEMPLATES.values())
 

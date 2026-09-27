@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -162,6 +163,138 @@ async def test_create_order_prices_allowed_extras_server_side():
     added_item = session.add.call_args_list[1].args[0]
     assert float(added_item.extras_total) == 10
     assert added_item.extras_snapshot[0]["name"] == "Mozzarella"
+
+
+async def test_create_order_reward_transaction_contains_loyalty_audit_metadata(monkeypatch):
+    from app.modules.catalog.models import Product
+    from app.modules.loyalty.account.models import LoyaltyTransaction
+    from app.modules.loyalty.config.models import LoyaltyReward
+    from app.modules.orders import service
+    from app.modules.orders.schemas import ManualOrderCreate, OrderItemCreate
+
+    product = Product(id=1, name="Margherita", base_price=12, is_active=True)
+    reward = LoyaltyReward(
+        id=7,
+        name="5 EUR offerts",
+        reward_type="discount_euros",
+        points_required=100,
+        discount_amount=5,
+        is_active=True,
+    )
+    account = SimpleNamespace(id=55, user_id=42, points=180)
+    session = AsyncMock()
+    session.scalar = AsyncMock(side_effect=[None, 3])
+    session.get = AsyncMock(side_effect=[product, reward])
+    session.add = MagicMock()
+    session.flush = AsyncMock()
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+
+    monkeypatch.setattr(
+        service,
+        "get_or_create_account",
+        AsyncMock(return_value=account),
+    )
+    record_audit = AsyncMock()
+    monkeypatch.setattr(service, "_record_loyalty_reward_audit", record_audit)
+
+    body = ManualOrderCreate(
+        establishment_id=3,
+        order_type="pickup",
+        loyalty_customer_id=42,
+        loyalty_reward_id=7,
+        loyalty_identification_method="qr",
+        loyalty_oral_confirmed=True,
+        items=[OrderItemCreate(product_id=1, quantity=1)],
+        payment={"method": "cash", "amount_received": 20},
+    )
+
+    order = await service.create_order(
+        session,
+        body,
+        user_id=42,
+        idempotency_key="manual-reward",
+        created_by_user_id=11,
+        source="manual",
+        commit=False,
+        skip_idempotency_lookup=True,
+    )
+
+    transactions = [
+        call.args[0]
+        for call in session.add.call_args_list
+        if isinstance(call.args[0], LoyaltyTransaction)
+    ]
+    assert len(transactions) == 1
+    tx = transactions[0]
+    assert tx.points_delta == -100
+    assert tx.reward_id == 7
+    assert tx.changed_by_user_id == 11
+    assert tx.order_id == order.id
+    assert tx.metadata_json["customer_id"] == 42
+    assert tx.metadata_json["staff_user_id"] == 11
+    assert tx.metadata_json["establishment_id"] == 3
+    assert tx.metadata_json["loyalty_identification_method"] == "qr"
+    assert tx.metadata_json["loyalty_oral_confirmed"] is True
+    record_audit.assert_awaited_once()
+
+
+async def test_create_manual_order_credits_points_after_confirmed_payment(monkeypatch):
+    from app.modules.orders import service
+    from app.modules.orders.models import Order
+    from app.modules.orders.schemas import ManualOrderCreate, OrderItemCreate
+
+    session = AsyncMock()
+    session.scalar = AsyncMock(return_value=None)
+    session.add = MagicMock()
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+
+    order = Order(
+        id=88,
+        user_id=42,
+        establishment_id=3,
+        status="pending",
+        payment_status="pending",
+        total=24,
+    )
+    credit = AsyncMock()
+
+    async def _confirm_order(*args, **kwargs):
+        order.status = "confirmed"
+        return order
+
+    monkeypatch.setattr(service, "create_order", AsyncMock(return_value=order))
+    monkeypatch.setattr(service, "update_status", AsyncMock(side_effect=_confirm_order))
+    monkeypatch.setattr(service, "_credit_loyalty_for_order", credit)
+    monkeypatch.setattr(service, "_serialize_order_detail", AsyncMock(return_value={"id": 88}))
+    monkeypatch.setattr(service, "build_receipt", AsyncMock(return_value={"order_id": 88}))
+
+    body = ManualOrderCreate(
+        establishment_id=3,
+        order_type="pickup",
+        loyalty_customer_id=42,
+        loyalty_identification_method="phone",
+        items=[OrderItemCreate(product_id=1, quantity=2)],
+        payment={"method": "cash", "amount_received": 30},
+    )
+
+    await service.create_manual_order(
+        session,
+        body,
+        actor_user_id=11,
+        tenant_slug="test",
+        idempotency_key="manual-credit",
+    )
+
+    assert order.payment_status == "paid"
+    credit.assert_awaited_once_with(
+        session,
+        order,
+        staff_user_id=11,
+        identification_method="phone",
+        oral_confirmed=False,
+    )
 
 
 async def test_update_item_preparation_marks_ready_with_audit_fields():

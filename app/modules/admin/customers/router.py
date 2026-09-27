@@ -11,6 +11,7 @@ from app.modules.admin.customers.schemas import (
     AdminCustomerDetail,
     AdminCustomerListItem,
     AdminCustomerOrderDetail,
+    AdminAuditLogOut,
     BulkCustomerMessageRequest,
     CustomerCommunicationOut,
     CustomerMessageSendRequest,
@@ -102,6 +103,25 @@ async def export_customers_csv(
 @router.get("/message-templates", response_model=list[MessageTemplateOut])
 async def message_templates(current_user: dict = Depends(require_role("admin"))):
     return service.list_templates()
+
+
+@router.get("/audit", response_model=PaginatedResponse[AdminAuditLogOut])
+async def list_admin_audit_logs(
+    pagination: PaginationParams = Depends(get_pagination),
+    action: str | None = Query(None, max_length=64),
+    target_type: str | None = Query(None, max_length=64),
+    loyalty_only: bool = False,
+    current_user: dict = Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        items, total = await service.list_admin_audit_logs(
+            session,
+            pagination,
+            action=action,
+            target_type=target_type,
+            loyalty_only=loyalty_only,
+        )
+    return PaginatedResponse.build(items, total, pagination)
 
 
 @router.post("/messages/bulk", response_model=CustomerMessageSendResult)
