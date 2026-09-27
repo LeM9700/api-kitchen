@@ -6,6 +6,7 @@ helpers for tenant-scoped loyalty programs.
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 import pytz
 from sqlalchemy import func, select
@@ -127,6 +128,7 @@ async def credit_points_for_order(
     order_id: int,
     order_total_euros: float,
     category_ids: list[int],
+    metadata: dict[str, Any] | None = None,
 ) -> LoyaltyAccount:
     idempotency_key = f"order_delivered_{order_id}"
     already_credited = await session.scalar(
@@ -155,6 +157,7 @@ async def credit_points_for_order(
                 "bonus_points": preview.bonus_points,
                 "applied_rules": preview.applied_rules,
                 "total_multiplier": str(preview.total_multiplier),
+                **(metadata or {}),
             },
         )
     )

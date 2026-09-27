@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.modules.loyalty.config.schemas import LoyaltyRewardEligibilityResponse
+
 
 class LoyaltyAccountOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -78,3 +80,44 @@ class ExpiringPointsResponse(BaseModel):
     points_expiry_days: int | None
     total_expiring_points: int
     buckets: list[ExpiringPointsBucket]
+
+
+class LoyaltyStaffCustomerOut(BaseModel):
+    id: int
+    full_name: str | None = None
+    masked_phone: str | None = None
+    phone_last4: str | None = None
+    points: int = 0
+    available_points: int = 0
+    phone_verified: bool = False
+    pending_profile_completion: bool = False
+
+
+class LoyaltyStaffCustomerSearchResponse(BaseModel):
+    items: list[LoyaltyStaffCustomerOut]
+    min_digits: int = 4
+
+
+class LoyaltyQrTokenResponse(BaseModel):
+    token: str
+    expires_at: datetime
+    ttl_seconds: int
+
+
+class LoyaltyQrIdentifyRequest(BaseModel):
+    token: str = Field(..., min_length=24, max_length=2048)
+
+
+class LoyaltyStaffCustomerCreateRequest(BaseModel):
+    phone: str = Field(..., min_length=4, max_length=32)
+    first_name: str = Field(..., min_length=1, max_length=80)
+    last_name: str = Field(..., min_length=1, max_length=80)
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name.strip()} {self.last_name.strip()}".strip()
+
+
+class LoyaltyStaffCustomerWalletOut(BaseModel):
+    customer: LoyaltyStaffCustomerOut
+    rewards: list[LoyaltyRewardEligibilityResponse]

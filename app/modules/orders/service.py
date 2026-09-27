@@ -17,6 +17,7 @@ from app.modules.delivery.models import DeliveryZone
 from app.modules.hr.models import Establishment
 from app.modules.loyalty.account.models import LoyaltyTransaction
 from app.modules.loyalty.account.service import get_or_create_account
+from app.modules.loyalty.config.models import LoyaltyReward
 from app.modules.loyalty.config.service import credit_points_for_order, get_or_create_loyalty_config
 from app.modules.notifications.notification_service import notify_staff, notify_user
 from app.modules.orders.models import Order, OrderItem, OrderStatusHistory
@@ -108,6 +109,57 @@ def _money(value) -> float:
     return round(float(value or 0), 2)
 
 
+def _loyalty_order_audit_metadata(
+    *,
+    body,
+    order: Order,
+    customer_id: int | None,
+    staff_user_id: int | None,
+) -> dict:
+    return {
+        "order_id": order.id,
+        "establishment_id": order.establishment_id,
+        "customer_id": customer_id,
+        "staff_user_id": staff_user_id,
+        "loyalty_identification_method": getattr(body, "loyalty_identification_method", None),
+        "loyalty_oral_confirmed": bool(getattr(body, "loyalty_oral_confirmed", False)),
+    }
+
+
+async def _record_loyalty_reward_audit(
+    session: AsyncSession,
+    *,
+    body,
+    order: Order,
+    customer_id: int,
+    staff_user_id: int | None,
+    reward: LoyaltyReward,
+    discount_amount: float,
+) -> None:
+    from app.modules.admin.customers.service import record_admin_audit
+
+    await record_admin_audit(
+        session,
+        actor={"id": staff_user_id} if staff_user_id is not None else None,
+        action="loyalty_staff_reward_applied",
+        target_type="customer",
+        target_id=customer_id,
+        metadata={
+            **_loyalty_order_audit_metadata(
+                body=body,
+                order=order,
+                customer_id=customer_id,
+                staff_user_id=staff_user_id,
+            ),
+            "reward_id": reward.id,
+            "reward_name": reward.name,
+            "reward_type": reward.reward_type,
+            "points_required": reward.points_required,
+            "discount_amount": str(discount_amount),
+        },
+    )
+
+
 async def _resolve_loyalty_discount(
     session: AsyncSession,
     user_id: int | None,
@@ -136,6 +188,52 @@ async def _resolve_loyalty_discount(
             "loyalty_points_to_use",
         )
     return discount, points_to_use
+
+
+async def _resolve_loyalty_reward_discount(
+    session: AsyncSession,
+    user_id: int | None,
+    reward_id: int | None,
+    amount_eligible: float,
+    resolved_items: list[tuple],
+) -> tuple[float, LoyaltyReward | None]:
+    if reward_id is None:
+        return 0.0, None
+    if user_id is None:
+        raise AppError("LOYALTY_USER_REQUIRED", "loyalty_customer_id is required", 422, "loyalty_customer_id")
+
+    reward = await session.get(LoyaltyReward, reward_id)
+    if reward is None or not reward.is_active:
+        raise AppError("REWARD_NOT_FOUND", "Recompense introuvable ou inactive", 404, "loyalty_reward_id")
+
+    account = await get_or_create_account(session, user_id, commit=False)
+    if account.points < reward.points_required:
+        raise AppError("INSUFFICIENT_POINTS", "Solde de points insuffisant", 422, "loyalty_reward_id")
+
+    eligible = _money(amount_eligible)
+    if reward.reward_type == "discount_euros":
+        if reward.discount_amount is None:
+            raise AppError("INVALID_REWARD", "Recompense mal configuree", 422, "loyalty_reward_id")
+        return min(_money(reward.discount_amount), eligible), reward
+
+    if reward.reward_type == "free_product":
+        if reward.product_id is None:
+            raise AppError("INVALID_REWARD", "Recompense mal configuree", 422, "loyalty_reward_id")
+        matching_unit_prices = [
+            _money(unit_price)
+            for item, unit_price, *_rest in resolved_items
+            if item.product_id == reward.product_id and item.quantity > 0
+        ]
+        if not matching_unit_prices:
+            raise AppError(
+                "REWARD_PRODUCT_REQUIRED",
+                "Le produit offert doit etre present dans la commande",
+                422,
+                "loyalty_reward_id",
+            )
+        return min(min(matching_unit_prices), eligible), reward
+
+    raise AppError("INVALID_REWARD", "Type de recompense non supporte", 422, "loyalty_reward_id")
 
 
 def _extras_from_snapshot(snapshot) -> list[dict]:
@@ -519,7 +617,25 @@ async def create_order(
         )
 
     loyalty_points_to_use = int(getattr(body, "loyalty_points_to_use", 0) or 0)
+    loyalty_reward_id = getattr(body, "loyalty_reward_id", None)
+    loyalty_reward: LoyaltyReward | None = None
     loyalty_discount = 0.0
+    if loyalty_points_to_use and loyalty_reward_id:
+        raise AppError(
+            "LOYALTY_REWARD_CONFLICT",
+            "Une seule recompense fidelite peut etre appliquee",
+            422,
+            "loyalty_reward_id",
+        )
+    if loyalty_reward_id:
+        loyalty_discount, loyalty_reward = await _resolve_loyalty_reward_discount(
+            session,
+            user_id,
+            loyalty_reward_id,
+            max(0.0, subtotal - discount_total),
+            resolved_items,
+        )
+        discount_total = _money(discount_total + loyalty_discount)
     if loyalty_points_to_use:
         loyalty_discount, loyalty_points_to_use = await _resolve_loyalty_discount(
             session,
@@ -564,6 +680,12 @@ async def create_order(
         if user_id is None:
             raise AppError("LOYALTY_USER_REQUIRED", "loyalty_user_id is required", 422, "loyalty_user_id")
         account = await get_or_create_account(session, user_id, commit=False)
+        loyalty_metadata = _loyalty_order_audit_metadata(
+            body=body,
+            order=order,
+            customer_id=user_id,
+            staff_user_id=created_by_user_id,
+        )
         account.points -= loyalty_points_to_use
         session.add(
             LoyaltyTransaction(
@@ -574,8 +696,46 @@ async def create_order(
                 source="staff_checkout",
                 changed_by_user_id=created_by_user_id,
                 order_id=order.id,
-                metadata_json={"discount_amount": str(loyalty_discount)},
+                metadata_json={**loyalty_metadata, "discount_amount": str(loyalty_discount)},
             )
+        )
+    if loyalty_reward is not None:
+        if user_id is None:
+            raise AppError("LOYALTY_USER_REQUIRED", "loyalty_customer_id is required", 422, "loyalty_customer_id")
+        account = await get_or_create_account(session, user_id, commit=False)
+        loyalty_metadata = _loyalty_order_audit_metadata(
+            body=body,
+            order=order,
+            customer_id=user_id,
+            staff_user_id=created_by_user_id,
+        )
+        account.points -= loyalty_reward.points_required
+        session.add(
+            LoyaltyTransaction(
+                account_id=account.id,
+                points_delta=-loyalty_reward.points_required,
+                reason=f"manual_reward_{loyalty_reward.id}_order_{order.id}",
+                transaction_type="redeem",
+                source="staff_checkout",
+                changed_by_user_id=created_by_user_id,
+                order_id=order.id,
+                reward_id=loyalty_reward.id,
+                metadata_json={
+                    **loyalty_metadata,
+                    "reward_name": loyalty_reward.name,
+                    "reward_type": loyalty_reward.reward_type,
+                    "discount_amount": str(loyalty_discount),
+                },
+            )
+        )
+        await _record_loyalty_reward_audit(
+            session,
+            body=body,
+            order=order,
+            customer_id=user_id,
+            staff_user_id=created_by_user_id,
+            reward=loyalty_reward,
+            discount_amount=loyalty_discount,
         )
     for (
         item,
@@ -658,11 +818,12 @@ async def create_manual_order(
         raise AppError("INVALID_PAYMENT_METHOD", "Unsupported manual payment method", 422, "payment.method")
 
     customer = body.customer
+    loyalty_customer_id = getattr(body, "loyalty_customer_id", None) or getattr(body, "loyalty_user_id", None)
     try:
         order = await create_order(
             session,
             body,
-            user_id=getattr(body, "loyalty_user_id", None),
+            user_id=loyalty_customer_id,
             tenant_slug=tenant_slug,
             idempotency_key=idempotency_key,
             created_by_user_id=actor_user_id,
@@ -704,6 +865,23 @@ async def create_manual_order(
         await session.rollback()
         raise
 
+    if order.user_id is not None and order.payment_status == "paid" and order.status in {"confirmed", "queued"}:
+        try:
+            await _credit_loyalty_for_order(
+                session,
+                order,
+                staff_user_id=actor_user_id,
+                identification_method=getattr(body, "loyalty_identification_method", None),
+                oral_confirmed=bool(getattr(body, "loyalty_oral_confirmed", False)),
+            )
+        except Exception as exc:
+            logger.error(
+                "loyalty.credit_points_for_order failed for manual order_id=%s user_id=%s: %s",
+                order.id,
+                order.user_id,
+                exc,
+            )
+
     await session.refresh(order)
     await session.refresh(payment)
     return {
@@ -711,6 +889,48 @@ async def create_manual_order(
         "payment": _payment_payload(payment),
         "receipt": await build_receipt(session, order.id),
     }
+
+
+async def _credit_loyalty_for_order(
+    session: AsyncSession,
+    order: Order,
+    *,
+    staff_user_id: int | None = None,
+    identification_method: str | None = None,
+    oral_confirmed: bool = False,
+) -> None:
+    if order.user_id is None:
+        return
+
+    items_result = await session.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+    order_items = list(items_result.scalars())
+    product_ids = [item.product_id for item in order_items]
+
+    category_ids: list[int] = []
+    if product_ids:
+        products_result = await session.execute(
+            select(Product.category_id).where(
+                Product.id.in_(product_ids),
+                Product.category_id.isnot(None),
+            )
+        )
+        category_ids = [row[0] for row in products_result]
+
+    await credit_points_for_order(
+        session,
+        order.user_id,
+        order.id,
+        float(order.total),
+        category_ids,
+        metadata={
+            "order_id": order.id,
+            "establishment_id": order.establishment_id,
+            "customer_id": order.user_id,
+            "staff_user_id": staff_user_id,
+            "loyalty_identification_method": identification_method,
+            "loyalty_oral_confirmed": oral_confirmed,
+        },
+    )
 
 
 def _apply_preparation_status(item: OrderItem, status: str, actor_user_id: int | None) -> None:
@@ -1332,29 +1552,7 @@ async def update_status(
     # Recupere les category_ids des produits commandes pour le calcul des regles bonus.
     if actual_status == "delivered" and order.user_id is not None:
         try:
-            items_result = await session.execute(
-                select(OrderItem).where(OrderItem.order_id == order_id)
-            )
-            order_items = list(items_result.scalars())
-            product_ids = [item.product_id for item in order_items]
-
-            category_ids: list[int] = []
-            if product_ids:
-                products_result = await session.execute(
-                    select(Product.category_id).where(
-                        Product.id.in_(product_ids),
-                        Product.category_id.isnot(None),
-                    )
-                )
-                category_ids = [row[0] for row in products_result]
-
-            await credit_points_for_order(
-                session,
-                order.user_id,
-                order_id,
-                float(order.total),
-                category_ids,
-            )
+            await _credit_loyalty_for_order(session, order)
         except Exception as exc:
             logger.error(
                 "loyalty.credit_points_for_order failed for order_id=%s user_id=%s: %s",

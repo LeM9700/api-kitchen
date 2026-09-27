@@ -1,13 +1,19 @@
+from arq import ArqRedis
 from fastapi import APIRouter, Depends, Query
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_current_user, require_role
+from app.core.http.deps import get_arq_pool, get_current_user, require_role
 from app.modules.loyalty.account import service
 from app.modules.loyalty.account.schemas import (
     CheckoutReservationCreate,
     CheckoutReservationOut,
     ExpiringPointsResponse,
     LoyaltyAccountOut,
+    LoyaltyQrIdentifyRequest,
+    LoyaltyQrTokenResponse,
+    LoyaltyStaffCustomerCreateRequest,
+    LoyaltyStaffCustomerSearchResponse,
+    LoyaltyStaffCustomerWalletOut,
     LoyaltyTransactionPage,
     PointsRequest,
     RedeemPointsRequest,
@@ -43,6 +49,62 @@ async def my_transactions(
 async def my_expiring_points(current_user=Depends(get_current_user)):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await service.get_expiring_points_response(session, int(current_user["id"]))
+
+
+@router.post("/qr-token", response_model=LoyaltyQrTokenResponse)
+async def create_my_loyalty_qr_token(current_user=Depends(get_current_user)):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_loyalty_qr_token(
+            session,
+            user_id=int(current_user["id"]),
+            tenant_slug=current_user["tenant_slug"],
+        )
+
+
+@router.get("/staff/customers/search", response_model=LoyaltyStaffCustomerSearchResponse)
+async def staff_search_customers(
+    q: str = Query(..., min_length=1, max_length=32),
+    limit: int = Query(10, ge=1, le=20),
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.search_staff_customers(session, q, actor=current_user, limit=limit)
+
+
+@router.post("/staff/customers", response_model=LoyaltyStaffCustomerWalletOut, status_code=201)
+async def staff_create_customer(
+    body: LoyaltyStaffCustomerCreateRequest,
+    current_user=Depends(require_role("staff", "admin")),
+    arq_pool: ArqRedis = Depends(get_arq_pool),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.create_staff_customer(
+            session,
+            body,
+            actor=current_user,
+            tenant_slug=current_user["tenant_slug"],
+            arq_pool=arq_pool,
+        )
+
+
+@router.get("/staff/customers/{customer_id}/wallet", response_model=LoyaltyStaffCustomerWalletOut)
+async def staff_customer_wallet(customer_id: int, current_user=Depends(require_role("staff", "admin"))):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.build_staff_customer_wallet(session, customer_id, actor=current_user)
+
+
+@router.post("/staff/identify-qr", response_model=LoyaltyStaffCustomerWalletOut)
+async def staff_identify_qr(
+    body: LoyaltyQrIdentifyRequest,
+    current_user=Depends(require_role("staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.identify_loyalty_qr_token(
+            session,
+            body.token,
+            tenant_slug=current_user["tenant_slug"],
+            actor=current_user,
+        )
 
 
 @router.get("/users/{user_id}", response_model=LoyaltyAccountOut)

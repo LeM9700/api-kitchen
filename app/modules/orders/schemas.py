@@ -9,6 +9,7 @@ OrderType = Literal["delivery", "pickup", "dine_in"]
 PreparationStatus = Literal["pending", "preparing", "ready"]
 PreparationStation = Literal["kitchen", "counter", "none"]
 ManualPaymentMethod = Literal["cash", "external_terminal", "cash_register"]
+LoyaltyIdentificationMethod = Literal["phone", "qr", "quick_create"]
 
 
 class OrderItemExtraCreate(BaseModel):
@@ -67,6 +68,12 @@ class ManualOrderPaymentCreate(BaseModel):
 class ManualOrderCreate(OrderCreate):
     customer: ManualOrderCustomer | None = None
     table_number: str | None = Field(None, max_length=32)
+    loyalty_customer_id: int | None = Field(None, ge=1)
+    loyalty_reward_id: int | None = Field(None, ge=1)
+    loyalty_identification_method: LoyaltyIdentificationMethod | None = None
+    loyalty_oral_confirmed: bool = False
+    # Deprecated: kept temporarily so older clients fail gracefully while the
+    # staff app migrates to phone/QR identification.
     loyalty_user_id: int | None = Field(None, ge=1)
     loyalty_points_to_use: int | None = Field(None, ge=1)
     payment: ManualOrderPaymentCreate
@@ -76,8 +83,16 @@ class ManualOrderCreate(OrderCreate):
     def _copy_customer_fields(self) -> "ManualOrderCreate":
         if self.customer is not None:
             self.customer_email = self.customer.email
-        if self.loyalty_points_to_use is not None and self.loyalty_user_id is None:
-            raise ValueError("loyalty_user_id est requis avec loyalty_points_to_use")
+        if self.loyalty_user_id is not None:
+            raise ValueError("loyalty_user_id est obsolete: utilisez loyalty_customer_id")
+        if self.loyalty_points_to_use is not None:
+            raise ValueError("La saisie manuelle de points fidelite est indisponible")
+        if self.loyalty_customer_id is not None and self.loyalty_identification_method is None:
+            raise ValueError("loyalty_identification_method est requis avec loyalty_customer_id")
+        if self.loyalty_reward_id is not None and self.loyalty_customer_id is None:
+            raise ValueError("loyalty_customer_id est requis avec loyalty_reward_id")
+        if self.loyalty_reward_id is not None and not self.loyalty_oral_confirmed:
+            raise ValueError("Confirmation orale client requise avec loyalty_reward_id")
         return self
 
 
