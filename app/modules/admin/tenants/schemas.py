@@ -50,6 +50,7 @@ class TenantConfigUpdate(BaseModel):
     timezone: str | None = None
     large_stock_adjustment_threshold: float | None = Field(None, ge=0)
     haccp_frying_oil_enabled: bool | None = None
+    haccp_dlc_gate_enabled: bool | None = None
     currency: str | None = None
     default_language: str | None = None
 
@@ -117,6 +118,7 @@ class TenantConfigResponse(BaseModel):
     print_enabled: bool = False
     print_config: dict | None = None
     haccp_frying_oil_enabled: bool = False
+    haccp_dlc_gate_enabled: bool = False
     updated_at: datetime
     scheduled_close_at: datetime | None
 

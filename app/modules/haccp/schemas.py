@@ -416,3 +416,7 @@ class HaccpStatusResponse(BaseModel):
     can_open: bool
     can_close: bool
     open_non_conformities: int
+    dlc_gate_status: Literal["ok", "warning", "blocked"] = "ok"
+    dlc_gate_enabled: bool = False
+    dlc_critical_count: int = 0
+    dlc_gate_message: str | None = None

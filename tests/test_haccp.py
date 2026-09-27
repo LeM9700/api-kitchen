@@ -15,6 +15,12 @@ donnees (_collect_data) avec generate_csv(), deja couvert plus bas.
 """
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from app.core.http.errors import AppError
 
 
 async def _register_admin(client, slug: str) -> dict:
@@ -259,3 +265,141 @@ async def test_haccp_equipment_create_requires_valid_auth(client):
         headers={"Authorization": "Bearer invalid-token"},
     )
     assert resp.status_code in (401, 403)
+
+
+async def test_haccp_dlc_gate_snapshot_classifies_blocking_items(monkeypatch):
+    from app.modules.admin.tenants.models import TenantConfig
+    from app.modules.haccp import service
+
+    async def fake_overview(_session):
+        return {
+            "items": [
+                {"severity": "expired"},
+                {"severity": "regularize"},
+                {"severity": "critical"},
+                {"severity": "warning"},
+                {"severity": "ok"},
+            ]
+        }
+
+    class FakeSession:
+        async def scalar(self, _stmt):
+            return TenantConfig(haccp_dlc_gate_enabled=False)
+
+    monkeypatch.setattr(service.stock_service, "get_dlc_overview", fake_overview)
+
+    snapshot = await service._dlc_gate_snapshot(FakeSession())
+
+    assert snapshot["enabled"] is False
+    assert snapshot["status"] == "warning"
+    assert snapshot["critical_count"] == 3
+    assert "3 lots DLC critiques" in snapshot["message"]
+
+
+async def test_haccp_complete_session_blocks_when_strict_dlc_gate_enabled(monkeypatch):
+    from app.modules.haccp import service
+    from app.modules.haccp.models import HaccpCheckSession
+
+    check_session = HaccpCheckSession(
+        session_type="opening",
+        date=date.today(),
+        status="in_progress",
+    )
+    check_session.id = 42
+    fake_session = SimpleNamespace(
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        add=Mock(),
+    )
+
+    async def fake_get_session(_session, _session_id):
+        return check_session
+
+    monkeypatch.setattr(service, "get_session_by_id", fake_get_session)
+    monkeypatch.setattr(service, "_count_equipment_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_count_temperature_logs", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_count_cleaning_tasks_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_count_cleaning_logs", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        service,
+        "_dlc_gate_snapshot",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "status": "blocked",
+                "critical_count": 1,
+                "message": "1 lot DLC critique bloque la validation HACCP.",
+                "items": [{"severity": "expired"}],
+            }
+        ),
+    )
+
+    with pytest.raises(AppError) as exc:
+        await service.complete_session(
+            fake_session,
+            session_id=42,
+            user_id=7,
+            notes=None,
+            force=False,
+        )
+
+    assert exc.value.code == "HACCP_DLC_GATE_BLOCKED"
+    assert exc.value.status_code == 409
+    fake_session.commit.assert_not_awaited()
+
+
+async def test_haccp_complete_session_force_records_manager_trace_for_dlc(monkeypatch):
+    from app.modules.haccp import service
+    from app.modules.haccp.models import HaccpCheckSession, HaccpNonConformity
+
+    check_session = HaccpCheckSession(
+        session_type="closing",
+        date=date.today(),
+        status="in_progress",
+    )
+    check_session.id = 84
+    fake_session = SimpleNamespace(
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        add=Mock(),
+    )
+
+    async def fake_get_session(_session, _session_id):
+        return check_session
+
+    monkeypatch.setattr(service, "get_session_by_id", fake_get_session)
+    monkeypatch.setattr(service, "_count_equipment_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_count_temperature_logs", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_count_cleaning_tasks_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_count_cleaning_logs", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        service,
+        "_dlc_gate_snapshot",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "status": "blocked",
+                "critical_count": 2,
+                "message": "2 lots DLC critiques bloquent la validation HACCP.",
+                "items": [{"severity": "regularize"}, {"severity": "critical"}],
+            }
+        ),
+    )
+
+    result = await service.complete_session(
+        fake_session,
+        session_id=84,
+        user_id=7,
+        notes="validation manager",
+        force=True,
+    )
+
+    assert result.status == "incomplete_validated"
+    assert result.completed_by == 7
+    fake_session.commit.assert_awaited_once()
+    trace = fake_session.add.call_args.args[0]
+    assert isinstance(trace, HaccpNonConformity)
+    assert trace.source_type == "dlc"
+    assert trace.session_id == 84
+    assert trace.status == "open"
+    assert trace.validated_by == 7

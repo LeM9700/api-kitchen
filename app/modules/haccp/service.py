@@ -12,6 +12,7 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
+from app.modules.admin.tenants.models import TenantConfig
 from app.modules.haccp.models import (
     HaccpCheckSession,
     HaccpCleaningLog,
@@ -29,6 +30,7 @@ from app.modules.haccp.schemas import (
     HaccpSessionSummary,
     HaccpStatusResponse,
 )
+from app.modules.stock import service as stock_service
 
 # ─── Constantes HACCP ────────────────────────────────────────────────────────
 
@@ -37,6 +39,77 @@ OIL_POLARITY_LIMIT = 25.0
 
 # Températures max refroidissement rapide (arrêté 21/12/2009)
 COOLING_TARGET_TEMP = 10.0  # °C atteint en 2h max
+DLC_GATE_BLOCKING_SEVERITIES = {"expired", "regularize", "critical"}
+
+
+async def _tenant_dlc_gate_enabled(session: AsyncSession) -> bool:
+    """Retourne le mode strict DLC du tenant sans creer de config implicite."""
+    config = await session.scalar(select(TenantConfig))
+    return bool(getattr(config, "haccp_dlc_gate_enabled", False))
+
+
+def _dlc_gate_message(critical_count: int, *, gate_enabled: bool) -> str | None:
+    if critical_count <= 0:
+        return None
+    noun = "lot DLC critique" if critical_count == 1 else "lots DLC critiques"
+    if gate_enabled:
+        return (
+            f"{critical_count} {noun} bloquent la validation HACCP. "
+            "Regularisez, retirez du stock disponible ou forcez avec trace manager."
+        )
+    return (
+        f"{critical_count} {noun} a traiter avant d'activer le gate DLC strict "
+        "ou de fiabiliser ouverture/fermeture."
+    )
+
+
+async def _dlc_gate_snapshot(session: AsyncSession) -> dict:
+    overview = await stock_service.get_dlc_overview(session)
+    critical_items = [
+        item
+        for item in overview.get("items", [])
+        if item.get("severity") in DLC_GATE_BLOCKING_SEVERITIES
+    ]
+    gate_enabled = await _tenant_dlc_gate_enabled(session)
+    critical_count = len(critical_items)
+    status = "ok"
+    if critical_count > 0:
+        status = "blocked" if gate_enabled else "warning"
+    return {
+        "enabled": gate_enabled,
+        "status": status,
+        "critical_count": critical_count,
+        "message": _dlc_gate_message(critical_count, gate_enabled=gate_enabled),
+        "items": critical_items,
+    }
+
+
+def _record_dlc_force_trace(
+    session: AsyncSession,
+    *,
+    check_session: HaccpCheckSession,
+    user_id: int,
+    snapshot: dict,
+) -> None:
+    critical_count = int(snapshot.get("critical_count") or 0)
+    if critical_count <= 0:
+        return
+    description = (
+        f"Validation manager avec {critical_count} risque(s) DLC critique(s) "
+        f"sur le check {check_session.session_type} du {check_session.date}."
+    )
+    session.add(
+        HaccpNonConformity(
+            session_id=check_session.id,
+            source_type="dlc",
+            source_id=None,
+            description=description,
+            corrective_action="Validation forcee par manager; DLC a regulariser.",
+            validated_by=user_id,
+            validated_at=datetime.now(timezone.utc),
+            status="open",
+        )
+    )
 
 
 # ─── Equipment ───────────────────────────────────────────────────────────────
@@ -201,6 +274,20 @@ async def complete_session(
     cleaning_done = await _count_cleaning_logs(session, session_id)
 
     all_done = (temp_count >= equipment_count) and (cleaning_done >= cleaning_count)
+    dlc_snapshot = await _dlc_gate_snapshot(session)
+    dlc_blocks = (
+        dlc_snapshot["enabled"]
+        and dlc_snapshot["critical_count"] > 0
+    )
+
+    if dlc_blocks and not force:
+        raise AppError(
+            "HACCP_DLC_GATE_BLOCKED",
+            dlc_snapshot["message"]
+            or "Des risques DLC critiques bloquent la validation HACCP.",
+            409,
+            "dlc",
+        )
 
     if not all_done and not force:
         missing = []
@@ -214,7 +301,19 @@ async def complete_session(
             422,
         )
 
-    new_status = "complete" if all_done else "incomplete_validated"
+    if force and dlc_snapshot["critical_count"] > 0:
+        _record_dlc_force_trace(
+            session,
+            check_session=check_session,
+            user_id=user_id,
+            snapshot=dlc_snapshot,
+        )
+
+    new_status = (
+        "complete"
+        if all_done and not (force and dlc_snapshot["critical_count"] > 0)
+        else "incomplete_validated"
+    )
     check_session.status = new_status
     check_session.completed_by = user_id
     check_session.completed_at = datetime.now(timezone.utc)
@@ -294,7 +393,7 @@ async def log_temperature(
     Raises:
         AppError: NOT_FOUND si session ou équipement introuvable.
     """
-    check_session = await get_session_by_id(session, session_id)
+    await get_session_by_id(session, session_id)
     equipment = await get_equipment(session, data["equipment_id"])
 
     # Calcul conformité
@@ -856,6 +955,10 @@ async def get_haccp_status(session: AsyncSession, today: date) -> HaccpStatusRes
 
     can_open = opening_summary.status in ("complete", "incomplete_validated")
     can_close = closing_summary.status in ("complete", "incomplete_validated")
+    dlc_snapshot = await _dlc_gate_snapshot(session)
+    if dlc_snapshot["status"] == "blocked":
+        can_open = False
+        can_close = False
 
     return HaccpStatusResponse(
         today=today,
@@ -864,4 +967,8 @@ async def get_haccp_status(session: AsyncSession, today: date) -> HaccpStatusRes
         can_open=can_open,
         can_close=can_close,
         open_non_conformities=open_nc,
+        dlc_gate_status=dlc_snapshot["status"],
+        dlc_gate_enabled=dlc_snapshot["enabled"],
+        dlc_critical_count=dlc_snapshot["critical_count"],
+        dlc_gate_message=dlc_snapshot["message"],
     )

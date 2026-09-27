@@ -120,6 +120,11 @@ class TenantConfig(Base):
     haccp_frying_oil_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Gate DLC strict pour ouverture/fermeture. Par defaut on expose un warning
+    # de preparation sans bloquer les operations tant que le tenant ne l'active pas.
+    haccp_dlc_gate_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # ── Branding public (Plan 02) ─────────────────────────────────────────────
     # Ces champs sont exposés sans auth via GET /tenant/branding.
