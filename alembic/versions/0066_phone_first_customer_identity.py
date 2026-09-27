@@ -1,7 +1,7 @@
 """Phone-first customer identity
 
 Revision ID: 0066
-Revises: 0065
+Revises: 0063
 Create Date: 2026-09-25
 """
 
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "0066"
-down_revision = "0065"
+down_revision = "0063"
 branch_labels = None
 depends_on = None
 
