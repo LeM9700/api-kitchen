@@ -181,3 +181,38 @@ async def test_availability_map_applies_latest_unavailable_override(monkeypatch)
     assert availability[1].available is False
     assert availability[1].reason == "Rupture pate"
     assert availability[1].is_overridden is True
+
+
+async def test_availability_map_keeps_stock_reason_when_manual_reactivation_is_unsafe(monkeypatch):
+    from app.modules.catalog import service
+    from app.modules.catalog.models import ProductAvailabilityOverride
+    from app.modules.stock import service as stock_service
+
+    async def fake_get_products_availability(session, product_ids):
+        return {
+            1: {
+                "product_id": 1,
+                "available": False,
+                "limiting_ingredient": "Mozzarella",
+            }
+        }
+
+    async def fake_latest_overrides(session, product_ids):
+        return {
+            1: ProductAvailabilityOverride(
+                id=11,
+                product_id=1,
+                available=True,
+                reason="Retour en stock valide",
+                changed_by_user_id=7,
+            )
+        }
+
+    monkeypatch.setattr(stock_service, "get_products_availability", fake_get_products_availability)
+    monkeypatch.setattr(service, "_latest_availability_overrides", fake_latest_overrides)
+
+    availability = await service._availability_map(object(), [1])
+
+    assert availability[1].available is False
+    assert availability[1].reason == "Stock insuffisant : Mozzarella"
+    assert availability[1].is_overridden is False

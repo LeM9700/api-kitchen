@@ -136,6 +136,8 @@ async def test_alerts_returns_only_below_threshold(client, monkeypatch):
             "unit": "kg",
             "current_qty": 1.0,
             "alert_threshold": 2.0,
+            "purchase_price_per_unit": None,
+            "purchase_unit": None,
             "is_below_threshold": True,
         }
     ]

@@ -120,12 +120,15 @@ class ExtraIngredient(Base):
     __table_args__ = (
         Index("ix_extra_ingredients_extra", "extra_id"),
         Index("ix_extra_ingredients_ingredient", "ingredient_id"),
+        UniqueConstraint("extra_id", "ingredient_id", name="uq_extra_ingredients_extra_ingredient"),
+        CheckConstraint("quantity > 0", name="ck_extra_ingredients_quantity_positive"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     extra_id: Mapped[int] = mapped_column(ForeignKey("extras.id", ondelete="CASCADE"), nullable=False)
     ingredient_id: Mapped[int] = mapped_column(ForeignKey("ingredients.id"), nullable=False)
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    quantity_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class ProductRecommendation(Base):

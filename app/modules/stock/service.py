@@ -1,13 +1,20 @@
 from datetime import datetime, timedelta, timezone
 
 from arq import ArqRedis
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
 from app.modules.admin.tenants.models import TenantConfig
-from app.modules.catalog.models import ExtraIngredient, Product
+from app.modules.catalog.models import (
+    Extra,
+    ExtraIngredient,
+    Product,
+    ProductAvailabilityOverride,
+    ProductExtra,
+    ProductVariant,
+)
 from app.modules.orders.models import OrderItem
 from app.modules.stock.models import (
     Ingredient,
@@ -15,8 +22,73 @@ from app.modules.stock.models import (
     ProductIngredient,
     StockAdjustmentRequest,
     StockMovement,
+    StockRecipeAuditLog,
     VariantIngredient,
 )
+from app.modules.stock.schemas import StockRecipeLineCreate, StockRecipeReplace
+
+_UNIT_FACTORS: dict[str, tuple[str, float]] = {
+    "g": ("mass", 1.0),
+    "gram": ("mass", 1.0),
+    "grams": ("mass", 1.0),
+    "kg": ("mass", 1000.0),
+    "kilogram": ("mass", 1000.0),
+    "kilograms": ("mass", 1000.0),
+    "ml": ("volume", 1.0),
+    "milliliter": ("volume", 1.0),
+    "milliliters": ("volume", 1.0),
+    "l": ("volume", 1000.0),
+    "liter": ("volume", 1000.0),
+    "liters": ("volume", 1000.0),
+    "piece": ("count", 1.0),
+    "pieces": ("count", 1.0),
+    "pc": ("count", 1.0),
+    "pcs": ("count", 1.0),
+    "unit": ("count", 1.0),
+    "units": ("count", 1.0),
+    "unite": ("count", 1.0),
+    "unites": ("count", 1.0),
+    "portion": ("count", 1.0),
+    "portions": ("count", 1.0),
+}
+
+_AUTO_STOCK_USER_ID = 0
+_AUTO_STOCK_REASON_PREFIX = "Stock insuffisant"
+
+
+def _stock_unavailable_reason(limiting_ingredient: str | None) -> str:
+    if limiting_ingredient:
+        return f"{_AUTO_STOCK_REASON_PREFIX} : {limiting_ingredient}"
+    return _AUTO_STOCK_REASON_PREFIX
+
+
+def _clean_unit(unit: str) -> str:
+    return unit.strip().lower()
+
+
+def _normalize_quantity(
+    quantity: float,
+    *,
+    from_unit: str | None,
+    ingredient: Ingredient,
+) -> tuple[float, str]:
+    target_unit = _clean_unit(ingredient.unit)
+    source_unit = _clean_unit(from_unit or ingredient.unit)
+    if source_unit == target_unit:
+        return float(quantity), ingredient.unit
+
+    source = _UNIT_FACTORS.get(source_unit)
+    target = _UNIT_FACTORS.get(target_unit)
+    if source is None or target is None or source[0] != target[0]:
+        raise AppError(
+            "INVALID_RECIPE_UNIT",
+            "Recipe unit is not compatible with ingredient stock unit",
+            422,
+            "unit",
+        )
+
+    normalized = float(quantity) * source[1] / target[1]
+    return normalized, ingredient.unit
 
 
 def _effective_batch_expires_at(batch: IngredientBatch) -> datetime | None:
@@ -59,6 +131,149 @@ def _adjustment_request_payload(request: StockAdjustmentRequest, is_large_adjust
         "is_large_adjustment": is_large_adjustment,
         "created_at": request.created_at,
     }
+
+
+def _recipe_payload(recipe, recipe_type: str, target_id: int, ingredient: Ingredient | None = None) -> dict:
+    return {
+        "id": recipe.id,
+        "recipe_type": recipe_type,
+        "target_id": target_id,
+        "ingredient_id": recipe.ingredient_id,
+        "ingredient_name": ingredient.name if ingredient is not None else None,
+        "quantity": float(recipe.quantity),
+        "unit": recipe.quantity_unit or (ingredient.unit if ingredient is not None else None),
+    }
+
+
+async def _recipe_ingredients_by_id(session: AsyncSession, recipes: list) -> dict[int, Ingredient]:
+    ingredient_ids = {recipe.ingredient_id for recipe in recipes}
+    if not ingredient_ids:
+        return {}
+    result = await session.execute(select(Ingredient).where(Ingredient.id.in_(ingredient_ids)))
+    return {ingredient.id: ingredient for ingredient in result.scalars()}
+
+
+def _recipe_response(recipe_type: str, target_id: int, recipes: list, ingredients: dict[int, Ingredient]) -> dict:
+    return {
+        "recipe_type": recipe_type,
+        "target_id": target_id,
+        "items": [
+            _recipe_payload(recipe, recipe_type, target_id, ingredients.get(recipe.ingredient_id))
+            for recipe in recipes
+        ],
+    }
+
+
+def _recipe_audit_items(
+    recipe_type: str,
+    target_id: int,
+    recipes: list,
+    ingredients: dict[int, Ingredient],
+) -> list[dict]:
+    return sorted(
+        [
+            _recipe_payload(recipe, recipe_type, target_id, ingredients.get(recipe.ingredient_id))
+            for recipe in recipes
+        ],
+        key=lambda item: (item["ingredient_id"], item["id"] or 0),
+    )
+
+
+def _add_recipe_audit_log(
+    session: AsyncSession,
+    *,
+    recipe_type: str,
+    target_id: int,
+    changed_by_user_id: int | None,
+    old_items: list[dict],
+    new_items: list[dict],
+) -> None:
+    if old_items == new_items:
+        return
+    session.add(
+        StockRecipeAuditLog(
+            recipe_type=recipe_type,
+            target_id=target_id,
+            changed_by_user_id=changed_by_user_id,
+            old_items=old_items,
+            new_items=new_items,
+        )
+    )
+
+
+def _recipe_config(recipe_type: str):
+    if recipe_type == "product":
+        return ProductIngredient, ProductIngredient.product_id, Product, "PRODUCT_NOT_FOUND", "Product not found"
+    if recipe_type == "variant":
+        return (
+            VariantIngredient,
+            VariantIngredient.variant_id,
+            ProductVariant,
+            "VARIANT_NOT_FOUND",
+            "Product variant not found",
+        )
+    if recipe_type == "extra":
+        return ExtraIngredient, ExtraIngredient.extra_id, Extra, "EXTRA_NOT_FOUND", "Extra not found"
+    raise AppError("INVALID_RECIPE_TYPE", "Invalid recipe type", 422, "recipe_type")
+
+
+async def _ensure_recipe_target(session: AsyncSession, recipe_type: str, target_id: int) -> None:
+    _, _, target_model, error_code, error_detail = _recipe_config(recipe_type)
+    if await session.get(target_model, target_id) is None:
+        raise AppError(error_code, error_detail, 404)
+
+
+async def _validate_recipe_items(
+    session: AsyncSession,
+    items: list[StockRecipeLineCreate],
+) -> dict[int, Ingredient]:
+    seen: set[int] = set()
+    duplicates: set[int] = set()
+    for item in items:
+        if item.ingredient_id in seen:
+            duplicates.add(item.ingredient_id)
+        seen.add(item.ingredient_id)
+    if duplicates:
+        raise AppError(
+            "DUPLICATE_RECIPE_INGREDIENT",
+            "Recipe cannot contain the same ingredient twice",
+            409,
+            "ingredient_id",
+        )
+
+    if not seen:
+        return {}
+
+    result = await session.execute(select(Ingredient).where(Ingredient.id.in_(seen)))
+    ingredients = {ingredient.id: ingredient for ingredient in result.scalars()}
+    missing = seen - set(ingredients)
+    if missing:
+        raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404, "ingredient_id")
+    return ingredients
+
+
+async def _ensure_unique_ingredient_name(
+    session: AsyncSession,
+    name: str,
+    *,
+    exclude_ingredient_id: int | None = None,
+) -> str:
+    normalized_name = " ".join(name.strip().split())
+    if not normalized_name:
+        raise AppError("INVALID_INGREDIENT_NAME", "Ingredient name is required", 422, "name")
+
+    query = select(Ingredient).where(func.lower(func.trim(Ingredient.name)) == normalized_name.lower())
+    if exclude_ingredient_id is not None:
+        query = query.where(Ingredient.id != exclude_ingredient_id)
+    existing = await session.scalar(query)
+    if existing is not None:
+        raise AppError(
+            "INGREDIENT_ALREADY_EXISTS",
+            "An ingredient with this name already exists",
+            409,
+            "name",
+        )
+    return normalized_name
 
 
 async def _large_adjustment_threshold(session: AsyncSession) -> float:
@@ -155,6 +370,374 @@ async def list_alerts(session: AsyncSession) -> list[Ingredient]:
         .order_by(Ingredient.current_qty.asc(), Ingredient.name.asc())
     )
     return list(result.scalars())
+
+
+async def create_ingredient(
+    session: AsyncSession,
+    data: dict,
+) -> Ingredient:
+    data = dict(data)
+    data["name"] = await _ensure_unique_ingredient_name(session, str(data.get("name") or ""))
+    ingredient = Ingredient(**data)
+    session.add(ingredient)
+    await session.commit()
+    await session.refresh(ingredient)
+    return ingredient
+
+
+async def get_recipe(session: AsyncSession, recipe_type: str, target_id: int) -> dict:
+    await _ensure_recipe_target(session, recipe_type, target_id)
+    recipe_model, target_column, _, _, _ = _recipe_config(recipe_type)
+    result = await session.execute(
+        select(recipe_model).where(target_column == target_id).order_by(recipe_model.id)
+    )
+    recipes = list(result.scalars())
+    ingredients = await _recipe_ingredients_by_id(session, recipes)
+    return _recipe_response(recipe_type, target_id, recipes, ingredients)
+
+
+async def replace_recipe(
+    session: AsyncSession,
+    recipe_type: str,
+    target_id: int,
+    body: StockRecipeReplace,
+    user_id: int | None = None,
+) -> dict:
+    await _ensure_recipe_target(session, recipe_type, target_id)
+    ingredients = await _validate_recipe_items(session, body.items)
+    recipe_model, target_column, _, _, _ = _recipe_config(recipe_type)
+    target_field = target_column.key
+    existing_result = await session.execute(
+        select(recipe_model).where(target_column == target_id).order_by(recipe_model.id)
+    )
+    existing_recipes = list(existing_result.scalars())
+    existing_ingredients = await _recipe_ingredients_by_id(session, existing_recipes)
+    old_items = _recipe_audit_items(recipe_type, target_id, existing_recipes, existing_ingredients)
+
+    await session.execute(delete(recipe_model).where(target_column == target_id))
+    recipes = []
+    for item in body.items:
+        normalized_quantity, normalized_unit = _normalize_quantity(
+            item.quantity,
+            from_unit=item.unit,
+            ingredient=ingredients[item.ingredient_id],
+        )
+        recipes.append(
+            recipe_model(
+                **{
+                    target_field: target_id,
+                    "ingredient_id": item.ingredient_id,
+                    "quantity": normalized_quantity,
+                    "quantity_unit": normalized_unit,
+                }
+            )
+        )
+    for recipe in recipes:
+        session.add(recipe)
+
+    await session.flush()
+    new_items = _recipe_audit_items(recipe_type, target_id, recipes, ingredients)
+    _add_recipe_audit_log(
+        session,
+        recipe_type=recipe_type,
+        target_id=target_id,
+        changed_by_user_id=user_id,
+        old_items=old_items,
+        new_items=new_items,
+    )
+    await sync_auto_stock_availability_overrides(
+        session,
+        await _product_ids_for_recipe_target(session, recipe_type, target_id),
+    )
+    await session.commit()
+    return _recipe_response(recipe_type, target_id, recipes, ingredients)
+
+
+async def create_recipe_line(
+    session: AsyncSession,
+    recipe_type: str,
+    target_id: int,
+    item: StockRecipeLineCreate,
+    user_id: int | None = None,
+) -> dict:
+    await _ensure_recipe_target(session, recipe_type, target_id)
+    ingredients = await _validate_recipe_items(session, [item])
+    recipe_model, target_column, _, _, _ = _recipe_config(recipe_type)
+    target_field = target_column.key
+    existing_result = await session.execute(
+        select(recipe_model).where(target_column == target_id).order_by(recipe_model.id)
+    )
+    existing_recipes = list(existing_result.scalars())
+    existing_ingredients = await _recipe_ingredients_by_id(session, existing_recipes)
+    old_items = _recipe_audit_items(recipe_type, target_id, existing_recipes, existing_ingredients)
+
+    existing = await session.scalar(
+        select(recipe_model).where(
+            target_column == target_id,
+            recipe_model.ingredient_id == item.ingredient_id,
+        )
+    )
+    if existing is not None:
+        raise AppError(
+            "DUPLICATE_RECIPE_INGREDIENT",
+            "Recipe already contains this ingredient",
+            409,
+            "ingredient_id",
+        )
+
+    normalized_quantity, normalized_unit = _normalize_quantity(
+        item.quantity,
+        from_unit=item.unit,
+        ingredient=ingredients[item.ingredient_id],
+    )
+    recipe = recipe_model(
+        **{
+            target_field: target_id,
+            "ingredient_id": item.ingredient_id,
+            "quantity": normalized_quantity,
+            "quantity_unit": normalized_unit,
+        }
+    )
+    session.add(recipe)
+    await session.flush()
+    new_items = _recipe_audit_items(
+        recipe_type,
+        target_id,
+        [*existing_recipes, recipe],
+        {**existing_ingredients, **ingredients},
+    )
+    _add_recipe_audit_log(
+        session,
+        recipe_type=recipe_type,
+        target_id=target_id,
+        changed_by_user_id=user_id,
+        old_items=old_items,
+        new_items=new_items,
+    )
+    await sync_auto_stock_availability_overrides(
+        session,
+        await _product_ids_for_recipe_target(session, recipe_type, target_id),
+    )
+    await session.commit()
+    return _recipe_payload(recipe, recipe_type, target_id, ingredients.get(item.ingredient_id))
+
+
+async def delete_recipe_line(
+    session: AsyncSession,
+    recipe_type: str,
+    recipe_line_id: int,
+    user_id: int | None = None,
+) -> None:
+    recipe_model, target_column, _, _, _ = _recipe_config(recipe_type)
+    recipe = await session.get(recipe_model, recipe_line_id)
+    if recipe is None:
+        raise AppError("RECIPE_LINE_NOT_FOUND", "Recipe line not found", 404)
+    target_id = getattr(recipe, target_column.key)
+    existing_result = await session.execute(
+        select(recipe_model).where(target_column == target_id).order_by(recipe_model.id)
+    )
+    existing_recipes = list(existing_result.scalars())
+    existing_ingredients = await _recipe_ingredients_by_id(session, existing_recipes)
+    old_items = _recipe_audit_items(recipe_type, target_id, existing_recipes, existing_ingredients)
+    new_recipes = [
+        item
+        for item in existing_recipes
+        if getattr(item, "id", None) != recipe_line_id
+    ]
+    new_items = _recipe_audit_items(recipe_type, target_id, new_recipes, existing_ingredients)
+    await session.delete(recipe)
+    _add_recipe_audit_log(
+        session,
+        recipe_type=recipe_type,
+        target_id=target_id,
+        changed_by_user_id=user_id,
+        old_items=old_items,
+        new_items=new_items,
+    )
+    await sync_auto_stock_availability_overrides(
+        session,
+        await _product_ids_for_recipe_target(session, recipe_type, target_id),
+    )
+    await session.commit()
+
+
+async def list_missing_recipes(session: AsyncSession) -> list[dict]:
+    missing: list[dict] = []
+
+    product_recipe_ids = set(
+        (await session.execute(select(ProductIngredient.product_id).distinct())).scalars()
+    )
+    products = await session.execute(select(Product).where(Product.is_active.is_(True)).order_by(Product.name))
+    for product in products.scalars():
+        if product.id not in product_recipe_ids:
+            missing.append(
+                {
+                    "recipe_type": "product",
+                    "target_id": product.id,
+                    "name": product.name,
+                    "product_id": product.id,
+                }
+            )
+
+    variant_recipe_ids = set(
+        (await session.execute(select(VariantIngredient.variant_id).distinct())).scalars()
+    )
+    variants = await session.execute(
+        select(ProductVariant).where(ProductVariant.is_active.is_(True)).order_by(ProductVariant.name)
+    )
+    for variant in variants.scalars():
+        if variant.id not in variant_recipe_ids:
+            missing.append(
+                {
+                    "recipe_type": "variant",
+                    "target_id": variant.id,
+                    "name": variant.name,
+                    "product_id": variant.product_id,
+                }
+            )
+
+    extra_recipe_ids = set(
+        (await session.execute(select(ExtraIngredient.extra_id).distinct())).scalars()
+    )
+    extras = await session.execute(select(Extra).where(Extra.is_active.is_(True)).order_by(Extra.name))
+    for extra in extras.scalars():
+        if extra.id not in extra_recipe_ids:
+            missing.append(
+                {
+                    "recipe_type": "extra",
+                    "target_id": extra.id,
+                    "name": extra.name,
+                    "product_id": None,
+                }
+            )
+
+    return missing
+
+
+async def _latest_availability_overrides(
+    session: AsyncSession,
+    product_ids: set[int],
+) -> dict[int, ProductAvailabilityOverride]:
+    if not product_ids:
+        return {}
+    result = await session.execute(
+        select(ProductAvailabilityOverride)
+        .where(ProductAvailabilityOverride.product_id.in_(tuple(product_ids)))
+        .order_by(
+            ProductAvailabilityOverride.product_id,
+            ProductAvailabilityOverride.created_at.desc(),
+            ProductAvailabilityOverride.id.desc(),
+        )
+    )
+    latest: dict[int, ProductAvailabilityOverride] = {}
+    for override in result.scalars():
+        latest.setdefault(override.product_id, override)
+    return latest
+
+
+async def _product_ids_for_ingredients(
+    session: AsyncSession,
+    ingredient_ids: set[int],
+) -> set[int]:
+    if not ingredient_ids:
+        return set()
+
+    product_ids: set[int] = set(
+        (
+            await session.execute(
+                select(ProductIngredient.product_id)
+                .where(ProductIngredient.ingredient_id.in_(tuple(ingredient_ids)))
+                .distinct()
+            )
+        ).scalars()
+    )
+
+    variant_product_ids = await session.execute(
+        select(ProductVariant.product_id)
+        .join(VariantIngredient, VariantIngredient.variant_id == ProductVariant.id)
+        .where(VariantIngredient.ingredient_id.in_(tuple(ingredient_ids)))
+        .distinct()
+    )
+    product_ids.update(variant_product_ids.scalars())
+
+    extra_product_ids = await session.execute(
+        select(ProductExtra.product_id)
+        .join(ExtraIngredient, ExtraIngredient.extra_id == ProductExtra.extra_id)
+        .where(ExtraIngredient.ingredient_id.in_(tuple(ingredient_ids)))
+        .distinct()
+    )
+    product_ids.update(extra_product_ids.scalars())
+    return product_ids
+
+
+async def _product_ids_for_recipe_target(
+    session: AsyncSession,
+    recipe_type: str,
+    target_id: int,
+) -> set[int]:
+    if recipe_type == "product":
+        return {target_id}
+    if recipe_type == "variant":
+        variant = await session.get(ProductVariant, target_id)
+        return {variant.product_id} if variant is not None else set()
+    if recipe_type == "extra":
+        result = await session.execute(
+            select(ProductExtra.product_id).where(ProductExtra.extra_id == target_id)
+        )
+        return set(result.scalars())
+    return set()
+
+
+async def sync_auto_stock_availability_overrides(
+    session: AsyncSession,
+    product_ids: set[int] | None = None,
+) -> list[ProductAvailabilityOverride]:
+    """Cree des indisponibilites systeme pour les produits non produisibles.
+
+    Ne cree jamais d'override available=true : le retour en stock doit rester
+    une validation admin explicite.
+    """
+    if product_ids is None:
+        product_ids = set(
+            (
+                await session.execute(
+                    select(Product.id).where(Product.is_active.is_(True))
+                )
+            ).scalars()
+        )
+    else:
+        product_ids = {int(product_id) for product_id in product_ids if product_id}
+    if not product_ids:
+        return []
+
+    availability = await get_products_availability(session, sorted(product_ids))
+    unavailable_ids = {
+        product_id
+        for product_id, item in availability.items()
+        if item.get("available") is False
+    }
+    if not unavailable_ids:
+        return []
+
+    latest_overrides = await _latest_availability_overrides(session, unavailable_ids)
+    created: list[ProductAvailabilityOverride] = []
+    for product_id in sorted(unavailable_ids):
+        latest = latest_overrides.get(product_id)
+        if latest is not None and latest.available is False:
+            continue
+        item = availability[product_id]
+        override = ProductAvailabilityOverride(
+            product_id=product_id,
+            available=False,
+            reason=_stock_unavailable_reason(item.get("limiting_ingredient")),
+            changed_by_user_id=_AUTO_STOCK_USER_ID,
+        )
+        session.add(override)
+        created.append(override)
+
+    if created:
+        await session.flush()
+    return created
 
 
 async def supply(
@@ -505,6 +1088,13 @@ async def patch_ingredient(
     if ingredient is None:
         raise AppError("INGREDIENT_NOT_FOUND", "Ingredient not found", 404)
 
+    if "name" in data and data["name"] is not None:
+        data["name"] = await _ensure_unique_ingredient_name(
+            session,
+            str(data["name"]),
+            exclude_ingredient_id=ingredient_id,
+        )
+
     for field, value in data.items():
         setattr(ingredient, field, value)
 
@@ -543,6 +1133,11 @@ async def adjust_ingredient_stock(
             user_id=user_id,
         )
     )
+    if quantity_delta < 0:
+        await sync_auto_stock_availability_overrides(
+            session,
+            await _product_ids_for_ingredients(session, {ingredient.id}),
+        )
     await session.commit()
     await session.refresh(ingredient)
     return ingredient
@@ -580,6 +1175,7 @@ async def deduct_for_order(
     """
     items = await session.execute(select(OrderItem).where(OrderItem.order_id == order_id))
     low_stock: list[Ingredient] = []
+    touched_ingredient_ids: set[int] = set()
     for item in items.scalars():
         for ingredient_id, delta in await _item_recipe_deltas(session, item):
             ingredient = await session.get(Ingredient, ingredient_id)
@@ -596,8 +1192,14 @@ async def deduct_for_order(
                     user_id=actor_user_id,
                 )
             )
+            touched_ingredient_ids.add(ingredient.id)
             if float(ingredient.current_qty) <= float(ingredient.alert_threshold):
                 low_stock.append(ingredient)
+
+    await sync_auto_stock_availability_overrides(
+        session,
+        await _product_ids_for_ingredients(session, touched_ingredient_ids),
+    )
 
     if not auto_commit:
         return low_stock
@@ -682,27 +1284,7 @@ async def get_product_availability(
     if product is None:
         raise AppError("PRODUCT_NOT_FOUND", "Product not found", 404)
 
-    recipes_result = await session.execute(
-        select(ProductIngredient).where(ProductIngredient.product_id == product_id)
-    )
-    recipes = list(recipes_result.scalars())
-
-    if not recipes:
-        # Aucune recette definie : on considere le produit disponible par defaut.
-        return {"product_id": product_id, "available": True, "limiting_ingredient": None}
-
-    for recipe in recipes:
-        ingredient = await session.get(Ingredient, recipe.ingredient_id)
-        if ingredient is None:
-            continue
-        if float(ingredient.current_qty) < float(recipe.quantity):
-            return {
-                "product_id": product_id,
-                "available": False,
-                "limiting_ingredient": ingredient.name,
-            }
-
-    return {"product_id": product_id, "available": True, "limiting_ingredient": None}
+    return (await get_products_availability(session, [product_id]))[product_id]
 
 
 async def get_products_availability(
@@ -727,13 +1309,41 @@ async def get_products_availability(
     if not product_ids:
         return {}
 
-    recipes_result = await session.execute(
+    product_recipes_result = await session.execute(
         select(ProductIngredient).where(ProductIngredient.product_id.in_(product_ids))
     )
-    recipes_by_product: dict[int, list[ProductIngredient]] = {}
+    required_by_product: dict[int, dict[int, float]] = {}
     ingredient_ids: set[int] = set()
-    for recipe in recipes_result.scalars():
-        recipes_by_product.setdefault(recipe.product_id, []).append(recipe)
+    for recipe in product_recipes_result.scalars():
+        required = required_by_product.setdefault(recipe.product_id, {})
+        required[recipe.ingredient_id] = required.get(recipe.ingredient_id, 0.0) + float(recipe.quantity)
+        ingredient_ids.add(recipe.ingredient_id)
+
+    variant_recipes_result = await session.execute(
+        select(ProductVariant.product_id, VariantIngredient)
+        .join(VariantIngredient, VariantIngredient.variant_id == ProductVariant.id)
+        .where(
+            ProductVariant.product_id.in_(product_ids),
+            ProductVariant.is_active.is_(True),
+        )
+    )
+    for product_id, recipe in variant_recipes_result.all():
+        required = required_by_product.setdefault(product_id, {})
+        required[recipe.ingredient_id] = required.get(recipe.ingredient_id, 0.0) + float(recipe.quantity)
+        ingredient_ids.add(recipe.ingredient_id)
+
+    extra_recipes_result = await session.execute(
+        select(ProductExtra.product_id, ExtraIngredient)
+        .join(ExtraIngredient, ExtraIngredient.extra_id == ProductExtra.extra_id)
+        .join(Extra, Extra.id == ProductExtra.extra_id)
+        .where(
+            ProductExtra.product_id.in_(product_ids),
+            Extra.is_active.is_(True),
+        )
+    )
+    for product_id, recipe in extra_recipes_result.all():
+        required = required_by_product.setdefault(product_id, {})
+        required[recipe.ingredient_id] = required.get(recipe.ingredient_id, 0.0) + float(recipe.quantity)
         ingredient_ids.add(recipe.ingredient_id)
 
     ingredients_by_id: dict[int, Ingredient] = {}
@@ -745,17 +1355,17 @@ async def get_products_availability(
 
     availability: dict[int, dict] = {}
     for product_id in product_ids:
-        recipes = recipes_by_product.get(product_id)
-        if not recipes:
+        required = required_by_product.get(product_id)
+        if not required:
             availability[product_id] = {"product_id": product_id, "available": True, "limiting_ingredient": None}
             continue
 
         limiting_ingredient: str | None = None
-        for recipe in recipes:
-            ingredient = ingredients_by_id.get(recipe.ingredient_id)
+        for ingredient_id, required_qty in required.items():
+            ingredient = ingredients_by_id.get(ingredient_id)
             if ingredient is None:
                 continue
-            if float(ingredient.current_qty) < float(recipe.quantity):
+            if float(ingredient.current_qty) < required_qty:
                 limiting_ingredient = ingredient.name
                 break
 
@@ -763,5 +1373,6 @@ async def get_products_availability(
             "product_id": product_id,
             "available": limiting_ingredient is None,
             "limiting_ingredient": limiting_ingredient,
+            "reason": None if limiting_ingredient is None else _stock_unavailable_reason(limiting_ingredient),
         }
     return availability

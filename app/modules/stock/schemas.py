@@ -13,6 +13,8 @@ class IngredientCreate(BaseModel):
     unit: str
     current_qty: float = 0
     alert_threshold: float = 0
+    purchase_price_per_unit: float | None = Field(default=None, ge=0)
+    purchase_unit: str | None = None
 
 
 class IngredientOut(IngredientCreate):
@@ -28,21 +30,54 @@ class SupplyRequest(BaseModel):
 
 
 class ProductIngredientCreate(BaseModel):
-    product_id: int
-    ingredient_id: int
-    quantity: float
+    product_id: int = Field(gt=0)
+    ingredient_id: int = Field(gt=0)
+    quantity: float = Field(gt=0)
 
 
 class VariantIngredientCreate(BaseModel):
-    variant_id: int
-    ingredient_id: int
-    quantity: float
+    variant_id: int = Field(gt=0)
+    ingredient_id: int = Field(gt=0)
+    quantity: float = Field(gt=0)
 
 
 class ExtraIngredientCreate(BaseModel):
-    extra_id: int
+    extra_id: int = Field(gt=0)
+    ingredient_id: int = Field(gt=0)
+    quantity: float = Field(gt=0)
+
+
+class StockRecipeLineCreate(BaseModel):
+    ingredient_id: int = Field(gt=0)
+    quantity: float = Field(gt=0)
+    unit: str | None = None
+
+
+class StockRecipeReplace(BaseModel):
+    items: list[StockRecipeLineCreate] = Field(default_factory=list)
+
+
+class StockRecipeLineOut(BaseModel):
+    id: int
+    recipe_type: Literal["product", "variant", "extra"]
+    target_id: int
     ingredient_id: int
+    ingredient_name: str | None = None
     quantity: float
+    unit: str | None = None
+
+
+class StockRecipeOut(BaseModel):
+    recipe_type: Literal["product", "variant", "extra"]
+    target_id: int
+    items: list[StockRecipeLineOut]
+
+
+class MissingStockRecipeOut(BaseModel):
+    recipe_type: Literal["product", "variant", "extra"]
+    target_id: int
+    name: str
+    product_id: int | None = None
 
 
 class StockMovementOut(BaseModel):
@@ -62,6 +97,8 @@ class IngredientPatch(BaseModel):
     name: str | None = None
     unit: str | None = None
     alert_threshold: float | None = None
+    purchase_price_per_unit: float | None = Field(default=None, ge=0)
+    purchase_unit: str | None = None
 
 
 class IngredientAdjustRequest(BaseModel):

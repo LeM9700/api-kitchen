@@ -1,6 +1,18 @@
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -11,6 +23,10 @@ class Ingredient(Base):
     __tablename__ = "ingredients"
     __table_args__ = (
         CheckConstraint("current_qty >= 0", name="ck_ingredients_current_qty_non_negative"),
+        CheckConstraint(
+            "purchase_price_per_unit IS NULL OR purchase_price_per_unit >= 0",
+            name="ck_ingredients_purchase_price_non_negative",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -18,6 +34,8 @@ class Ingredient(Base):
     unit: Mapped[str] = mapped_column(String(32), nullable=False)
     current_qty: Mapped[float] = mapped_column(Numeric(12, 3), default=0)
     alert_threshold: Mapped[float] = mapped_column(Numeric(12, 3), default=0)
+    purchase_price_per_unit: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    purchase_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # [PROD] Rate-limit alertes stock : ne pas renvoyer si alerte < 4h.
     # Necessite migration Alembic : ALTER TABLE ingredients ADD COLUMN last_alert_sent_at TIMESTAMPTZ.
     last_alert_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -29,20 +47,49 @@ class Ingredient(Base):
 
 class ProductIngredient(Base):
     __tablename__ = "product_ingredients"
+    __table_args__ = (
+        UniqueConstraint("product_id", "ingredient_id", name="uq_product_ingredients_product_ingredient"),
+        CheckConstraint("quantity > 0", name="ck_product_ingredients_quantity_positive"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     product_id: Mapped[int] = mapped_column(Integer, nullable=False)
     ingredient_id: Mapped[int] = mapped_column(ForeignKey("ingredients.id"), nullable=False)
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    quantity_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class VariantIngredient(Base):
     __tablename__ = "variant_ingredients"
+    __table_args__ = (
+        UniqueConstraint("variant_id", "ingredient_id", name="uq_variant_ingredients_variant_ingredient"),
+        CheckConstraint("quantity > 0", name="ck_variant_ingredients_quantity_positive"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     variant_id: Mapped[int] = mapped_column(Integer, nullable=False)
     ingredient_id: Mapped[int] = mapped_column(ForeignKey("ingredients.id"), nullable=False)
     quantity: Mapped[float] = mapped_column(Numeric(12, 3), nullable=False)
+    quantity_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class StockRecipeAuditLog(Base):
+    __tablename__ = "stock_recipe_audit_logs"
+    __table_args__ = (
+        CheckConstraint(
+            "recipe_type IN ('product', 'variant', 'extra')",
+            name="ck_stock_recipe_audit_logs_recipe_type",
+        ),
+        Index("ix_stock_recipe_audit_logs_target", "recipe_type", "target_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    recipe_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    changed_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    old_items: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    new_items: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class StockMovement(Base):

@@ -357,6 +357,12 @@ def _effective_preparation_station(product: Product, category: Category | None =
     return product.preparation_station or (category.preparation_station if category else None) or "kitchen"
 
 
+def _stock_unavailable_reason(limiting_ingredient: str | None) -> str:
+    if limiting_ingredient:
+        return f"Stock insuffisant : {limiting_ingredient}"
+    return "Stock insuffisant"
+
+
 async def _availability_map(session: AsyncSession, product_ids: list[int]) -> dict[int, ProductAvailabilityOut]:
     if not product_ids:
         return {}
@@ -374,6 +380,12 @@ async def _availability_map(session: AsyncSession, product_ids: list[int]) -> di
             product_id,
             {"product_id": product_id, "available": True, "limiting_ingredient": None},
         )
+        if data.get("available") is False and not data.get("reason"):
+            data = {
+                **data,
+                "reason": _stock_unavailable_reason(data.get("limiting_ingredient")),
+                "is_overridden": False,
+            }
         override = latest_overrides.get(product_id)
         if override is not None and override.available is False:
             data = {
@@ -383,7 +395,7 @@ async def _availability_map(session: AsyncSession, product_ids: list[int]) -> di
                 "reason": override.reason,
                 "is_overridden": True,
             }
-        elif override is not None:
+        elif override is not None and data.get("available") is not False:
             data = {
                 **data,
                 "reason": override.reason,

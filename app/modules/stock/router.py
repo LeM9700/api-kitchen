@@ -1,5 +1,7 @@
 from datetime import datetime
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.core.database import get_tenant_session
@@ -7,7 +9,6 @@ from app.core.http.deps import get_pagination, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse, PaginationParams
 from app.modules.stock import service
-from app.modules.stock.models import Ingredient, ProductIngredient, VariantIngredient, ExtraIngredient
 from app.modules.stock.schemas import (
     ExtraIngredientCreate,
     IngredientAdjustRequest,
@@ -18,10 +19,14 @@ from app.modules.stock.schemas import (
     IngredientCreate,
     IngredientPatch,
     IngredientOut,
+    MissingStockRecipeOut,
     ProductIngredientCreate,
     StockAdjustmentRequestCreate,
     StockAdjustmentRequestOut,
     StockAdjustmentReviewRequest,
+    StockRecipeLineCreate,
+    StockRecipeOut,
+    StockRecipeReplace,
     StockMovementOut,
     SupplyRequest,
     VariantIngredientCreate,
@@ -82,11 +87,7 @@ async def create_ingredient(
     current_user=Depends(require_role("admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        ingredient = Ingredient(**body.model_dump())
-        session.add(ingredient)
-        await session.commit()
-        await session.refresh(ingredient)
-        return ingredient
+        return await service.create_ingredient(session, body.model_dump())
 
 
 @router.patch("/ingredients/{ingredient_id}", response_model=IngredientOut)
@@ -261,10 +262,17 @@ async def create_recipe(
     current_user=Depends(require_role("admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        recipe = ProductIngredient(**body.model_dump())
-        session.add(recipe)
-        await session.commit()
-        return {"id": recipe.id}
+        recipe = await service.create_recipe_line(
+            session,
+            "product",
+            body.product_id,
+            StockRecipeLineCreate(
+                ingredient_id=body.ingredient_id,
+                quantity=body.quantity,
+            ),
+            user_id=int(current_user["id"]),
+        )
+        return {"id": recipe["id"]}
 
 
 @router.post("/recipes/variant", status_code=201)
@@ -273,10 +281,17 @@ async def create_variant_recipe(
     current_user=Depends(require_role("admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        recipe = VariantIngredient(**body.model_dump())
-        session.add(recipe)
-        await session.commit()
-        return {"id": recipe.id}
+        recipe = await service.create_recipe_line(
+            session,
+            "variant",
+            body.variant_id,
+            StockRecipeLineCreate(
+                ingredient_id=body.ingredient_id,
+                quantity=body.quantity,
+            ),
+            user_id=int(current_user["id"]),
+        )
+        return {"id": recipe["id"]}
 
 
 @router.post("/recipes/extra", status_code=201)
@@ -285,10 +300,92 @@ async def create_extra_recipe(
     current_user=Depends(require_role("admin")),
 ):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        recipe = ExtraIngredient(**body.model_dump())
-        session.add(recipe)
-        await session.commit()
-        return {"id": recipe.id}
+        recipe = await service.create_recipe_line(
+            session,
+            "extra",
+            body.extra_id,
+            StockRecipeLineCreate(
+                ingredient_id=body.ingredient_id,
+                quantity=body.quantity,
+            ),
+            user_id=int(current_user["id"]),
+        )
+        return {"id": recipe["id"]}
+
+
+@router.get("/recipes/missing", response_model=list[MissingStockRecipeOut])
+async def missing_recipes(
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.list_missing_recipes(session)
+
+
+@router.get("/recipes/products/{product_id}", response_model=StockRecipeOut)
+async def product_recipe(
+    product_id: int,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_recipe(session, "product", product_id)
+
+
+@router.put("/recipes/products/{product_id}", response_model=StockRecipeOut)
+async def replace_product_recipe(
+    product_id: int,
+    body: StockRecipeReplace,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.replace_recipe(session, "product", product_id, body, user_id=int(current_user["id"]))
+
+
+@router.get("/recipes/variants/{variant_id}", response_model=StockRecipeOut)
+async def variant_recipe(
+    variant_id: int,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_recipe(session, "variant", variant_id)
+
+
+@router.put("/recipes/variants/{variant_id}", response_model=StockRecipeOut)
+async def replace_variant_recipe(
+    variant_id: int,
+    body: StockRecipeReplace,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.replace_recipe(session, "variant", variant_id, body, user_id=int(current_user["id"]))
+
+
+@router.get("/recipes/extras/{extra_id}", response_model=StockRecipeOut)
+async def extra_recipe(
+    extra_id: int,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_recipe(session, "extra", extra_id)
+
+
+@router.put("/recipes/extras/{extra_id}", response_model=StockRecipeOut)
+async def replace_extra_recipe(
+    extra_id: int,
+    body: StockRecipeReplace,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.replace_recipe(session, "extra", extra_id, body, user_id=int(current_user["id"]))
+
+
+@router.delete("/recipes/{recipe_type}/{recipe_line_id}", status_code=204)
+async def delete_recipe_line(
+    recipe_type: Literal["product", "variant", "extra"],
+    recipe_line_id: int,
+    current_user=Depends(require_role("admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await service.delete_recipe_line(session, recipe_type, recipe_line_id, user_id=int(current_user["id"]))
 
 
 @router.get("/availability")
