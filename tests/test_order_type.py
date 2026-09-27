@@ -186,6 +186,69 @@ def test_manual_order_schema_accepts_cash_dine_in_without_customer_account():
     assert body.payment.method == "cash"
 
 
+def test_manual_order_schema_requires_loyalty_identification_method():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.modules.orders.schemas import ManualOrderCreate, OrderItemCreate
+
+    with pytest.raises(ValidationError) as exc_info:
+        ManualOrderCreate(
+            order_type="pickup",
+            loyalty_customer_id=42,
+            items=[OrderItemCreate(product_id=1, quantity=1)],
+            payment={"method": "cash", "amount_received": 20},
+        )
+
+    assert "loyalty_identification_method" in str(exc_info.value)
+
+
+def test_manual_order_schema_requires_oral_confirmation_for_reward():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.modules.orders.schemas import ManualOrderCreate, OrderItemCreate
+
+    with pytest.raises(ValidationError) as exc_info:
+        ManualOrderCreate(
+            order_type="pickup",
+            loyalty_customer_id=42,
+            loyalty_reward_id=7,
+            loyalty_identification_method="qr",
+            items=[OrderItemCreate(product_id=1, quantity=1)],
+            payment={"method": "cash", "amount_received": 20},
+        )
+
+    assert "Confirmation orale" in str(exc_info.value)
+
+
+def test_manual_order_schema_rejects_legacy_loyalty_user_id_and_points():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.modules.orders.schemas import ManualOrderCreate, OrderItemCreate
+
+    with pytest.raises(ValidationError) as user_id_exc:
+        ManualOrderCreate(
+            order_type="pickup",
+            loyalty_user_id=42,
+            items=[OrderItemCreate(product_id=1, quantity=1)],
+            payment={"method": "cash", "amount_received": 20},
+        )
+    with pytest.raises(ValidationError) as points_exc:
+        ManualOrderCreate(
+            order_type="pickup",
+            loyalty_customer_id=42,
+            loyalty_identification_method="phone",
+            loyalty_points_to_use=10,
+            items=[OrderItemCreate(product_id=1, quantity=1)],
+            payment={"method": "cash", "amount_received": 20},
+        )
+
+    assert "loyalty_user_id est obsolete" in str(user_id_exc.value)
+    assert "saisie manuelle de points" in str(points_exc.value)
+
+
 def test_manual_terminal_payment_requires_external_reference():
     import pytest
     from pydantic import ValidationError
