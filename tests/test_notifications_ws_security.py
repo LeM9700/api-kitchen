@@ -105,7 +105,7 @@ async def test_notifications_ws_rejects_user_not_belonging_to_tenant():
     ):
         await ws_router.notifications_ws(websocket, tenant_slug="acme")
 
-    mocked.assert_awaited_once_with(1, "acme", None)
+    mocked.assert_awaited_once_with(1, "acme", None, None)
     assert websocket.accepted is True
     assert websocket.sent[-1]["code"] == "unauthorized"
     assert websocket.closed == (4001, "Unauthorized")
