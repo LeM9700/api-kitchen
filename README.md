@@ -105,8 +105,8 @@ python -m arq worker.main.WorkerSettings
 Variables d'environnement requises : voir `.env.example`. À définir sur Railway (jamais commitées) :
 `DATABASE_URL`, `MONGO_URL`, `ARQ_REDIS_URL`, `REDIS_URL`, `JWT_SECRET`, `STRIPE_SECRET_KEY`,
 `STRIPE_WEBHOOK_SECRET`, `CLOUDINARY_*`, `CORS_ORIGINS`, `APP_BASE_URL`, `ENVIRONMENT=production`,
-et optionnellement `SENTRY_DSN`, `JWT_HMAC_SECRET`, `STRIPE_WEBHOOK_CONNECT_SECRET`, `SMTP_*`,
-`APNS_*`, `FCM_*`.
+et optionnellement `SENTRY_DSN`, `JWT_HMAC_SECRET`, `KDS_QR_ENCRYPTION_KEY`,
+`STRIPE_WEBHOOK_CONNECT_SECRET`, `SMTP_*`, `APNS_*`, `FCM_*`.
 
 Procédures de rollback, replay webhook Stripe et restart worker : voir [RUNBOOK.md](RUNBOOK.md).
 Politique de confidentialité (base technique, à valider juridiquement) : voir [PRIVACY.md](PRIVACY.md).
@@ -114,7 +114,7 @@ Politique de confidentialité (base technique, à valider juridiquement) : voir 
 ## Documentation par module
 
 Voir [docs/modules/](docs/modules/) — un fichier par module métier (auth, catalog, orders,
-payments, stock, loyalty, promotions, delivery, admin, worker).
+payments, stock, loyalty, promotions, delivery, admin, kds, worker).
 
 ## Structure
 
