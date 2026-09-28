@@ -1,8 +1,11 @@
 import hashlib
 import hmac
+import base64
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,12 +40,69 @@ def _hmac_digest(scope: str, tenant_slug: str, secret_value: str) -> str:
     return hmac.new(hmac_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
+def _kds_qr_fernet() -> Fernet:
+    key = settings.kds_qr_encryption_key.strip()
+    if not key:
+        secret = (settings.jwt_hmac_secret or settings.jwt_secret).encode("utf-8")
+        key = base64.urlsafe_b64encode(hashlib.sha256(b"kds-qr:" + secret).digest()).decode("ascii")
+    return Fernet(key.encode("ascii"))
+
+
 def hash_pairing_code(tenant_slug: str, code: str) -> str:
     return _hmac_digest("kds-pairing", tenant_slug, code)
 
 
 def hash_remote_session_token(tenant_slug: str, token: str) -> str:
     return _hmac_digest("kds-session", tenant_slug, token)
+
+
+def _encode_pairing_payload(
+    *,
+    tenant_slug: str,
+    screen_id: int,
+    code: str,
+    expires_at: datetime,
+) -> str:
+    payload = {
+        "typ": "kds_pairing",
+        "tenant": tenant_slug,
+        "screen_id": screen_id,
+        "code": code,
+        "exp": int(_as_aware_utc(expires_at).timestamp()),
+        "nonce": secrets.token_urlsafe(16),
+    }
+    plaintext = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return _kds_qr_fernet().encrypt(plaintext).decode("ascii")
+
+
+def _decode_pairing_payload(pairing_payload: str, *, tenant_slug: str) -> dict:
+    try:
+        decrypted = _kds_qr_fernet().decrypt(pairing_payload.strip().encode("ascii"))
+        payload = json.loads(decrypted)
+    except (InvalidToken, UnicodeEncodeError, ValueError, json.JSONDecodeError) as exc:
+        raise AppError("KDS_PAIRING_PAYLOAD_INVALID", "KDS pairing payload invalid", 401, "pairing_payload") from exc
+
+    if payload.get("typ") != "kds_pairing" or payload.get("tenant") != tenant_slug:
+        raise AppError("KDS_PAIRING_PAYLOAD_INVALID", "KDS pairing payload invalid", 401, "pairing_payload")
+
+    code = payload.get("code")
+    if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
+        raise AppError("KDS_PAIRING_PAYLOAD_INVALID", "KDS pairing payload invalid", 401, "pairing_payload")
+
+    try:
+        screen_id = int(payload.get("screen_id"))
+        exp = int(payload.get("exp"))
+    except (TypeError, ValueError) as exc:
+        raise AppError("KDS_PAIRING_PAYLOAD_INVALID", "KDS pairing payload invalid", 401, "pairing_payload") from exc
+
+    if exp <= int(_utcnow().timestamp()):
+        raise AppError("KDS_PAIRING_PAYLOAD_EXPIRED", "KDS pairing payload expired", 401, "pairing_payload")
+
+    return {
+        "screen_id": screen_id,
+        "code": code,
+        "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc),
+    }
 
 
 def _generate_pairing_code() -> str:
@@ -91,6 +151,7 @@ def _screen_payload(screen: KdsScreen) -> dict:
         "interaction_mode": screen.interaction_mode,
         "tickets_per_page": screen.tickets_per_page,
         "is_active": screen.is_active,
+        "remote_enabled": screen.remote_enabled,
         "created_at": screen.created_at,
         "updated_at": screen.updated_at,
     }
@@ -183,6 +244,8 @@ async def create_pairing_code(
     screen = await _get_screen_or_404(session, screen_id)
     if not screen.is_active:
         raise AppError("KDS_SCREEN_INACTIVE", "KDS screen is inactive", 409, "screen_id")
+    if not screen.remote_enabled:
+        raise AppError("KDS_SCREEN_REMOTE_DISABLED", "KDS screen remote is disabled", 409, "screen_id")
 
     now = _utcnow()
     await session.execute(
@@ -203,7 +266,37 @@ async def create_pairing_code(
     )
     session.add(pairing)
     await session.commit()
-    return {"screen_id": screen_id, "code": code, "expires_at": pairing.expires_at}
+    return {
+        "screen_id": screen_id,
+        "code": code,
+        "expires_at": pairing.expires_at,
+        "pairing_payload": _encode_pairing_payload(
+            tenant_slug=tenant_slug,
+            screen_id=screen_id,
+            code=code,
+            expires_at=pairing.expires_at,
+        ),
+    }
+
+
+async def resolve_pairing_payload(
+    session: AsyncSession,
+    *,
+    tenant_slug: str,
+    pairing_payload: str,
+) -> dict:
+    payload = _decode_pairing_payload(pairing_payload, tenant_slug=tenant_slug)
+    screen = await _get_screen_or_404(session, payload["screen_id"])
+    if not screen.is_active:
+        raise AppError("KDS_SCREEN_INACTIVE", "KDS screen is inactive", 409, "screen_id")
+    if not screen.remote_enabled:
+        raise AppError("KDS_SCREEN_REMOTE_DISABLED", "KDS screen remote is disabled", 409, "screen_id")
+    return {
+        "screen_id": payload["screen_id"],
+        "code": payload["code"],
+        "expires_at": payload["expires_at"],
+        "screen": _screen_payload(screen),
+    }
 
 
 async def pair_remote(

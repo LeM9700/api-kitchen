@@ -8,6 +8,8 @@ from app.core.http.limiter import limiter
 from app.modules.kds import service
 from app.modules.kds.schemas import (
     KdsPairingCodeOut,
+    KdsPairingPayloadResolveOut,
+    KdsPairingPayloadResolveRequest,
     KdsPairRequest,
     KdsRemoteSessionOut,
     KdsRemoteSessionRevokeOut,
@@ -82,6 +84,19 @@ async def create_pairing_code(
             tenant_slug=current_user["tenant_slug"],
             screen_id=screen_id,
             created_by_user_id=int(current_user["id"]),
+        )
+
+
+@router.post("/pairing-payload/resolve", response_model=KdsPairingPayloadResolveOut)
+async def resolve_pairing_payload(
+    body: KdsPairingPayloadResolveRequest,
+    current_user: dict = Depends(require_permission("orders:preparation", "staff", "admin")),
+) -> KdsPairingPayloadResolveOut:
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.resolve_pairing_payload(
+            session,
+            tenant_slug=current_user["tenant_slug"],
+            pairing_payload=body.pairing_payload,
         )
 
 

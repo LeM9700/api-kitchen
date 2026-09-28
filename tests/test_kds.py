@@ -34,6 +34,7 @@ def _screen(**overrides) -> KdsScreen:
         "interaction_mode": "wall",
         "tickets_per_page": 4,
         "is_active": True,
+        "remote_enabled": True,
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
     }
@@ -147,6 +148,7 @@ def test_kds_openapi_paths_are_registered_and_do_not_expose_hashes():
 
     assert "/api/v1/kds/screens" in paths
     assert "/api/v1/kds/screens/{screen_id}/pairing-code" in paths
+    assert "/api/v1/kds/pairing-payload/resolve" in paths
     assert "/api/v1/kds/pair" in paths
     assert "/api/v1/kds/remote/session" in paths
     assert "/api/v1/kds/remote/session/revoke" in paths
@@ -182,7 +184,26 @@ async def test_admin_creates_kitchen_screen():
     assert created.mode == "kitchen"
     assert created.station == "kitchen"
     assert created.interaction_mode == "wall"
+    assert created.remote_enabled is True
     session.commit.assert_awaited_once()
+
+
+def test_kds_screen_schema_accepts_remote_enabled_false():
+    body = KdsScreenCreate(
+        name="Comptoir",
+        screen_key="counter-main",
+        mode="counter",
+        station="counter",
+        remote_enabled=False,
+    )
+
+    assert body.remote_enabled is False
+
+
+def test_kds_screen_update_accepts_remote_enabled_false():
+    body = KdsScreenUpdate(remote_enabled=False)
+
+    assert body.model_dump(exclude_unset=True) == {"remote_enabled": False}
 
 
 async def test_screen_key_unique_is_enforced_before_insert():
@@ -286,6 +307,7 @@ async def test_staff_preparation_can_list_screens(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()[0]["screen_key"] == "kitchen-main"
+    assert response.json()[0]["remote_enabled"] is True
 
 
 async def test_create_pairing_code_returns_six_digits_and_stores_only_hash(monkeypatch):
@@ -308,8 +330,13 @@ async def test_create_pairing_code_returns_six_digits_and_stores_only_hash(monke
     assert result["code"] == "004281"
     assert result["code"].isdigit()
     assert len(result["code"]) == 6
+    assert result["pairing_payload"]
+    assert result["pairing_payload"] != result["code"]
     assert pairing.code_hash != "004281"
     assert len(pairing.code_hash) == 64
+    decoded = service._decode_pairing_payload(result["pairing_payload"], tenant_slug="acme")
+    assert decoded["code"] == "004281"
+    assert decoded["screen_id"] == 12
 
 
 async def test_new_pairing_code_invalidates_previous_active_code(monkeypatch):
@@ -348,6 +375,21 @@ async def test_create_pairing_code_rejects_inactive_screen():
     assert exc_info.value.code == "KDS_SCREEN_INACTIVE"
 
 
+async def test_create_pairing_code_rejects_remote_disabled_screen():
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=_screen(remote_enabled=False))
+
+    with pytest.raises(AppError) as exc_info:
+        await service.create_pairing_code(
+            session,
+            tenant_slug="acme",
+            screen_id=12,
+            created_by_user_id=7,
+        )
+
+    assert exc_info.value.code == "KDS_SCREEN_REMOTE_DISABLED"
+
+
 async def test_create_pairing_code_rejects_missing_screen():
     session = AsyncMock()
     session.get = AsyncMock(return_value=None)
@@ -361,6 +403,90 @@ async def test_create_pairing_code_rejects_missing_screen():
         )
 
     assert exc_info.value.code == "KDS_SCREEN_NOT_FOUND"
+
+
+async def test_resolve_pairing_payload_returns_code_and_screen():
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    payload = service._encode_pairing_payload(
+        tenant_slug="acme",
+        screen_id=12,
+        code="004281",
+        expires_at=expires_at,
+    )
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=_screen())
+
+    result = await service.resolve_pairing_payload(
+        session,
+        tenant_slug="acme",
+        pairing_payload=payload,
+    )
+
+    assert result["code"] == "004281"
+    assert result["screen_id"] == 12
+    assert result["screen"]["screen_key"] == "kitchen-main"
+
+
+async def test_resolve_pairing_payload_rejects_tampering():
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    payload = service._encode_pairing_payload(
+        tenant_slug="acme",
+        screen_id=12,
+        code="004281",
+        expires_at=expires_at,
+    )
+    tampered = payload[:-1] + ("A" if payload[-1] != "A" else "B")
+    session = AsyncMock()
+
+    with pytest.raises(AppError) as exc_info:
+        await service.resolve_pairing_payload(
+            session,
+            tenant_slug="acme",
+            pairing_payload=tampered,
+        )
+
+    assert exc_info.value.code == "KDS_PAIRING_PAYLOAD_INVALID"
+    session.get.assert_not_called()
+
+
+async def test_resolve_pairing_payload_rejects_expired_payload():
+    payload = service._encode_pairing_payload(
+        tenant_slug="acme",
+        screen_id=12,
+        code="004281",
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    session = AsyncMock()
+
+    with pytest.raises(AppError) as exc_info:
+        await service.resolve_pairing_payload(
+            session,
+            tenant_slug="acme",
+            pairing_payload=payload,
+        )
+
+    assert exc_info.value.code == "KDS_PAIRING_PAYLOAD_EXPIRED"
+    session.get.assert_not_called()
+
+
+async def test_resolve_pairing_payload_rejects_remote_disabled_screen():
+    payload = service._encode_pairing_payload(
+        tenant_slug="acme",
+        screen_id=12,
+        code="004281",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=_screen(remote_enabled=False))
+
+    with pytest.raises(AppError) as exc_info:
+        await service.resolve_pairing_payload(
+            session,
+            tenant_slug="acme",
+            pairing_payload=payload,
+        )
+
+    assert exc_info.value.code == "KDS_SCREEN_REMOTE_DISABLED"
 
 
 async def test_pair_remote_valid_code_creates_session_and_returns_raw_token(monkeypatch):

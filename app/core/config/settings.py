@@ -141,6 +141,9 @@ class Settings(BaseSettings):
     # loyalty_qr_secret vide = fallback sur jwt_secret.
     loyalty_qr_secret: str = ""
     loyalty_qr_ttl_seconds: int = 120
+    # QR remote KDS: payload Fernet chiffre et authentifie contenant le code
+    # d'association temporaire. Vide = cle derivee de jwt_hmac_secret/jwt_secret.
+    kds_qr_encryption_key: str = ""
 
     # Hub POS OAuth 2.0 — HubRise (https://www.hubrise.com/developers). Chaine
     # vide sur client_id = feature desactivee (comme smtp_host,

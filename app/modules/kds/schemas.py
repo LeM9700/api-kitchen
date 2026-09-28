@@ -14,6 +14,7 @@ KDS_SCREEN_PATCH_NON_NULL_FIELDS = frozenset(
         "interaction_mode",
         "tickets_per_page",
         "is_active",
+        "remote_enabled",
     }
 )
 
@@ -33,6 +34,7 @@ class KdsScreenBase(BaseModel):
     interaction_mode: KdsInteractionMode = "wall"
     tickets_per_page: int = Field(4, ge=1, le=8)
     is_active: bool = True
+    remote_enabled: bool = True
 
     @field_validator("name", "screen_key", "station", mode="before")
     @classmethod
@@ -61,6 +63,7 @@ class KdsScreenUpdate(BaseModel):
     interaction_mode: KdsInteractionMode | None = None
     tickets_per_page: int | None = Field(None, ge=1, le=8)
     is_active: bool | None = None
+    remote_enabled: bool | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -94,6 +97,7 @@ class KdsScreenOut(BaseModel):
     interaction_mode: KdsInteractionMode
     tickets_per_page: int
     is_active: bool
+    remote_enabled: bool
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -102,6 +106,27 @@ class KdsPairingCodeOut(BaseModel):
     screen_id: int
     code: str = Field(..., pattern=r"^\d{6}$")
     expires_at: datetime
+    pairing_payload: str
+
+
+class KdsPairingPayloadResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pairing_payload: str = Field(..., min_length=1)
+
+    @field_validator("pairing_payload", mode="before")
+    @classmethod
+    def strip_payload(cls, value: str) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+class KdsPairingPayloadResolveOut(BaseModel):
+    screen_id: int
+    code: str = Field(..., pattern=r"^\d{6}$")
+    expires_at: datetime
+    screen: KdsScreenOut
 
 
 class KdsPairRequest(BaseModel):

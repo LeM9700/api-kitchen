@@ -24,6 +24,7 @@ class KdsScreen(Base):
     interaction_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="wall", server_default="wall")
     tickets_per_page: Mapped[int] = mapped_column(Integer, nullable=False, default=4, server_default="4")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    remote_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
