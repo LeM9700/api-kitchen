@@ -1,7 +1,8 @@
+import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.payments.schemas import PaymentOut
 
@@ -26,12 +27,22 @@ class OrderItemCreate(BaseModel):
     # exclusivement depuis le catalogue côté serveur (orders/service.py::create_order).
 
 
+_PHONE_RE = re.compile(r"^\+?[0-9 ().-]{6,32}$")
+
+
 class OrderCreate(BaseModel):
     establishment_id: int | None = Field(None, ge=1)
     order_type: OrderType = "delivery"
     customer_email: str | None = None
+    customer_name: str | None = Field(None, max_length=255)
+    customer_phone: str | None = Field(None, max_length=32)
     delivery_address: str | None = None
     delivery_zone_id: int | None = None
+    # Point GPS de livraison (WGS84). Le serveur retrouve la zone a partir de ce point ;
+    # delivery_zone_id n'est qu'un repli pour les commandes saisies au comptoir.
+    delivery_lat: float | None = Field(None, ge=-90, le=90)
+    delivery_lng: float | None = Field(None, ge=-180, le=180)
+    delivery_instructions: str | None = Field(None, max_length=500)
     delivery_fee: float = 0
     # [🔒 SÉCURITÉ] discount_total est ignoré côté serveur — le calcul se fait
     # exclusivement depuis promo_code. Ce champ est conservé pour rétrocompatibilité
@@ -40,10 +51,32 @@ class OrderCreate(BaseModel):
     promo_code: str | None = None
     items: list[OrderItemCreate] = Field(..., min_length=1)
 
+    @field_validator("customer_phone", mode="before")
+    @classmethod
+    def _normalize_phone(cls, value):
+        if value is None:
+            return None
+        phone = str(value).strip()
+        if not phone:
+            return None
+        if not _PHONE_RE.match(phone):
+            raise ValueError("customer_phone invalide")
+        return phone
+
+    @field_validator("delivery_instructions", mode="before")
+    @classmethod
+    def _normalize_instructions(cls, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
     @model_validator(mode="after")
     def _validate_delivery_fields(self) -> "OrderCreate":
         if self.order_type == "delivery" and not self.delivery_address:
             raise ValueError("delivery_address est requis pour une commande en livraison")
+        if (self.delivery_lat is None) != (self.delivery_lng is None):
+            raise ValueError("delivery_lat et delivery_lng doivent etre fournis ensemble")
         return self
 
 
@@ -130,6 +163,9 @@ class OrderListOut(BaseModel):
     total: float
     delivery_address: str | None
     delivery_zone_id: int | None = None
+    delivery_lat: float | None = None
+    delivery_lng: float | None = None
+    delivery_instructions: str | None = None
     table_number: str | None = None
     estimated_delivery_at: datetime | None = None
     created_at: datetime | None = None

@@ -159,3 +159,11 @@ msgstr ""
 " product or ingredient is unavailable. An automatic refund has been "
 "triggered."
 
+#: app/modules/orders/service.py
+msgid "Delivery failed"
+msgstr "Delivery failed"
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "We could not deliver your order #{order_id}. The restaurant will contact you."
+msgstr "We could not deliver your order #{order_id}. The restaurant will contact you."

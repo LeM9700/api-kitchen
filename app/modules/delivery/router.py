@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Request
 
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_current_user, require_role
+from app.core.http.errors import AppError
 from app.modules.delivery import service
 from app.modules.delivery.models import DeliveryZone
 from app.modules.delivery.schemas import AddressCheckRequest, DeliveryZoneCreate, DeliveryZoneOut
@@ -30,6 +31,8 @@ async def create_zone(body: DeliveryZoneCreate, current_user=Depends(require_rol
 async def update_zone(zone_id: int, body: DeliveryZoneCreate, current_user=Depends(require_role("admin"))):
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         zone = await session.get(DeliveryZone, zone_id)
+        if zone is None:
+            raise AppError("DELIVERY_ZONE_NOT_FOUND", "Zone de livraison introuvable", 404)
         for key, value in body.model_dump().items():
             setattr(zone, key, value)
         await session.commit()

@@ -13,6 +13,7 @@ from app.core.http.schemas import PaginationParams
 from app.core.i18n.translate import t
 from app.modules.admin.tenants.models import TenantConfig
 from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
+from app.modules.delivery import service as delivery_service
 from app.modules.delivery.models import DeliveryZone
 from app.modules.hr.models import Establishment
 from app.modules.loyalty.account.models import LoyaltyTransaction
@@ -258,6 +259,9 @@ def _serialize_order_list(order: Order) -> dict:
         "total": _money(order.total),
         "delivery_address": order.delivery_address,
         "delivery_zone_id": getattr(order, "delivery_zone_id", None),
+        "delivery_lat": getattr(order, "delivery_lat", None),
+        "delivery_lng": getattr(order, "delivery_lng", None),
+        "delivery_instructions": getattr(order, "delivery_instructions", None),
         "table_number": getattr(order, "table_number", None),
         "estimated_delivery_at": getattr(order, "estimated_delivery_at", None),
         "created_at": getattr(order, "created_at", None),
@@ -384,19 +388,51 @@ async def _resolve_delivery(
     order_type: str,
     delivery_zone_id: int | None,
     subtotal: float,
+    delivery_lat: float | None = None,
+    delivery_lng: float | None = None,
+    source: str = "customer",
 ) -> tuple[float, int, int | None]:
     """Calcule delivery_fee, delai de trajet additionnel, et delivery_zone_id effectif.
 
     Pour order_type == "pickup" ou "dine_in" : pas de frais, pas de delai de
     trajet. delivery_zone_id est ignore meme s'il est envoye par le client.
+
+    Pour une livraison, le serveur est la seule autorite sur la zone et les frais :
+
+    - avec des coordonnees GPS : la zone est retrouvee a partir du point
+      (``delivery_zone_id`` envoye par le client est ignore), hors zone => 422
+      DELIVERY_ZONE_UNREACHABLE ;
+    - sans coordonnees : refuse pour une commande client (422
+      DELIVERY_COORDINATES_REQUIRED). Une commande saisie au comptoir
+      (``source="manual"``) peut designer une zone choisie par le staff, en
+      attendant la saisie d'adresse sur carte ; a defaut, 422
+      DELIVERY_ZONE_REQUIRED.
+
+    Une livraison ne peut donc plus etre creee sans zone, donc jamais a 0 EUR de
+    frais faute de controle.
     """
     if order_type in NON_DELIVERY_ORDER_TYPES:
         return 0.0, 0, None
 
-    if delivery_zone_id is None:
-        return 0.0, 0, None
+    if delivery_lat is not None and delivery_lng is not None:
+        zone = await delivery_service.check_address(session, delivery_lat, delivery_lng)
+    elif source == "manual":
+        if delivery_zone_id is None:
+            raise AppError(
+                "DELIVERY_ZONE_REQUIRED",
+                "Une zone de livraison est requise pour une commande en livraison",
+                422,
+                "delivery_zone_id",
+            )
+        zone = await session.get(DeliveryZone, delivery_zone_id)
+    else:
+        raise AppError(
+            "DELIVERY_COORDINATES_REQUIRED",
+            "Les coordonnees GPS de livraison sont requises",
+            422,
+            "delivery_lat",
+        )
 
-    zone = await session.get(DeliveryZone, delivery_zone_id)
     if zone is None or not zone.is_active:
         raise AppError("INVALID_DELIVERY_ZONE", "Delivery zone not found or inactive", 422, "delivery_zone_id")
     if subtotal < float(zone.min_order_amount or 0):
@@ -406,7 +442,7 @@ async def _resolve_delivery(
             422,
             "delivery_zone_id",
         )
-    return _money(zone.fee), int(zone.estimated_minutes or 0), delivery_zone_id
+    return _money(zone.fee), int(zone.estimated_minutes or 0), zone.id
 
 
 async def _resolve_extras(session: AsyncSession, product_id: int, item_extras: list) -> tuple[list[dict], float]:
@@ -646,8 +682,24 @@ async def create_order(
         discount_total = _money(discount_total + loyalty_discount)
 
     order_type = getattr(body, "order_type", None) or "delivery"
+    customer_name = customer_name or getattr(body, "customer_name", None)
+    customer_phone = customer_phone or getattr(body, "customer_phone", None)
+    if order_type == "delivery" and not customer_phone:
+        # Le livreur doit pouvoir joindre le client (adresse introuvable, absence).
+        raise AppError(
+            "CUSTOMER_PHONE_REQUIRED",
+            "Un telephone est requis pour une commande en livraison",
+            422,
+            "customer_phone",
+        )
     delivery_fee, delivery_minutes, effective_delivery_zone_id = await _resolve_delivery(
-        session, order_type, getattr(body, "delivery_zone_id", None), subtotal
+        session,
+        order_type,
+        getattr(body, "delivery_zone_id", None),
+        subtotal,
+        delivery_lat=getattr(body, "delivery_lat", None),
+        delivery_lng=getattr(body, "delivery_lng", None),
+        source=source,
     )
     estimated_delivery_at = await _estimate_delivery_at(session, delivery_minutes)
     establishment_id = await _resolve_establishment_id(session, getattr(body, "establishment_id", None))
@@ -667,6 +719,11 @@ async def create_order(
         discount_total=discount_total,
         delivery_fee=delivery_fee,
         delivery_zone_id=effective_delivery_zone_id,
+        delivery_lat=getattr(body, "delivery_lat", None) if order_type == "delivery" else None,
+        delivery_lng=getattr(body, "delivery_lng", None) if order_type == "delivery" else None,
+        delivery_instructions=(
+            getattr(body, "delivery_instructions", None) if order_type == "delivery" else None
+        ),
         table_number=table_number,
         estimated_delivery_at=estimated_delivery_at,
         total=total,
@@ -1450,11 +1507,28 @@ async def update_status(
             transition n'est pas autorisee par VALID_TRANSITIONS.
         AppError: INSUFFICIENT_STOCK (409) si confirmation et stock insuffisant.
     """
-    order = await session.get(Order, order_id)
+    # [CONCURRENCE] Verrou de ligne : deux appareils (ex. comptoir + livreur) qui valident
+    # la meme commande en meme temps sont serialises. Le second voit le nouveau statut
+    # et est rejete (INVALID_STATUS_TRANSITION) au lieu de dupliquer historique,
+    # deduction de stock ou credit de points. populate_existing evite de lire un etat
+    # perime depuis l'identity map de la session.
+    order = await session.get(Order, order_id, with_for_update=True, populate_existing=True)
     if order is None:
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
 
     previous_status = order.status
+
+    if (
+        status == "delivery_failed"
+        and authority == TransitionAuthority.INTERNAL
+        and not (note or "").strip()
+    ):
+        raise AppError(
+            "DELIVERY_FAILURE_REASON_REQUIRED",
+            "Un motif est requis pour declarer un echec de livraison",
+            422,
+            "note",
+        )
 
     if status == "confirmed" and (getattr(order, "payment_status", None) or "pending") != "paid":
         raise AppError("PAYMENT_REQUIRED", "Order must be paid before confirmation", 409, "payment_status")
@@ -1603,9 +1677,21 @@ async def update_status(
             },
         }
 
-        # Transitions vers "cancelled" depuis n'importe quel etat.
-        if actual_status == "cancelled":
+        # Echec de livraison : le client est prevenu, le staff doit statuer (remboursement
+        # ou nouvelle tentative). [i18n] staff_* restent en francais, comme ci-dessus.
+        if actual_status == "delivery_failed":
             notif: dict | None = {
+                "client_title": t("Delivery failed"),
+                "client_body": t(
+                    "We could not deliver your order #{order_id}. The restaurant will contact you.",
+                    order_id=order_id,
+                ),
+                "staff_title": "Echec de livraison",
+                "staff_body": f"Commande #{order_id} : livraison echouee, a traiter (remboursement ou nouvelle tentative).",
+            }
+        # Transitions vers "cancelled" depuis n'importe quel etat.
+        elif actual_status == "cancelled":
+            notif = {
                 "client_title": t("Order cancelled"),
                 "client_body": t("Your order #{order_id} has been cancelled.", order_id=order_id),
                 "staff_title": "Commande annulee",

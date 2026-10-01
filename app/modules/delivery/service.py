@@ -18,7 +18,11 @@ def _point_in_polygon(lat: float, lng: float, polygon: list[list[float]]) -> boo
 
 
 async def check_address(session: AsyncSession, lat: float, lng: float) -> DeliveryZone:
-    result = await session.execute(select(DeliveryZone).where(DeliveryZone.is_active.is_(True)))
+    # Ordre stable : si deux zones se chevauchent, /delivery/check et la creation de
+    # commande doivent toujours retenir la meme (donc les memes frais).
+    result = await session.execute(
+        select(DeliveryZone).where(DeliveryZone.is_active.is_(True)).order_by(DeliveryZone.id)
+    )
     for zone in result.scalars():
         coords = zone.polygon.get("coordinates", [[]])[0]
         if coords and _point_in_polygon(lat, lng, coords):

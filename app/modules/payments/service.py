@@ -1163,10 +1163,10 @@ async def create_refund(
     if order is None:
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
 
-    if not allow_unfulfilled_order and order.status not in {"cancelled", "delivered"}:
+    if not allow_unfulfilled_order and order.status not in {"cancelled", "delivered", "delivery_failed"}:
         raise AppError(
             "REFUND_NOT_ALLOWED",
-            "Remboursement impossible : la commande doit etre annulee ou livree.",
+            "Remboursement impossible : la commande doit etre annulee, livree ou en echec de livraison.",
             400,
         )
 

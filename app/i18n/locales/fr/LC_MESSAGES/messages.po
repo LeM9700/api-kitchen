@@ -163,3 +163,11 @@ msgstr ""
 "car un produit ou ingrédient est indisponible. Un remboursement "
 "automatique a été déclenché."
 
+#: app/modules/orders/service.py
+msgid "Delivery failed"
+msgstr "Échec de la livraison"
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "We could not deliver your order #{order_id}. The restaurant will contact you."
+msgstr "Nous n'avons pas pu livrer votre commande #{order_id}. Le restaurant va vous contacter."

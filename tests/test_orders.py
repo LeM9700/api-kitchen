@@ -459,7 +459,9 @@ async def test_internal_authority_supports_rejected_and_delivery_failed_statuses
 
     order2 = Order(id=2, status="out_for_delivery", payment_status="paid", total=10)
     session2 = _mock_session(order2)
-    result2 = await service.update_status(session2, 2, "delivery_failed", tenant_slug="acme")
+    result2 = await service.update_status(
+        session2, 2, "delivery_failed", note="Client absent", tenant_slug="acme"
+    )
     assert result2.status == "delivery_failed"
 
 

@@ -19,9 +19,9 @@ Gestion des zones de livraison géographiques par tenant : CRUD admin, liste pub
 
 **Liste des zones (`GET /zones`)** : retourne toutes les zones actives triées par nom.
 
-**Vérification adresse (`POST /check`)** : accepte `lat`/`lng`, teste l'appartenance à chaque zone active par algorithme ray-casting sur le polygone GeoJSON. Retourne `{zone_id, name, fee, estimated_minutes}` de la première zone correspondante. Erreur 404 si aucune zone ne couvre le point.
+**Vérification adresse (`POST /check`)** : accepte `lat`/`lng`, teste l'appartenance à chaque zone active par algorithme ray-casting sur le polygone GeoJSON. Retourne `{zone_id, name, fee, estimated_minutes}` de la première zone correspondante (ordre par `id`, donc stable si deux zones se chevauchent). Erreur 422 `DELIVERY_ZONE_UNREACHABLE` si aucune zone ne couvre le point. La création de commande utilise la même fonction : le serveur retrouve lui-même la zone et les frais à partir de `delivery_lat`/`delivery_lng`.
 
-**CRUD zones** : création et mise à jour full-replace (PUT). Pas de soft-delete exposé.
+**CRUD zones** : création et mise à jour full-replace (PUT, 404 `DELIVERY_ZONE_NOT_FOUND` si la zone n'existe pas). Pas de soft-delete exposé.
 
 ## Sécurité implémentée
 

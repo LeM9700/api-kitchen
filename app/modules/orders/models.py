@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -54,6 +55,12 @@ class Order(Base):
     total: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     delivery_zone_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Coordonnees WGS84 du point de livraison (geocodees cote client). Renseignees pour
+    # les commandes client ; NULL pour une commande saisie au comptoir avec une zone
+    # choisie a la main (cf. orders/service.py::_resolve_delivery).
+    delivery_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    delivery_lng: Mapped[float | None] = mapped_column(Float, nullable=True)
+    delivery_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
     table_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     estimated_delivery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)

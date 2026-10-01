@@ -149,3 +149,11 @@ msgid ""
 "triggered."
 msgstr ""
 
+#: app/modules/orders/service.py
+msgid "Delivery failed"
+msgstr ""
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "We could not deliver your order #{order_id}. The restaurant will contact you."
+msgstr ""

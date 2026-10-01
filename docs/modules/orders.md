@@ -34,7 +34,7 @@ Creation et cycle de vie des commandes : pricing serveur-side, application des p
 
 ## Modeles de donnees
 
-**`orders`** : `id`, `user_id`, `customer_email`, `customer_name`, `customer_phone`, `order_type`, `status`, `payment_status`, `source`, `created_by_user_id`, `subtotal`, `discount_total`, `delivery_fee`, `total`, `delivery_address`, `delivery_zone_id`, `table_number`, `estimated_delivery_at`, `idempotency_key`, `promo_code`, `created_at`.
+**`orders`** : `id`, `user_id`, `customer_email`, `customer_name`, `customer_phone`, `order_type`, `status`, `payment_status`, `source`, `created_by_user_id`, `subtotal`, `discount_total`, `delivery_fee`, `total`, `delivery_address`, `delivery_zone_id`, `delivery_lat`, `delivery_lng`, `delivery_instructions`, `table_number`, `estimated_delivery_at`, `idempotency_key`, `promo_code`, `created_at`.
 
 **`order_items`** : `id`, `order_id`, `product_id`, `variant_id`, `product_name_snapshot`, `variant_name_snapshot`, `extras_snapshot`, `extras_total`, `quantity`, `unit_price`, `total`, `preparation_status`, `preparation_station`, `prepared_at`, `prepared_by_user_id`.
 
@@ -66,7 +66,7 @@ La migration `0035_admin_staff_api_contracts.py` ajoute :
 
 Valeurs supportees :
 
-- `delivery` : `delivery_address` obligatoire, zone/frais de livraison possibles.
+- `delivery` : `delivery_address`, `customer_phone` et un point GPS (`delivery_lat`/`delivery_lng`) obligatoires. La zone et les frais sont retrouves cote serveur a partir du point ; `delivery_zone_id` client est ignore. Exception : une commande saisie au comptoir (`POST /orders/manual`) peut designer une zone choisie par le staff a la place du point GPS. `delivery_instructions` (etage, digicode, 500 caracteres max) est optionnel.
 - `pickup` : aucune adresse requise, `delivery_fee = 0`, `delivery_zone_id = null`.
 - `dine_in` : aucune adresse requise, `delivery_fee = 0`, `delivery_zone_id = null`.
 
@@ -78,10 +78,13 @@ confirmed -> preparing | cancelled
 queued -> confirmed | cancelled
 preparing -> ready | cancelled
 ready -> out_for_delivery | delivered
-out_for_delivery -> delivered | cancelled
+out_for_delivery -> delivered | cancelled | delivery_failed
 delivered -> terminal
 cancelled -> terminal
+delivery_failed -> terminal (remboursement possible)
 ```
+
+`delivery_failed` exige un motif (`note`) pour une transition interne (422 `DELIVERY_FAILURE_REASON_REQUIRED`) ; une autorite externe n'est jamais bloquee. La transition notifie le client (`order.delivery_failed`) et le staff.
 
 ## Cycle paiement / commande
 
@@ -105,7 +108,9 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - `items[].unit_price`, `discount_total` et `delivery_fee` client ne sont pas source de verite.
 - Les prix sont resolus depuis `Product.base_price`, `ProductVariant.price_delta` et les `Extra` autorises via `ProductExtra`.
 - Les extras sont sauvegardes en snapshot JSON dans `order_items.extras_snapshot`.
-- `delivery_fee` est calcule cote serveur depuis `delivery_zone_id`.
+- `delivery_fee` est calcule cote serveur depuis la zone qui couvre le point GPS de livraison.
+- Une livraison sans coordonnees est refusee (422 `DELIVERY_COORDINATES_REQUIRED`), hors zone aussi (422 `DELIVERY_ZONE_UNREACHABLE`), sans telephone aussi (422 `CUSTOMER_PHONE_REQUIRED`). Une livraison manuelle sans point ni zone donne 422 `DELIVERY_ZONE_REQUIRED`.
+- `update_status` verrouille la ligne de commande (`FOR UPDATE`) : deux validations simultanees sont serialisees, la seconde est rejetee (`INVALID_STATUS_TRANSITION`).
 - Pour `pickup` et `dine_in`, l'API ignore adresse/zone de livraison et force `delivery_fee = 0`.
 - `estimated_delivery_at` est calcule depuis `TenantConfig` + `DeliveryZone.estimated_minutes`, puis stocke.
 - `total = subtotal - discount_total + delivery_fee`.
