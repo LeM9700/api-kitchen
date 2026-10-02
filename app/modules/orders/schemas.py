@@ -4,12 +4,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.modules.payments.schemas import PaymentOut
+from app.modules.payments.schemas import PaymentLinkOut, PaymentOut
 
 OrderType = Literal["delivery", "pickup", "dine_in"]
 PreparationStatus = Literal["pending", "preparing", "ready"]
 PreparationStation = Literal["kitchen", "counter", "none"]
-ManualPaymentMethod = Literal["cash", "external_terminal", "cash_register"]
+ManualPaymentMethod = Literal["cash", "external_terminal", "cash_register", "payment_link"]
 LoyaltyIdentificationMethod = Literal["phone", "qr", "quick_create"]
 
 
@@ -90,9 +90,15 @@ class ManualOrderPaymentCreate(BaseModel):
     method: ManualPaymentMethod
     external_reference: str | None = Field(None, max_length=255)
     amount_received: float | None = Field(None, ge=0)
+    # Uniquement avec method='payment_link' : 'full' = paiement en ligne immediat,
+    # 'guarantee' = empreinte bancaire (reglement a la livraison). Defaut : empreinte pour une
+    # livraison, paiement complet sinon.
+    link_mode: Literal["full", "guarantee"] | None = None
 
     @model_validator(mode="after")
     def _validate_reference(self) -> "ManualOrderPaymentCreate":
+        if self.link_mode is not None and self.method != "payment_link":
+            raise ValueError("link_mode n'est valable qu'avec method='payment_link'")
         if self.method in {"external_terminal", "cash_register"} and not self.external_reference:
             raise ValueError("external_reference est requis pour ce mode de paiement")
         return self
@@ -258,8 +264,13 @@ class OrderReceiptOut(BaseModel):
 
 class ManualOrderOut(BaseModel):
     order: OrderDetailOut
-    payment: PaymentOut
+    # None tant qu'une commande saisie avec un lien de paiement n'est pas reglee.
+    payment: PaymentOut | None = None
     receipt: OrderReceiptOut
+    payment_link: PaymentLinkOut | None = None
+    # Code d'erreur si la commande est creee mais le lien n'a pas pu l'etre (relancer via
+    # POST /payments/{order_id}/link).
+    payment_link_error: str | None = None
 
 
 OrderOut = OrderListOut

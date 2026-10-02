@@ -97,7 +97,15 @@ Valeur initiale :
 
 Le module `payments` marque la commande `payment_status = paid` apres confirmation du paiement.
 
-La transition `pending -> confirmed` est refusee tant que `payment_status != paid`. Cette regle evite de confirmer une commande non payee et garde la deduction de stock dans `orders.update_status`.
+La transition `pending -> confirmed` est refusee tant que `payment_status != paid`, sauf pour une **livraison** `guaranteed` (carte pre-autorisee, paiement a la remise). Cette regle evite de confirmer une commande non payee et garde la deduction de stock dans `orders.update_status`.
+
+Valeurs de `payment_status` liees a l'empreinte bancaire (voir `docs/modules/payments.md`, « Garantie de paiement ») :
+
+- `guaranteed` : empreinte posee, rien debite. La commande ne peut pas passer `delivered` tant que le reglement n'est pas enregistre (409 `PAYMENT_SETTLEMENT_REQUIRED`).
+- `guarantee_released` : empreinte liberee (annulation, rejet, decision admin, expiration).
+- `guarantee_captured` : une partie de l'empreinte a ete debitee (echec de livraison de la faute du client).
+
+Annuler ou rejeter une commande `guaranteed` libere l'empreinte automatiquement (jamais bloquant).
 
 ## Comportements metier
 
@@ -124,10 +132,13 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - Le payload accepte `customer.email`, `customer.full_name`, `customer.phone`, sans compte client obligatoire.
 - Les prix restent resolus cote serveur depuis catalogue/variants/extras.
 - Le paiement caisse est integre dans le payload via `payment.method`.
-- Methodes acceptees : `cash`, `external_terminal`, `cash_register`.
+- Methodes acceptees : `cash`, `external_terminal`, `cash_register`, `payment_link`.
 - Pour `external_terminal` et `cash_register`, `external_reference` est obligatoire.
+- `cash` est refuse pour une livraison (422 `DELIVERY_CASH_REQUIRES_GUARANTEE`) : l'argent n'est pas encore encaisse. Utiliser `payment_link`.
+- `payment_link` est refuse pour une commande `dine_in` (422 `PAYMENT_LINK_UNSUPPORTED`, avant toute creation).
+- `payment_link` (+ `link_mode` optionnel : `guarantee` par defaut en livraison, `full` sinon ; `guarantee` refuse hors livraison) cree la commande **en attente** (`pending`, pas de paiement) puis un lien Stripe Checkout envoye par SMS/email. La commande est confirmee par le webhook Stripe. Si le lien ne peut pas etre cree, la commande existe quand meme et `payment_link_error` indique pourquoi (relancer via `POST /payments/{order_id}/link`).
 - Si le paiement caisse est valide, la commande passe `payment_status = paid`, puis la transition `pending -> confirmed` reutilise `update_status` pour garder la deduction de stock atomique.
-- Reponse : `{ "order": OrderDetailOut, "payment": PaymentOut, "receipt": OrderReceiptOut }`.
+- Reponse : `{ "order": OrderDetailOut, "payment": PaymentOut | null, "receipt": OrderReceiptOut, "payment_link": PaymentLinkOut | null, "payment_link_error": string | null }`. `payment` est `null` tant qu'un lien de paiement n'est pas regle.
 
 **Preparation item par item**
 

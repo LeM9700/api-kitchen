@@ -2,22 +2,36 @@ from datetime import datetime
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_current_user, get_pagination, require_permission, require_role
+from app.core.http.deps import (
+    get_arq_pool,
+    get_current_user,
+    get_pagination,
+    require_permission,
+    require_role,
+)
 from app.core.http.limiter import limiter
 from app.core.http.schemas import PaginatedResponse, PaginationParams
-from app.modules.payments import service
+from app.modules.payments import guarantee, service
 from app.modules.payments.models import Payment
 from app.modules.payments.schemas import (
+    GuaranteeCaptureRequest,
+    GuaranteeCashRequest,
+    GuaranteeIntentOut,
+    GuaranteeIntentRequest,
+    GuaranteeReleaseRequest,
+    GuaranteeTermsOut,
     LocalTestPaymentRequest,
     PaymentConfirmRequest,
     PaymentDetailOut,
     PaymentIntentRequest,
+    PaymentLinkOut,
+    PaymentLinkRequest,
     PaymentListItemOut,
     PaymentOut,
     PaymentSummaryOut,
@@ -263,6 +277,140 @@ async def cancel_terminal_reader(
             current_user["tenant_slug"],
             reader_id,
         )
+
+
+_LINK_DONE_PAGES = {
+    "ok": ("Merci !", "Votre carte a bien ete enregistree. Vous pouvez fermer cette page."),
+    "cancelled": ("Paiement annule", "Aucun debit n'a ete effectue. Vous pouvez fermer cette page."),
+    "local": ("Mode test", "Lien de paiement de test (aucun debit)."),
+}
+
+
+@router.get("/public/link-done", response_class=HTMLResponse)
+async def payment_link_done(status: str = Query("ok", max_length=16)) -> HTMLResponse:
+    """Page d'atterrissage apres un lien de paiement (success/cancel Stripe Checkout).
+
+    Statique et sans donnee de commande : la confirmation reelle vient du webhook.
+    """
+    title, message = _LINK_DONE_PAGES.get(status, _LINK_DONE_PAGES["ok"])
+    html = (
+        '<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{title}</title></head>"
+        '<body style="font-family:system-ui,sans-serif;text-align:center;padding:3rem 1rem">'
+        f"<h1>{title}</h1><p>{message}</p></body></html>"
+    )
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/guarantee-terms", response_model=GuaranteeTermsOut)
+async def guarantee_terms(current_user=Depends(get_current_user)) -> GuaranteeTermsOut:
+    """Conditions de l'empreinte bancaire (versionnees) : l'app affiche la meme politique que celle
+    appliquee par le serveur."""
+    return GuaranteeTermsOut(**guarantee.terms_policy())
+
+
+@router.post("/guarantee-intent", response_model=GuaranteeIntentOut)
+@limiter.limit("10/minute")
+async def create_guarantee_intent(
+    request: Request,
+    body: GuaranteeIntentRequest,
+    current_user=Depends(get_current_user),
+) -> GuaranteeIntentOut:
+    """Pre-autorise le total d'une livraison payee a la remise (aucun debit)."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        result = await guarantee.create_guarantee_intent(
+            session,
+            body.order_id,
+            current_user["tenant_slug"],
+            int(current_user["id"]),
+            terms_version=body.terms_version,
+            accept_terms=body.accept_terms,
+        )
+        return GuaranteeIntentOut(
+            client_secret=result["client_secret"],
+            payment=service._payment_out(result["payment"]),
+            terms_version=guarantee.GUARANTEE_TERMS_VERSION,
+        )
+
+
+@router.post("/{order_id}/guarantee/release", response_model=PaymentOut)
+async def release_guarantee(
+    order_id: int,
+    body: GuaranteeReleaseRequest | None = None,
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> PaymentOut:
+    """Libere l'empreinte : rien n'est debite."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        payment = await guarantee.release_guarantee(
+            session,
+            current_user["tenant_slug"],
+            order_id,
+            reason=(body.reason if body else "released_by_staff"),
+            user_id=int(current_user["id"]),
+        )
+        return service._payment_out(payment)
+
+
+@router.post("/{order_id}/guarantee/capture", response_model=PaymentOut)
+@limiter.limit("10/minute")
+async def capture_guarantee(
+    request: Request,
+    order_id: int,
+    body: GuaranteeCaptureRequest,
+    current_user: dict = Depends(require_role("admin")),
+) -> PaymentOut:
+    """Debite tout ou partie de l'empreinte (administrateur, motif obligatoire)."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        payment = await guarantee.capture_guarantee(
+            session,
+            current_user["tenant_slug"],
+            order_id,
+            amount_cents=body.amount,
+            reason=body.reason,
+            user_id=int(current_user["id"]),
+        )
+        return service._payment_out(payment)
+
+
+@router.post("/{order_id}/guarantee/cash-collected", response_model=PaymentOut)
+async def guarantee_cash_collected(
+    order_id: int,
+    body: GuaranteeCashRequest | None = None,
+    current_user: dict = Depends(require_role("staff", "admin")),
+) -> PaymentOut:
+    """Le client a paye en especes a la remise : libere l'empreinte et enregistre l'encaissement."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        payment = await guarantee.settle_guarantee_cash(
+            session,
+            current_user["tenant_slug"],
+            order_id,
+            amount_received=(body.amount_received if body else None),
+            user_id=int(current_user["id"]),
+        )
+        return service._payment_out(payment)
+
+
+@router.post("/{order_id}/link", response_model=PaymentLinkOut)
+@limiter.limit("10/minute")
+async def create_payment_link(
+    request: Request,
+    order_id: int,
+    body: PaymentLinkRequest | None = None,
+    current_user: dict = Depends(require_role("staff", "admin")),
+    arq_pool=Depends(get_arq_pool),
+) -> PaymentLinkOut:
+    """Lien de paiement Stripe pour une commande saisie au comptoir (envoye par SMS/email)."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        result = await guarantee.create_payment_link(
+            session,
+            current_user["tenant_slug"],
+            order_id,
+            mode=(body.mode if body else "full"),
+            actor_user_id=int(current_user["id"]),
+            arq_pool=arq_pool,
+        )
+        return PaymentLinkOut(**result)
 
 
 @router.get("/{order_id}", response_model=PaymentDetailOut)

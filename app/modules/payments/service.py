@@ -167,7 +167,22 @@ def _payment_out(payment: Payment, receipt_url: str | None = None) -> PaymentOut
         status=payment.status,
         created_by_user_id=getattr(payment, "created_by_user_id", None),
         receipt_url=receipt_url,
+        purpose=getattr(payment, "purpose", None) or "sale",
+        captured_amount=(
+            float(payment.captured_amount) if getattr(payment, "captured_amount", None) is not None else None
+        ),
+        settled_at=getattr(payment, "settled_at", None),
+        settlement_note=getattr(payment, "settlement_note", None),
     )
+
+
+def _collected_cents(payment: Payment) -> int:
+    """Montant reellement encaisse : pour une garantie capturee, le montant debite (peut etre
+    inferieur a l'empreinte) ; sinon le montant du paiement."""
+    captured = getattr(payment, "captured_amount", None)
+    if getattr(payment, "purpose", "sale") == "guarantee" and captured is not None:
+        return _money_to_cents(captured)
+    return _money_to_cents(payment.amount)
 
 
 def _stripe_object_to_dict(value: Any) -> dict:
@@ -340,7 +355,7 @@ async def create_intent(
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
     if user_id is not None and (order.user_id is None or int(order.user_id) != int(user_id)):
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
-    if getattr(order, "payment_status", None) == "paid":
+    if getattr(order, "payment_status", None) in {"paid", "guaranteed"}:
         raise AppError("ORDER_ALREADY_PAID", "Order is already paid.", 409)
 
     stripe_context = await get_stripe_context(session, tenant_slug)
@@ -348,6 +363,7 @@ async def create_intent(
     filters = [
         Payment.order_id == order.id,
         Payment.provider == "stripe",
+        Payment.purpose == "sale",
         Payment.status == "pending",
     ]
     if user_id is None:
@@ -670,6 +686,24 @@ async def finalize_payment(
     if order is None:
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
 
+    if payment.purpose == "guarantee":
+        # Empreinte bancaire (livraison payee a la remise) : logique dediee, voir guarantee.py.
+        from app.modules.payments import guarantee
+
+        return await guarantee.finalize_guarantee(
+            session,
+            tenant_slug,
+            payment,
+            order,
+            source=source,
+            user_id=user_id,
+            is_staff=is_staff,
+            verify_with_stripe=verify_with_stripe,
+            stripe_payment_intent=(
+                _stripe_object_to_dict(stripe_payment_intent) if stripe_payment_intent is not None else None
+            ),
+        )
+
     _require_customer_payment_owner(payment, order, user_id, is_staff)
 
     if payment.status in {"paid", "refunded", "partially_refunded"}:
@@ -831,7 +865,23 @@ async def handle_webhook(session: AsyncSession, tenant_slug: str, payload: dict)
             logger.info("Webhook event %s already processed, skipping (tenant=%s)", event_id, tenant_slug)
             return
 
-    if event_type in {"payment_intent.succeeded", ""}:
+    if event_type in {"payment_intent.succeeded", "payment_intent.amount_capturable_updated"}:
+        from app.modules.payments import guarantee
+
+        # Garantie (empreinte) ou lien de paiement : rattachement du PaymentIntent puis, pour une
+        # garantie, finalisation. Retourne False pour un paiement classique.
+        if not await guarantee.handle_intent_event(session, tenant_slug, data_object, event_type):
+            pi_id = data_object.get("id")
+            if pi_id and event_type == "payment_intent.succeeded":
+                await finalize_payment(
+                    session,
+                    tenant_slug,
+                    pi_id,
+                    source="webhook",
+                    stripe_payment_intent=data_object,
+                )
+
+    elif event_type == "":
         pi_id = data_object.get("id")
         if pi_id:
             await finalize_payment(
@@ -841,6 +891,11 @@ async def handle_webhook(session: AsyncSession, tenant_slug: str, payload: dict)
                 source="webhook",
                 stripe_payment_intent=data_object,
             )
+
+    elif event_type in {"checkout.session.completed", "checkout.session.expired"}:
+        from app.modules.payments import guarantee
+
+        await guarantee.handle_checkout_session(session, tenant_slug, data_object, event_type)
 
     elif event_type in {"payment_intent.payment_failed", "payment_intent.canceled"}:
         pi_id = data_object.get("id")
@@ -877,7 +932,16 @@ async def handle_payment_failure(session: AsyncSession, provider_payment_id: str
         logger.debug("handle_payment_failure: payment not found for %s", provider_payment_id)
         return
 
-    if payment.status in {"paid", "partially_refunded", "refunded", "failed"}:
+    if payment.purpose == "guarantee":
+        from app.modules.payments import guarantee
+
+        # Blocage expire ou annule : c'est une liberation, pas un echec de paiement.
+        if await guarantee.handle_guarantee_canceled(session, payment):
+            return
+        if payment.status in {"authorized", "released", "paid"}:
+            return
+
+    if payment.status in {"paid", "partially_refunded", "refunded", "failed", "released"}:
         return  # Déjà traité — idempotent
 
     payment.status = "failed"
@@ -1176,7 +1240,7 @@ async def create_refund(
     if payment is None:
         raise AppError("PAYMENT_NOT_FOUND", "Aucun paiement confirme trouve pour cette commande.", 404)
 
-    payment_amount_cents = _money_to_cents(payment.amount)
+    payment_amount_cents = _collected_cents(payment)
     already_refunded = await _refunded_amount_cents(session, payment.id)
     remaining = payment_amount_cents - already_refunded
     if remaining <= 0:
@@ -1297,7 +1361,7 @@ async def get_payment_for_order(
 
     refunds = await _refunds_for_payment(session, payment.id)
     refunded_amount = sum(r.amount for r in refunds if r.status in {"pending", "succeeded"})
-    paid_amount = _money_to_cents(payment.amount) if payment.status in PAYMENT_STATUS_PAID | {"refunded"} else 0
+    paid_amount = _collected_cents(payment) if payment.status in PAYMENT_STATUS_PAID | {"refunded"} else 0
     receipt_url = await get_receipt_url(payment) if include_receipt else None
     refund_out = [RefundOut.model_validate(r) for r in refunds]
     return PaymentDetailOut(
@@ -1305,7 +1369,7 @@ async def get_payment_for_order(
         payment=_payment_out(payment, receipt_url),
         paid_amount_cents=paid_amount,
         refunded_amount_cents=refunded_amount,
-        remaining_refundable_cents=max(0, _money_to_cents(payment.amount) - refunded_amount),
+        remaining_refundable_cents=max(0, paid_amount - refunded_amount),
         refunds=refund_out,
         receipt_url=receipt_url,
     )
@@ -1384,6 +1448,12 @@ async def list_payments(
                 created_by_user_id=getattr(payment, "created_by_user_id", None),
                 created_at=payment.created_at,
                 refunded_amount_cents=await _refunded_amount_cents(session, payment.id),
+                purpose=getattr(payment, "purpose", None) or "sale",
+                captured_amount=(
+                    float(payment.captured_amount)
+                    if getattr(payment, "captured_amount", None) is not None
+                    else None
+                ),
             )
         )
     return items, int(total)
@@ -1493,7 +1563,7 @@ async def get_payment_summary(
 
     payments = list((await session.execute(payment_stmt)).scalars().all())
     refunds = list((await session.execute(refund_stmt)).scalars().all())
-    collected = sum(_money_to_cents(p.amount) for p in payments if p.status in PAYMENT_STATUS_PAID | {"refunded"})
+    collected = sum(_collected_cents(p) for p in payments if p.status in PAYMENT_STATUS_PAID | {"refunded"})
     refunded = sum(r.amount for r in refunds if r.status == "succeeded")
     counts: dict[str, int] = {}
     for payment in payments:
@@ -1524,7 +1594,11 @@ async def cleanup_expired_pending_payments(
     cancelled_count = 0
     failures: list[dict] = []
     for payment in payments:
-        if payment.provider_payment_id and not payment.provider_payment_id.startswith("local_"):
+        provider_id = payment.provider_payment_id or ""
+        if provider_id.startswith("cs_"):
+            # Lien de paiement jamais ouvert : la session Checkout expire seule, pas de PaymentIntent.
+            pass
+        elif provider_id and not provider_id.startswith("local_"):
             try:
                 await anyio.to_thread.run_sync(
                     lambda: stripe.PaymentIntent.cancel(

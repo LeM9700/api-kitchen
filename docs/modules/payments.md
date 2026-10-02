@@ -21,6 +21,13 @@ Le code applicatif principal se trouve dans `app/modules/payments`.
 |---------|--------|------------------|-------|-------|
 | POST | `/api/v1/payments/intent` | Bearer JWT | tous | Crée un PaymentIntent Stripe pour une commande |
 | POST | `/api/v1/payments/confirm` | Bearer JWT | tous | Synchronise le client avec la finalisation idempotente |
+| GET | `/api/v1/payments/guarantee-terms` | Bearer JWT | tous | Conditions versionnées de l'empreinte bancaire |
+| POST | `/api/v1/payments/guarantee-intent` | Bearer JWT | client propriétaire | Pré-autorise le total d'une livraison payée à la remise (10/min) |
+| POST | `/api/v1/payments/{order_id}/guarantee/release` | Bearer JWT | staff, admin | Libère l'empreinte (rien n'est débité) |
+| POST | `/api/v1/payments/{order_id}/guarantee/capture` | Bearer JWT | admin | Débite tout ou partie de l'empreinte, motif obligatoire (10/min) |
+| POST | `/api/v1/payments/{order_id}/guarantee/cash-collected` | Bearer JWT | staff, admin | Espèces encaissées : libère l'empreinte, enregistre un paiement `cash` |
+| POST | `/api/v1/payments/{order_id}/link` | Bearer JWT | staff, admin | Lien de paiement Stripe Checkout (SMS/email), `full` ou `guarantee` (10/min) |
+| GET | `/api/v1/payments/public/link-done` | Public | tous | Page d'atterrissage statique après un lien |
 | POST | `/api/v1/payments/webhook` | Public Stripe | Stripe uniquement | Reçoit les événements Stripe signés |
 | POST | `/api/v1/payments/{order_id}/refund` | Bearer JWT | admin | Cree un remboursement total ou partiel |
 | GET | `/api/v1/payments/{order_id}` | Bearer JWT | client propriétaire, staff, admin | Détail paiement, remboursements et reçu |
@@ -151,7 +158,11 @@ Champs :
 - `status` ;
 - `expires_at` ;
 - `created_by_user_id` ;
-- `created_at`.
+- `created_at` ;
+- `purpose` : `sale` (défaut) ou `guarantee` (contrainte `ck_payments_purpose`) ;
+- `guarantee_terms_version`, `guarantee_terms_accepted_at` ;
+- `captured_amount` : montant réellement débité d'une garantie ;
+- `settled_at`, `settled_by_user_id`, `settlement_note`.
 
 Providers supportes :
 
@@ -164,6 +175,8 @@ Providers supportes :
 Statuts :
 
 - `pending` : PaymentIntent créé, paiement non finalisé.
+- `authorized` : empreinte posée (fonds bloqués, rien débité), propre à `purpose='guarantee'`.
+- `released` : empreinte libérée, rien débité (ou débit remplacé par un paiement `cash`).
 - `paid` : paiement Stripe reussi ou paiement caisse valide.
 - `partially_refunded` : au moins un remboursement a réussi, mais il reste un solde remboursable.
 - `refunded` : montant payé intégralement remboursé.
@@ -256,6 +269,64 @@ Si la confirmation de commande échoue après paiement réussi :
 
 L’interface frontend/admin n’est pas implémentée ici. Le service payments expose les informations nécessaires pour afficher un message client et alerter le staff/admin.
 
+## Garantie de paiement (empreinte bancaire)
+
+Une **livraison** peut être payée à la remise (espèces ou carte) à condition que le client laisse une
+**empreinte bancaire** : le total de la commande est pré-autorisé sur sa carte (PaymentIntent à capture
+manuelle, `capture_method=manual`). Rien n'est débité tant que le restaurant ne capture pas. Code :
+`app/modules/payments/guarantee.py`.
+
+### Cycle de vie
+
+| Étape | Paiement (`purpose='guarantee'`) | `orders.payment_status` |
+|---|---|---|
+| Intent créé (`POST /payments/guarantee-intent`) | `pending` | `pending` |
+| Carte pré-autorisée (webhook `payment_intent.amount_capturable_updated` ou `POST /payments/confirm`) | `authorized` | `guaranteed`, la commande passe `confirmed` |
+| Livraison réussie, client paie en espèces (`/guarantee/cash-collected`) | `released` + un paiement `cash` `paid` | `paid` |
+| Livraison réussie, carte débitée (`/guarantee/capture`, montant total) | `paid` | `paid` |
+| Échec de livraison de la faute du client (`/guarantee/capture`, montant partiel ou total) | `paid` (`captured_amount` = montant débité) | `guarantee_captured` (partiel) ou `paid` |
+| Annulation, rejet, ou décision de ne rien débiter (`/guarantee/release`) | `released` | `guarantee_released` |
+| Blocage expiré chez Stripe (~7 jours) ou annulé dans Stripe (`payment_intent.canceled`) | `released` | `guarantee_released` |
+
+Règles imposées par le serveur :
+
+- la confirmation d'une commande exige `paid`, ou `guaranteed` **et** livraison ; une commande `guaranteed` ne
+  peut pas passer `delivered` avant règlement (`PAYMENT_SETTLEMENT_REQUIRED`, 409) ;
+- annuler ou rejeter une commande `guaranteed` libère l'empreinte (au mieux : en cas d'échec Stripe l'annulation
+  de la commande n'est jamais bloquée, le blocage expire seul) ;
+- capturer exige un **motif** et le rôle **admin** ; le montant ne peut pas dépasser l'empreinte
+  (`INVALID_CAPTURE_AMOUNT`) ; la capture partielle libère le reste côté Stripe ;
+- un blocage n'est marqué `released` qu'après confirmation Stripe (annulation idempotente) ;
+- si le stock manque à la confirmation, l'empreinte est annulée automatiquement et le staff est alerté
+  (`staff_alert`), rien n'est débité ;
+- l'encaissement en espèces est enregistré comme un vrai paiement `cash` (comptabilité, remboursements) ;
+- le montant encaissé réel (`captured_amount` pour une garantie) alimente `summary`, le détail et le plafond de
+  remboursement.
+
+### Conditions affichées au client
+
+`GET /payments/guarantee-terms` renvoie la politique (version, cas de débit, durée de validité). L'app l'affiche
+et renvoie `terms_version` + `accept_terms=true` ; une version périmée est refusée (409
+`GUARANTEE_TERMS_OUTDATED`), une acceptation absente aussi (422 `GUARANTEE_TERMS_NOT_ACCEPTED`). La version et
+l'horodatage d'acceptation sont conservés sur le paiement (`guarantee_terms_version`,
+`guarantee_terms_accepted_at`). **Le libellé juridique est à faire valider avant la production.**
+
+### Lien de paiement (commande saisie au comptoir)
+
+`POST /payments/{order_id}/link` (`mode` = `full` ou `guarantee`) crée une session Stripe Checkout (valide
+60 minutes) et envoie le lien par SMS et/ou email ; le lien est toujours renvoyé pour que le staff puisse le
+transmettre autrement. Un seul lien actif par commande (les précédents sont expirés). La commande saisie via
+`POST /orders/manual` avec `payment.method = "payment_link"` reste `pending` jusqu'au webhook. Une livraison
+payée `cash` au comptoir est refusée (`DELIVERY_CASH_REQUIRES_GUARANTEE`) : l'argent n'est pas encore encaissé.
+Pages publiques `GET /payments/public/link-done` (succès/annulation, statiques, sans donnée de commande).
+
+### Événements Stripe à activer sur le webhook
+
+Ajouter à l'endpoint existant (plateforme **et** Connect) : `payment_intent.amount_capturable_updated`,
+`checkout.session.completed`, `checkout.session.expired` (en plus de `payment_intent.succeeded`,
+`payment_intent.payment_failed`, `payment_intent.canceled`, `charge.refunded`, `charge.dispute.created`).
+Sans `amount_capturable_updated`, une empreinte posée par lien n'est finalisée que par `POST /payments/confirm`.
+
 ## Sécurité webhook
 
 Le webhook :
@@ -274,9 +345,13 @@ Métadonnées Stripe attendues :
 {
   "tenant_slug": "tenant-a",
   "order_id": "123",
-  "payment_id": "456"
+  "payment_id": "456",
+  "purpose": "guarantee"
 }
 ```
+
+`purpose` n'est présent que pour une garantie ; il est vérifié à la finalisation avec le montant, la devise, le
+mode de capture et le statut `requires_capture`.
 
 ## Règles de remboursement
 
@@ -398,6 +473,12 @@ Note sur la suite complète :
 
 ## Limites connues
 
+- Garantie : France / Stripe uniquement (la Serbie dépend d'un autre prestataire, hors périmètre).
+- Garantie : une pré-autorisation expire chez la banque au bout de ~7 jours ; une livraison programmée plus tard
+  que cela n'est pas couverte.
+- Garantie : le libellé des conditions (cas de débit) n'a pas reçu de validation juridique.
+- Lien de paiement : comportement de Checkout avec un compte Connect non vérifié contre un vrai compte Stripe ;
+  l'envoi SMS dépend de la configuration SMS du tenant.
 - Le cleanup n’est pas encore branché à ARQ/cron.
 - L’onboarding Stripe Connect UI/API est hors scope de ce module ; payments consomme seulement `stripe_account_id`.
 - Le lien de reçu dépend de la présence de `latest_charge.receipt_url` côté Stripe.

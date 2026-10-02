@@ -57,6 +57,18 @@ API (webhook manqué — Stripe down, erreur 500 transitoire, etc.).
    pour les events Connect, vérifier que `STRIPE_WEBHOOK_CONNECT_SECRET` est bien défini sur Railway
    et correspond au signing secret de l'endpoint webhook Connect du Dashboard Stripe (distinct de
    celui de l'endpoint plateforme, même si les deux endpoints pointent vers la même URL).
+6. **Empreinte bancaire (livraison payée à la remise)** : l'endpoint doit aussi recevoir
+   `payment_intent.amount_capturable_updated`, `checkout.session.completed` et
+   `checkout.session.expired` (sur l'endpoint plateforme **et** Connect). Sans le premier, une empreinte
+   posée par lien de paiement n'est finalisée que lorsque l'app appelle `POST /payments/confirm`.
+   Détail et cycle de vie : `docs/modules/payments.md`, section « Garantie de paiement ».
+   - **Empreinte restée `authorized` alors que la commande est annulée** (l'annulation Stripe a échoué à ce
+     moment-là) : `POST /api/v1/payments/{order_id}/guarantee/release`, ou annuler le PaymentIntent dans le
+     Dashboard Stripe (le webhook `payment_intent.canceled` la marque alors `released`). Sans action, la banque
+     la libère d'elle-même au bout d'environ 7 jours.
+   - **Débiter un client** (échec de livraison de son fait) : administrateur uniquement,
+     `POST /api/v1/payments/{order_id}/guarantee/capture` avec un motif ; jamais depuis le Dashboard Stripe si
+     possible (l'API trace le motif, l'auteur et le montant).
 
 ---
 

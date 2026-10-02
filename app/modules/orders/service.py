@@ -931,17 +931,48 @@ async def create_manual_order(
             .where(Payment.order_id == existing_order.id)
             .order_by(Payment.created_at.desc(), Payment.id.desc())
         )
-        if payment is None:
+        awaiting_link = existing_order.status == "pending" and (
+            payment is None or payment.status == "pending"
+        )
+        if payment is None and not awaiting_link:
             raise AppError("PAYMENT_NOT_FOUND", "Manual order payment not found", 409)
+        link = None
+        if awaiting_link:
+            from app.modules.payments import guarantee as _guarantee
+
+            link = await _guarantee.get_payment_link(session, tenant_slug, existing_order.id)
         return {
             "order": await _serialize_order_detail(session, existing_order),
-            "payment": _payment_payload(payment),
+            "payment": _payment_payload(payment) if payment is not None and not awaiting_link else None,
             "receipt": await build_receipt(session, existing_order.id),
+            "payment_link": link,
         }
 
     payment_body = body.payment
-    if payment_body.method not in MANUAL_PAYMENT_PROVIDERS:
+    if payment_body.method not in MANUAL_PAYMENT_PROVIDERS | {"payment_link"}:
         raise AppError("INVALID_PAYMENT_METHOD", "Unsupported manual payment method", 422, "payment.method")
+    is_delivery = getattr(body, "order_type", "delivery") == "delivery"
+    if is_delivery and payment_body.method == "cash":
+        # Especes non encore encaissees : on ne peut pas declarer la commande payee. Le client
+        # laisse une empreinte bancaire (lien) puis paie a la remise.
+        raise AppError(
+            "DELIVERY_CASH_REQUIRES_GUARANTEE",
+            "Une livraison payee en especes exige une empreinte bancaire : utilisez un lien de paiement.",
+            422,
+            "payment.method",
+        )
+    if payment_body.method == "payment_link" and getattr(body, "order_type", "delivery") == "dine_in":
+        raise AppError(
+            "PAYMENT_LINK_UNSUPPORTED",
+            "Lien de paiement indisponible pour une commande sur place.",
+            422,
+            "payment.method",
+        )
+    link_mode = payment_body.link_mode or ("guarantee" if is_delivery else "full")
+    if payment_body.method == "payment_link" and link_mode == "guarantee" and not is_delivery:
+        raise AppError(
+            "GUARANTEE_DELIVERY_ONLY", "L'empreinte ne concerne que les livraisons.", 422, "payment.link_mode"
+        )
 
     customer = body.customer
     loyalty_customer_id = getattr(body, "loyalty_customer_id", None) or getattr(body, "loyalty_user_id", None)
@@ -960,36 +991,62 @@ async def create_manual_order(
             commit=False,
             skip_idempotency_lookup=True,
         )
-        payment = Payment(
-            order_id=order.id,
-            provider=payment_body.method,
-            provider_payment_id=payment_body.external_reference,
-            external_reference=payment_body.external_reference,
-            amount=order.total,
-            amount_received=payment_body.amount_received,
-            currency="EUR",
-            status="paid",
-            created_by_user_id=actor_user_id,
-        )
-        session.add(payment)
-        order.payment_status = "paid"
-        await session.flush()
-        if order.status == "pending":
-            await update_status(
-                session,
-                order.id,
-                "confirmed",
-                body.note or f"Manual payment: {payment_body.method}",
-                tenant_slug=tenant_slug,
-                arq_pool=arq_pool,
-                actor_user_id=actor_user_id,
-                is_staff=True,
-            )
-        else:
+        if payment_body.method == "payment_link":
+            # Commande creee « en attente » : elle est confirmee par le webhook Stripe quand le
+            # client valide le lien (paiement ou empreinte).
+            payment = None
             await session.commit()
+        else:
+            payment = Payment(
+                order_id=order.id,
+                provider=payment_body.method,
+                provider_payment_id=payment_body.external_reference,
+                external_reference=payment_body.external_reference,
+                amount=order.total,
+                amount_received=payment_body.amount_received,
+                currency="EUR",
+                status="paid",
+                created_by_user_id=actor_user_id,
+            )
+            session.add(payment)
+            order.payment_status = "paid"
+            await session.flush()
+            if order.status == "pending":
+                await update_status(
+                    session,
+                    order.id,
+                    "confirmed",
+                    body.note or f"Manual payment: {payment_body.method}",
+                    tenant_slug=tenant_slug,
+                    arq_pool=arq_pool,
+                    actor_user_id=actor_user_id,
+                    is_staff=True,
+                )
+            else:
+                await session.commit()
     except Exception:
         await session.rollback()
         raise
+
+    payment_link = None
+    payment_link_error = None
+    if payment_body.method == "payment_link":
+        from app.modules.payments import guarantee as _guarantee
+
+        try:
+            payment_link = await _guarantee.create_payment_link(
+                session,
+                tenant_slug,
+                order.id,
+                mode=link_mode,
+                actor_user_id=actor_user_id,
+                arq_pool=arq_pool,
+            )
+        except AppError as exc:
+            payment_link_error = exc.code
+        except Exception:
+            logger.exception("payment link creation failed for manual order_id=%s", order.id)
+            payment_link_error = "PAYMENT_LINK_FAILED"
 
     if order.user_id is not None and order.payment_status == "paid" and order.status in {"confirmed", "queued"}:
         try:
@@ -1009,11 +1066,14 @@ async def create_manual_order(
             )
 
     await session.refresh(order)
-    await session.refresh(payment)
+    if payment is not None:
+        await session.refresh(payment)
     return {
         "order": await _serialize_order_detail(session, order),
-        "payment": _payment_payload(payment),
+        "payment": _payment_payload(payment) if payment is not None else None,
         "receipt": await build_receipt(session, order.id),
+        "payment_link": payment_link,
+        "payment_link_error": payment_link_error,
     }
 
 
@@ -1599,8 +1659,20 @@ async def update_status(
             "note",
         )
 
-    if status == "confirmed" and (getattr(order, "payment_status", None) or "pending") != "paid":
+    current_payment_status = getattr(order, "payment_status", None) or "pending"
+    # « guaranteed » : livraison payee a la remise, carte pre-autorisee (voir payments/guarantee.py).
+    if status == "confirmed" and not (
+        current_payment_status == "paid"
+        or (current_payment_status == "guaranteed" and order.order_type == "delivery")
+    ):
         raise AppError("PAYMENT_REQUIRED", "Order must be paid before confirmation", 409, "payment_status")
+    if status == "delivered" and current_payment_status == "guaranteed":
+        raise AppError(
+            "PAYMENT_SETTLEMENT_REQUIRED",
+            "Enregistrez le reglement (especes ou carte) avant de marquer la commande livree.",
+            409,
+            "payment_status",
+        )
 
     # Validate the transition using the ORIGINAL requested status before any redirect.
     is_graph_transition = status in VALID_TRANSITIONS.get(previous_status, set())
@@ -1662,6 +1734,23 @@ async def update_status(
 
     await session.commit()
     await session.refresh(order)
+
+    # Empreinte bancaire : une commande annulee ou rejetee libere la pre-autorisation (jamais
+    # bloquant : en cas d'echec Stripe, l'empreinte expire d'elle-meme au bout de 7 jours).
+    if actual_status in {"cancelled", "rejected"} and (
+        getattr(order, "payment_status", None) == "guaranteed"
+    ):
+        from app.modules.payments import guarantee as _guarantee
+
+        await _guarantee.release_guarantee(
+            session,
+            tenant_slug or "default",
+            order_id,
+            reason=f"order_{actual_status}",
+            user_id=actor_user_id,
+            best_effort=True,
+        )
+        await session.refresh(order)
 
     # Enqueue alerte stock post-commit (non bloquant, erreur ignoree).
     if arq_pool is not None and low_stock:

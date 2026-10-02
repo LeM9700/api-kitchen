@@ -29,6 +29,11 @@ class PaymentOut(BaseModel):
     status: str
     created_by_user_id: int | None = None
     receipt_url: str | None = None
+    # 'sale' | 'guarantee' (empreinte bancaire). captured_amount : montant reellement debite.
+    purpose: str = "sale"
+    captured_amount: float | None = None
+    settled_at: datetime | None = None
+    settlement_note: str | None = None
 
 
 class TerminalConnectionTokenOut(BaseModel):
@@ -93,6 +98,55 @@ class RefundOut(BaseModel):
     created_at: datetime
 
 
+class GuaranteeTermsOut(BaseModel):
+    version: str
+    hold_amount: str
+    charged_on: list[str]
+    released_otherwise: bool
+    hold_validity_days: int
+
+
+class GuaranteeIntentRequest(BaseModel):
+    order_id: int
+    # Version des conditions affichees au client ; refusee si perimee (409).
+    terms_version: str = Field(..., min_length=1, max_length=32)
+    accept_terms: bool
+
+
+class GuaranteeIntentOut(BaseModel):
+    client_secret: str
+    payment: "PaymentOut"
+    terms_version: str
+
+
+class GuaranteeCaptureRequest(BaseModel):
+    # Centimes ; None = tout l'empreinte.
+    amount: int | None = Field(None, gt=0)
+    reason: str = Field(..., min_length=1, max_length=256)
+
+
+class GuaranteeReleaseRequest(BaseModel):
+    reason: str = Field("released_by_staff", min_length=1, max_length=256)
+
+
+class GuaranteeCashRequest(BaseModel):
+    amount_received: float | None = Field(None, gt=0)
+
+
+class PaymentLinkRequest(BaseModel):
+    # 'full' : paiement en ligne immediat ; 'guarantee' : empreinte, reglement a la livraison.
+    mode: str = Field("full", pattern="^(full|guarantee)$")
+
+
+class PaymentLinkOut(BaseModel):
+    url: str
+    expires_at: datetime | None = None
+    mode: str
+    payment_id: int
+    sent_by_sms: bool = False
+    sent_by_email: bool = False
+
+
 class PaymentFinalizeOut(BaseModel):
     payment: PaymentOut
     order_confirmed: bool
@@ -128,6 +182,8 @@ class PaymentListItemOut(BaseModel):
     created_by_user_id: int | None = None
     created_at: datetime | None = None
     refunded_amount_cents: int = 0
+    purpose: str = "sale"
+    captured_amount: float | None = None
 
 
 class PaymentSummaryOut(BaseModel):
