@@ -140,7 +140,10 @@ async def get_settings(current_user=Depends(require_role("staff", "admin"))):
         row = await service.get_delivery_settings(session)
         await session.commit()
         return DeliverySettingsOut(
-            internal_enabled=row.internal_enabled, version=row.version, updated_at=row.updated_at
+            internal_enabled=row.internal_enabled,
+            driver_dispatch_enabled=row.driver_dispatch_enabled,
+            version=row.version,
+            updated_at=row.updated_at,
         )
 
 
@@ -152,6 +155,7 @@ async def update_settings(
         row = await service.update_delivery_settings(
             session,
             internal_enabled=body.internal_enabled,
+            driver_dispatch_enabled=body.driver_dispatch_enabled,
             expected_version=body.expected_version,
             user_id=int(current_user["id"]),
             user_email=current_user.get("email"),
@@ -159,7 +163,10 @@ async def update_settings(
             user_agent=request.headers.get("user-agent"),
         )
         return DeliverySettingsOut(
-            internal_enabled=row.internal_enabled, version=row.version, updated_at=row.updated_at
+            internal_enabled=row.internal_enabled,
+            driver_dispatch_enabled=row.driver_dispatch_enabled,
+            version=row.version,
+            updated_at=row.updated_at,
         )
 
 
@@ -230,3 +237,9 @@ async def reverse_geocode(
     """Coordonnees -> adresse la plus proche (``null`` si aucune)."""
     result = await geocoding.reverse_geocode(lat, lng, language=language)
     return GeocodeResultOut(**result.as_dict()) if result else None
+
+
+# Livreurs et dispatch comptoir (phase 3) : memes prefixe `/delivery`.
+from app.modules.delivery.dispatch_router import router as _dispatch_router  # noqa: E402
+
+router.include_router(_dispatch_router)

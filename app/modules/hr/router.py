@@ -48,7 +48,7 @@ async def list_employees(
 
 @router.get("/employees/me", response_model=EmployeeProfileSelfOut)
 async def get_my_employee_profile(
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> EmployeeProfileSelfOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -110,7 +110,7 @@ async def list_shifts_endpoint(
 async def list_my_shifts_endpoint(
     date_from: datetime | None = None,
     date_to: datetime | None = None,
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> list[ShiftOut]:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -125,7 +125,7 @@ async def list_my_shifts_endpoint(
 async def clock_in_endpoint(
     body: ClockInRequest,
     request: Request,
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> TimeClockEntryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -257,7 +257,7 @@ async def export_time_clock_endpoint(
 @router.post("/timeclock/clock-out", response_model=TimeClockEntryOut)
 async def clock_out_endpoint(
     request: Request,
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> TimeClockEntryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -275,7 +275,7 @@ async def clock_out_endpoint(
 
 @router.post("/timeclock/break/start", response_model=TimeClockEntryOut)
 async def start_break_endpoint(
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> TimeClockEntryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -288,7 +288,7 @@ async def start_break_endpoint(
 
 @router.post("/timeclock/break/end", response_model=TimeClockEntryOut)
 async def end_break_endpoint(
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> TimeClockEntryOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -302,7 +302,7 @@ async def end_break_endpoint(
 @router.post("/alerts/late-report", response_model=HrAlertOut, status_code=201)
 async def report_late_endpoint(
     body: LateReportRequest,
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> HrAlertOut:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(
@@ -336,7 +336,7 @@ async def list_time_clock_entries_endpoint(
 async def list_my_time_clock_entries_endpoint(
     date_from: datetime | None = None,
     date_to: datetime | None = None,
-    current_user: dict = Depends(require_role("staff", "admin")),
+    current_user: dict = Depends(require_role("staff", "admin", "driver")),
 ) -> list[TimeClockEntryOut]:
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         profile = await hr_service.get_employee_profile_by_user_id(

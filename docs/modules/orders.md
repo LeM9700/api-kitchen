@@ -107,6 +107,10 @@ Valeurs de `payment_status` liees a l'empreinte bancaire (voir `docs/modules/pay
 
 Annuler ou rejeter une commande `guaranteed` libere l'empreinte automatiquement (jamais bloquant).
 
+**Livraison par livreur** (voir `docs/modules/delivery.md`) : quand `driver_dispatch_enabled` est actif,
+`ready -> out_for_delivery` exige un livreur assigne (409 `DRIVER_REQUIRED`, sans rien modifier). Depart, livraison,
+annulation, rejet et echec mettent a jour la livraison dans la meme transaction que le statut de la commande.
+
 ## Comportements metier
 
 **Creation (`POST /orders`)**

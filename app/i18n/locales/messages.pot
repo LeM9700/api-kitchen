@@ -157,3 +157,30 @@ msgstr ""
 #, python-brace-format
 msgid "We could not deliver your order #{order_id}. The restaurant will contact you."
 msgstr ""
+
+#: app/modules/orders/service.py
+msgid "Order ready"
+msgstr ""
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your order #{order_id} is ready and will leave with a driver shortly."
+msgstr ""
+
+#: app/modules/orders/service.py
+msgid "Your driver is on the way"
+msgstr ""
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your order #{order_id} has left the restaurant."
+msgstr ""
+
+#: app/modules/orders/service.py
+msgid "Your driver has arrived"
+msgstr ""
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your driver is at your address with order #{order_id}."
+msgstr ""

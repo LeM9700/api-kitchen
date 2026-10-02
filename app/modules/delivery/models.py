@@ -107,6 +107,12 @@ class RestaurantDeliverySettings(Base):
     display_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     independent_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     internal_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Dispatch par livreurs : quand il est actif, `ready -> out_for_delivery` exige un livreur
+    # assigne (impose par orders.update_status). Coupe par defaut : un restaurant qui n'a pas
+    # encore de livreurs enregistres continue de partir en livraison comme avant.
+    driver_dispatch_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     pickup_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     internal_delivery_fee: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     internal_delivery_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -135,3 +141,100 @@ class RestaurantDeliverySettingsAudit(Base):
     new_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# --------------------------------------------------------------------------- livreurs (phase 3)
+
+
+class DriverProfile(Base):
+    """Livreur salarie du restaurant. Le compte est un ``users`` de role ``driver`` (aucun acces
+    hors pointage et livraisons, impose cote API par ``require_role``). Le pointage passe par
+    l'``EmployeeProfile`` du meme utilisateur (module RH)."""
+
+    __tablename__ = "driver_profiles"
+    __table_args__ = (Index("ix_driver_profiles_establishment_id", "establishment_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    # Un livreur travaille pour un seul etablissement (celui de son profil employe).
+    establishment_id: Mapped[int] = mapped_column(ForeignKey("establishments.id"), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    vehicle: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Inactif : ne recoit plus de livraison et n'a plus acces a l'ecran de livraison.
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliveryRun(Base):
+    """Tournee : les livraisons que le livreur emmene en un seul depart."""
+
+    __tablename__ = "delivery_runs"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'completed')", name="ck_delivery_runs_status"),
+        Index("ix_delivery_runs_driver_id_status", "driver_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("driver_profiles.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# Statuts « vivants » d'une livraison : une commande n'a qu'une livraison vivante a la fois.
+DELIVERY_ACTIVE_STATUSES = ("assigned", "out_for_delivery", "arrived")
+
+
+class Delivery(Base):
+    """Livraison d'une commande a un livreur. Suit le statut de la commande (voir
+    ``delivery/lifecycle.py``) ; ``arrived`` est propre a la livraison."""
+
+    __tablename__ = "deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('assigned', 'out_for_delivery', 'arrived', 'delivered', 'failed', 'cancelled')",
+            name="ck_deliveries_status",
+        ),
+        Index("ix_deliveries_driver_id_status", "driver_id", "status"),
+        Index("ix_deliveries_order_id", "order_id"),
+        Index(
+            "uq_deliveries_one_active_per_order",
+            "order_id",
+            unique=True,
+            postgresql_where=text("status IN ('assigned', 'out_for_delivery', 'arrived')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("driver_profiles.id"), nullable=False)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_runs.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="assigned", server_default="assigned")
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    assigned_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    departed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliveryEvent(Base):
+    """Journal d'une livraison (qui a attribue, reattribue, retire, parti, arrive, livre)."""
+
+    __tablename__ = "delivery_events"
+    __table_args__ = (Index("ix_delivery_events_order_id", "order_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    delivery_id: Mapped[int | None] = mapped_column(ForeignKey("deliveries.id"), nullable=True)
+    order_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    driver_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    event: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    note: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

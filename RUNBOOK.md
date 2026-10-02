@@ -72,6 +72,25 @@ API (webhook manqué — Stripe down, erreur 500 transitoire, etc.).
 
 ---
 
+## 2bis. Livraison : livreur ou livraison bloques
+
+- **Un livreur ne peut pas recevoir de commande** : il doit avoir **pointe** (`DRIVER_NOT_CLOCKED_IN`). Corriger le pointage
+  dans l'app (RH, correction admin) puis reattribuer.
+- **Une commande ne part pas** (409 `DRIVER_REQUIRED`) : le dispatch est actif, assigner un livreur depuis l'ecran Dispatch.
+  Pour rouvrir le depart libre en urgence : couper `driver_dispatch_enabled` (page Dispatch, administrateur, ou
+  `PUT /api/v1/delivery/settings`). Aucune donnee n'est perdue.
+- **Livreur parti avec une commande puis injoignable** : le comptoir ne peut plus reattribuer (`DELIVERY_ALREADY_STARTED`).
+  Declarer l'echec de livraison (motif obligatoire) ou annuler la commande : la livraison se cloture toute seule.
+- **Livraison restee `out_for_delivery` apres une panne** : l'etat de la commande fait foi ; le statut de la livraison suit
+  `orders.update_status`. Ne jamais modifier `deliveries` a la main sans modifier la commande.
+- **Desactiver un livreur** : refuse tant qu'il a des livraisons vivantes (retirer ou reattribuer d'abord). La desactivation
+  du profil ne ferme pas son compte ; pour couper aussi la connexion, desactiver l'utilisateur depuis l'administration.
+- **Rollback de la migration `0076`** : `alembic downgrade 0075` supprime les tables livreurs/livraisons (donnees perdues).
+  Sur une base avec beaucoup de schemas tenant, une seule transaction peut echouer (`out of shared memory`, voir
+  `max_locks_per_transaction`) : dans ce cas supprimer schema par schema puis `alembic stamp 0075`.
+
+---
+
 ## 3. Redémarrer le worker ARQ
 
 **Symptôme** : jobs qui ne se traitent plus (emails non envoyés, alertes stock absentes, cron

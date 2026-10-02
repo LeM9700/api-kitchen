@@ -13,6 +13,7 @@ from app.core.http.schemas import PaginationParams
 from app.core.i18n.translate import t
 from app.modules.admin.tenants.models import TenantConfig
 from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
+from app.modules.delivery import lifecycle as delivery_lifecycle
 from app.modules.delivery import service as delivery_service
 from app.modules.delivery.models import DeliveryZone
 from app.modules.hr.models import Establishment
@@ -1326,8 +1327,15 @@ async def update_station_preparation(
                 tenant_slug=_effective_tenant,
                 user_id=order.user_id,
                 event="order.ready",
-                title=t("Ready for pickup"),
-                body=t("Your order #{order_id} is ready!", order_id=order_id),
+                title=t("Order ready") if order.order_type == "delivery" else t("Ready for pickup"),
+                body=(
+                    t(
+                        "Your order #{order_id} is ready and will leave with a driver shortly.",
+                        order_id=order_id,
+                    )
+                    if order.order_type == "delivery"
+                    else t("Your order #{order_id} is ready!", order_id=order_id)
+                ),
                 data={"order_id": order_id},
             )
         except Exception as exc:
@@ -1666,6 +1674,9 @@ async def update_status(
         or (current_payment_status == "guaranteed" and order.order_type == "delivery")
     ):
         raise AppError("PAYMENT_REQUIRED", "Order must be paid before confirmation", 409, "payment_status")
+    if status == "out_for_delivery" and authority == TransitionAuthority.INTERNAL:
+        # Dispatch actif : pas de depart sans livreur assigne (voir delivery/lifecycle.py).
+        await delivery_lifecycle.ensure_driver_for_departure(session, order)
     if status == "delivered" and current_payment_status == "guaranteed":
         raise AppError(
             "PAYMENT_SETTLEMENT_REQUIRED",
@@ -1711,6 +1722,14 @@ async def update_status(
     session.add(
         OrderStatusHistory(order_id=order.id, status=actual_status, note=note, authority=authority.value)
     )
+
+    # La livraison suit la commande dans la meme transaction : elle ne peut pas diverger.
+    if actual_status == "out_for_delivery":
+        await delivery_lifecycle.on_departure(session, order, actor_user_id)
+    elif actual_status == "delivered":
+        await delivery_lifecycle.on_delivered(session, order, actor_user_id)
+    elif actual_status in {"cancelled", "rejected", "delivery_failed"}:
+        await delivery_lifecycle.on_order_closed(session, order, actual_status, actor_user_id)
 
     low_stock: list = []
 
@@ -1815,9 +1834,29 @@ async def update_status(
                 "staff_title": None,
                 "staff_body": None,
             },
-            ("preparing", "ready"): {
-                "client_title": t("Ready for pickup"),
-                "client_body": t("Your order #{order_id} is ready!", order_id=order_id),
+            ("preparing", "ready"): (
+                {
+                    "client_title": t("Order ready"),
+                    "client_body": t(
+                        "Your order #{order_id} is ready and will leave with a driver shortly.",
+                        order_id=order_id,
+                    ),
+                    "staff_title": None,
+                    "staff_body": None,
+                }
+                if order.order_type == "delivery"
+                else {
+                    "client_title": t("Ready for pickup"),
+                    "client_body": t("Your order #{order_id} is ready!", order_id=order_id),
+                    "staff_title": None,
+                    "staff_body": None,
+                }
+            ),
+            ("ready", "out_for_delivery"): {
+                "client_title": t("Your driver is on the way"),
+                "client_body": t(
+                    "Your order #{order_id} has left the restaurant.", order_id=order_id
+                ),
                 "staff_title": None,
                 "staff_body": None,
             },

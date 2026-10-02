@@ -373,6 +373,7 @@ async def update_delivery_settings(
     session: AsyncSession,
     *,
     internal_enabled: bool,
+    driver_dispatch_enabled: bool | None = None,
     expected_version: int,
     user_id: int,
     user_email: str | None,
@@ -399,6 +400,33 @@ async def update_delivery_settings(
             )
         )
         row.internal_enabled = internal_enabled
+        row.version = row.version + 1
+    if driver_dispatch_enabled is not None and row.driver_dispatch_enabled != driver_dispatch_enabled:
+        if driver_dispatch_enabled:
+            # Activer le dispatch sans livreur bloquerait tous les departs en livraison.
+            from app.modules.delivery.models import DriverProfile
+
+            has_driver = await session.scalar(
+                select(DriverProfile.id).where(DriverProfile.is_active.is_(True)).limit(1)
+            )
+            if has_driver is None:
+                raise AppError(
+                    "NO_ACTIVE_DRIVER",
+                    "Creez au moins un livreur actif avant d'activer le dispatch par livreurs.",
+                    409,
+                )
+        session.add(
+            RestaurantDeliverySettingsAudit(
+                changed_by_user_id=user_id,
+                user_email=user_email,
+                field_name="driver_dispatch_enabled",
+                old_value=str(row.driver_dispatch_enabled).lower(),
+                new_value=str(driver_dispatch_enabled).lower(),
+                ip_address=(ip_address or "")[:45] or None,
+                user_agent=user_agent,
+            )
+        )
+        row.driver_dispatch_enabled = driver_dispatch_enabled
         row.version = row.version + 1
     await session.commit()
     await session.refresh(row)

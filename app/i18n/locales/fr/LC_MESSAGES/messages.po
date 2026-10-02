@@ -171,3 +171,30 @@ msgstr "Échec de la livraison"
 #, python-brace-format
 msgid "We could not deliver your order #{order_id}. The restaurant will contact you."
 msgstr "Nous n'avons pas pu livrer votre commande #{order_id}. Le restaurant va vous contacter."
+
+#: app/modules/orders/service.py
+msgid "Order ready"
+msgstr "Commande prête"
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your order #{order_id} is ready and will leave with a driver shortly."
+msgstr "Votre commande #{order_id} est prête et partira bientôt avec un livreur."
+
+#: app/modules/orders/service.py
+msgid "Your driver is on the way"
+msgstr "Votre livreur est en route"
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your order #{order_id} has left the restaurant."
+msgstr "Votre commande #{order_id} a quitté le restaurant."
+
+#: app/modules/orders/service.py
+msgid "Your driver has arrived"
+msgstr "Votre livreur est arrivé"
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your driver is at your address with order #{order_id}."
+msgstr "Votre livreur est devant chez vous avec la commande #{order_id}."

@@ -234,12 +234,16 @@ class GeocodeResultOut(BaseModel):
 
 class DeliverySettingsOut(BaseModel):
     internal_enabled: bool
+    # Dispatch par livreurs : `ready -> out_for_delivery` exige un livreur assigne.
+    driver_dispatch_enabled: bool = False
     version: int
     updated_at: datetime | None = None
 
 
 class DeliverySettingsUpdate(BaseModel):
     internal_enabled: bool
+    # Absent : inchange (les anciennes apps n'envoient que `internal_enabled`).
+    driver_dispatch_enabled: bool | None = None
     # Concurrence optimiste : refuse l'ecriture si quelqu'un a modifie les reglages entre-temps.
     expected_version: int = Field(..., ge=1)
 
