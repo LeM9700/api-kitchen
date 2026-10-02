@@ -15,19 +15,24 @@ from app.core.database import get_tenant_session
 from app.core.http.deps import get_arq_pool, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.modules.delivery import dispatch_service as svc
+from app.modules.delivery import failures as failures_svc
 from app.modules.delivery.dispatch_schemas import (
     AssignRequest,
     DeliverRequest,
+    DeliverWithoutCodeRequest,
     DeliveryActionOut,
     DepartRequest,
     DispatchBoardOut,
     DriverCreate,
     DriverCreatedOut,
     DriverDeliveryOut,
+    DriverFailureRequest,
+    FailureOut,
     DriverMeOut,
     DriverOut,
     DriverRecapOut,
     DriverUpdate,
+    ResolveFailureRequest,
     UnassignRequest,
 )
 
@@ -192,6 +197,7 @@ async def driver_delivered(
             driver,
             delivery_id,
             cash_received=body.cash_received if body else None,
+            code=body.code if body else None,
             user_id=int(current_user["id"]),
             tenant_slug=current_user["tenant_slug"],
             arq_pool=arq_pool,
@@ -206,3 +212,93 @@ async def driver_recap(
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         driver = await svc.get_driver_for_user(session, int(current_user["id"]))
         return await svc.driver_recap(session, driver, day)
+
+
+@router.post("/driver/deliveries/{delivery_id}/failed", response_model=FailureOut, status_code=201)
+@limiter.limit("30/minute")
+async def driver_failed(
+    request: Request,
+    delivery_id: int,
+    body: DriverFailureRequest,
+    current_user=Depends(require_role("driver")),
+    arq_pool=Depends(get_arq_pool),
+):
+    """Le livreur declare l'echec de la livraison (motif, appels passes). Un administrateur statue ensuite."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        failure = await failures_svc.report_failure(
+            session,
+            driver,
+            delivery_id,
+            reason=body.reason,
+            note=body.note,
+            call_attempts=body.call_attempts,
+            user_id=int(current_user["id"]),
+            tenant_slug=current_user["tenant_slug"],
+            arq_pool=arq_pool,
+        )
+        (item,) = [
+            f
+            for f in await failures_svc.list_failures(session, None)
+            if f["id"] == failure.id
+        ]
+        return item
+
+
+# --------------------------------------------------------------------------- echecs a traiter
+
+
+@router.get("/failures", response_model=list[FailureOut])
+async def list_failures(
+    status: str | None = Query("pending", pattern="^(pending|resolved)$"),
+    current_user=Depends(require_permission("orders:read", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await failures_svc.list_failures(session, status)
+
+
+@router.post("/failures/{failure_id}/resolve", response_model=FailureOut)
+@limiter.limit("30/minute")
+async def resolve_failure(
+    request: Request,
+    failure_id: int,
+    body: ResolveFailureRequest,
+    current_user=Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
+):
+    """Rembourser, retenir des frais (faute du client uniquement) ou relivrer. Administrateur uniquement."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await failures_svc.resolve_failure(
+            session,
+            failure_id,
+            action=body.action,
+            amount_cents=body.amount,
+            note=body.note,
+            admin_user_id=int(current_user["id"]),
+            tenant_slug=current_user["tenant_slug"],
+            arq_pool=arq_pool,
+        )
+        (item,) = [f for f in await failures_svc.list_failures(session, None) if f["id"] == failure_id]
+        return item
+
+
+@router.post("/dispatch/orders/{order_id}/deliver-without-code", response_model=DeliveryActionOut)
+@limiter.limit("20/minute")
+async def deliver_without_code(
+    request: Request,
+    order_id: int,
+    body: DeliverWithoutCodeRequest,
+    current_user=Depends(require_role("admin")),
+    arq_pool=Depends(get_arq_pool),
+):
+    """Conclut une livraison sans le code du client. Administrateur uniquement, motif obligatoire, journalise."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        delivery = await svc.admin_deliver_without_code(
+            session,
+            order_id=order_id,
+            reason=body.reason,
+            admin_user_id=int(current_user["id"]),
+            tenant_slug=current_user["tenant_slug"],
+            arq_pool=arq_pool,
+        )
+        return _action(delivery)

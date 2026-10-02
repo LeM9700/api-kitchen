@@ -142,6 +142,9 @@ async def get_settings(current_user=Depends(require_role("staff", "admin"))):
         return DeliverySettingsOut(
             internal_enabled=row.internal_enabled,
             driver_dispatch_enabled=row.driver_dispatch_enabled,
+            delivery_proof_required=row.delivery_proof_required,
+            failure_min_wait_minutes=row.failure_min_wait_minutes,
+            failure_min_call_attempts=row.failure_min_call_attempts,
             version=row.version,
             updated_at=row.updated_at,
         )
@@ -156,6 +159,9 @@ async def update_settings(
             session,
             internal_enabled=body.internal_enabled,
             driver_dispatch_enabled=body.driver_dispatch_enabled,
+            delivery_proof_required=body.delivery_proof_required,
+            failure_min_wait_minutes=body.failure_min_wait_minutes,
+            failure_min_call_attempts=body.failure_min_call_attempts,
             expected_version=body.expected_version,
             user_id=int(current_user["id"]),
             user_email=current_user.get("email"),
@@ -165,6 +171,9 @@ async def update_settings(
         return DeliverySettingsOut(
             internal_enabled=row.internal_enabled,
             driver_dispatch_enabled=row.driver_dispatch_enabled,
+            delivery_proof_required=row.delivery_proof_required,
+            failure_min_wait_minutes=row.failure_min_wait_minutes,
+            failure_min_call_attempts=row.failure_min_call_attempts,
             version=row.version,
             updated_at=row.updated_at,
         )

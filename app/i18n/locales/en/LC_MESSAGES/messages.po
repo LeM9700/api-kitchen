@@ -194,3 +194,13 @@ msgstr "Your driver has arrived"
 #, python-brace-format
 msgid "Your driver is at your address with order #{order_id}."
 msgstr "Your driver is at your address with order #{order_id}."
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Your order #{order_id} has left the restaurant. Your delivery code: {code}"
+msgstr "Your order #{order_id} has left the restaurant. Your delivery code: {code}"
+
+#: app/modules/orders/service.py
+#, python-brace-format
+msgid "Order #{order_id} is on its way. Give this code to the driver: {code}"
+msgstr "Order #{order_id} is on its way. Give this code to the driver: {code}"

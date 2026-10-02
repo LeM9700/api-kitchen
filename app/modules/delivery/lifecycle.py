@@ -128,13 +128,37 @@ async def _complete_run_if_done(session: AsyncSession, run_id: int | None) -> No
             run.ended_at = _now()
 
 
-async def on_delivered(session: AsyncSession, order, actor_user_id: int | None) -> None:
+async def proof_required_for(session: AsyncSession, order) -> bool:
+    """La preuve de remise s'impose quand elle est activee ET que la commande a une livraison
+    vivante (donc un livreur) : une livraison sans livreur reste regie par le comportement historique."""
+    if order.order_type != "delivery":
+        return False
+    required = await session.scalar(
+        select(RestaurantDeliverySettings.delivery_proof_required)
+        .order_by(RestaurantDeliverySettings.id)
+        .limit(1)
+    )
+    if not required:
+        return False
+    return await active_delivery(session, order.id) is not None
+
+
+async def on_delivered(
+    session: AsyncSession, order, actor_user_id: int | None, proof: str | None = None
+) -> None:
     delivery = await active_delivery(session, order.id, lock=True)
     if delivery is None:
         return
     delivery.status = "delivered"
     delivery.finished_at = _now()
-    add_event(session, delivery, order_id=order.id, event="delivered", actor_user_id=actor_user_id)
+    add_event(
+        session,
+        delivery,
+        order_id=order.id,
+        event="delivered",
+        actor_user_id=actor_user_id,
+        note=f"proof:{proof}" if proof else None,
+    )
     await session.flush()
     await _complete_run_if_done(session, delivery.run_id)
 

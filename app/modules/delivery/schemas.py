@@ -236,6 +236,9 @@ class DeliverySettingsOut(BaseModel):
     internal_enabled: bool
     # Dispatch par livreurs : `ready -> out_for_delivery` exige un livreur assigne.
     driver_dispatch_enabled: bool = False
+    delivery_proof_required: bool = False
+    failure_min_wait_minutes: int = 5
+    failure_min_call_attempts: int = 1
     version: int
     updated_at: datetime | None = None
 
@@ -244,6 +247,9 @@ class DeliverySettingsUpdate(BaseModel):
     internal_enabled: bool
     # Absent : inchange (les anciennes apps n'envoient que `internal_enabled`).
     driver_dispatch_enabled: bool | None = None
+    delivery_proof_required: bool | None = None
+    failure_min_wait_minutes: int | None = Field(None, ge=0, le=60)
+    failure_min_call_attempts: int | None = Field(None, ge=0, le=5)
     # Concurrence optimiste : refuse l'ecriture si quelqu'un a modifie les reglages entre-temps.
     expected_version: int = Field(..., ge=1)
 

@@ -14,6 +14,7 @@ from app.core.i18n.translate import t
 from app.modules.admin.tenants.models import TenantConfig
 from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
 from app.modules.delivery import lifecycle as delivery_lifecycle
+from app.modules.delivery import proof as delivery_proof_service
 from app.modules.delivery import service as delivery_service
 from app.modules.delivery.models import DeliveryZone
 from app.modules.hr.models import Establishment
@@ -912,6 +913,22 @@ async def create_order(
     return order
 
 
+async def get_delivery_code(
+    session: AsyncSession, order_id: int, user_id: int, tenant_slug: str
+) -> dict:
+    """Code de remise du client proprietaire de la commande (a donner au livreur). Jamais expose
+    au personnel ni au livreur par cette route ; 404 pour la commande d'un autre."""
+    order = await session.get(Order, order_id)
+    if order is None or order.user_id is None or int(order.user_id) != int(user_id):
+        raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    if order.order_type != "delivery":
+        raise AppError("ORDER_NOT_DELIVERY", "Cette commande n'est pas une livraison.", 404)
+    if order.status not in {"confirmed", "queued", "preparing", "ready", "out_for_delivery"}:
+        raise AppError("ORDER_NOT_ACTIVE", "Aucun code a donner pour cette commande.", 409)
+    code = await delivery_proof_service.get_code(session, tenant_slug, order_id)
+    return {"code": code, "length": delivery_proof_service.CODE_LENGTH}
+
+
 async def create_manual_order(
     session: AsyncSession,
     body,
@@ -1610,6 +1627,8 @@ async def update_status(
     actor_user_id: int | None = None,
     is_staff: bool = True,
     authority: TransitionAuthority = TransitionAuthority.INTERNAL,
+    delivery_proof: str | None = None,
+    allow_redelivery: bool = False,
 ) -> Order:
     """Met a jour le statut d'une commande avec notifications temps reel.
 
@@ -1621,6 +1640,11 @@ async def update_status(
 
     [PROD] Ne jamais appeler session.commit() avant cette fonction dans le
     meme contexte de session : cela briserait l'atomicite stock/statut.
+
+    ``delivery_proof`` : comment la remise a ete prouvee (``code``, ``admin_override``,
+    ``not_required``) ; quand la preuve est exigee, une livraison avec livreur ne peut passer
+    ``delivered`` sans elle. ``allow_redelivery`` : autorise ``delivery_failed -> ready`` (seul
+    le traitement admin d'un echec l'utilise).
 
     Args:
         session: Session SQLAlchemy async. Le caller NE DOIT PAS commit avant le
@@ -1677,6 +1701,18 @@ async def update_status(
     if status == "out_for_delivery" and authority == TransitionAuthority.INTERNAL:
         # Dispatch actif : pas de depart sans livreur assigne (voir delivery/lifecycle.py).
         await delivery_lifecycle.ensure_driver_for_departure(session, order)
+    if (
+        status == "delivered"
+        and delivery_proof is None
+        and authority == TransitionAuthority.INTERNAL
+        and await delivery_lifecycle.proof_required_for(session, order)
+    ):
+        raise AppError(
+            "DELIVERY_PROOF_REQUIRED",
+            "Cette livraison se conclut avec le code du client (ou, pour un administrateur, sans code avec un motif).",
+            409,
+            "status",
+        )
     if status == "delivered" and current_payment_status == "guaranteed":
         raise AppError(
             "PAYMENT_SETTLEMENT_REQUIRED",
@@ -1686,7 +1722,9 @@ async def update_status(
         )
 
     # Validate the transition using the ORIGINAL requested status before any redirect.
-    is_graph_transition = status in VALID_TRANSITIONS.get(previous_status, set())
+    is_graph_transition = status in VALID_TRANSITIONS.get(previous_status, set()) or (
+        allow_redelivery and previous_status == "delivery_failed" and status == "ready"
+    )
     if authority == TransitionAuthority.INTERNAL:
         if not is_graph_transition:
             raise AppError("INVALID_STATUS_TRANSITION", "Invalid order status transition", 422, "status")
@@ -1727,7 +1765,7 @@ async def update_status(
     if actual_status == "out_for_delivery":
         await delivery_lifecycle.on_departure(session, order, actor_user_id)
     elif actual_status == "delivered":
-        await delivery_lifecycle.on_delivered(session, order, actor_user_id)
+        await delivery_lifecycle.on_delivered(session, order, actor_user_id, delivery_proof)
     elif actual_status in {"cancelled", "rejected", "delivery_failed"}:
         await delivery_lifecycle.on_order_closed(session, order, actual_status, actor_user_id)
 
@@ -1821,6 +1859,13 @@ async def update_status(
         # [i18n] client_title/client_body traduits (t()) -- perimetre client
         # uniquement. staff_title/staff_body restent en francais (hors perimetre,
         # voir plan devise+locale).
+        # Code de remise : donne au client des qu'il part (push), ou par SMS s'il n'a pas de compte.
+        _delivery_code: str | None = None
+        if actual_status == "out_for_delivery" and order.order_type == "delivery":
+            try:
+                _delivery_code = await delivery_proof_service.get_code(session, _effective_tenant, order_id)
+            except Exception as exc:
+                logger.error("delivery code unavailable for order_id=%s: %s", order_id, exc)
         _notif_map: dict[tuple[str, str], dict] = {
             ("pending", "confirmed"): {
                 "client_title": t("Order confirmed"),
@@ -1854,8 +1899,14 @@ async def update_status(
             ),
             ("ready", "out_for_delivery"): {
                 "client_title": t("Your driver is on the way"),
-                "client_body": t(
-                    "Your order #{order_id} has left the restaurant.", order_id=order_id
+                "client_body": (
+                    t(
+                        "Your order #{order_id} has left the restaurant. Your delivery code: {code}",
+                        order_id=order_id,
+                        code=_delivery_code,
+                    )
+                    if _delivery_code
+                    else t("Your order #{order_id} has left the restaurant.", order_id=order_id)
                 ),
                 "staff_title": None,
                 "staff_body": None,
@@ -1911,6 +1962,29 @@ async def update_status(
                     body=notif["client_body"],
                     data=order_data,
                 )
+
+            # Client sans compte (commande saisie au comptoir) : le code part par SMS.
+            if (
+                _delivery_code
+                and order.user_id is None
+                and order.customer_phone
+                and arq_pool is not None
+            ):
+                try:
+                    from app.core.sms.service import enqueue_sms
+                    from app.modules.customer.service import normalize_phone_e164
+
+                    await enqueue_sms(
+                        arq_pool,
+                        to_phone_e164=normalize_phone_e164(order.customer_phone),
+                        body=t(
+                            "Order #{order_id} is on its way. Give this code to the driver: {code}",
+                            order_id=order_id,
+                            code=_delivery_code,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning("delivery code SMS not sent for order_id=%s: %s", order_id, exc)
 
             # Notification staff (uniquement si definie pour cette transition).
             if notif.get("staff_title"):

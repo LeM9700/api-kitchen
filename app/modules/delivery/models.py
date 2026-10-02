@@ -113,6 +113,20 @@ class RestaurantDeliverySettings(Base):
     driver_dispatch_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Preuve de remise : quand elle est exigee, le livreur doit saisir le code a 4 chiffres du
+    # client (sinon seule une livraison « sans code » d'un administrateur, motivee et tracee).
+    # Coupee par defaut : les anciennes apps client n'affichent pas le code.
+    delivery_proof_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Regles d'echec « client absent / injoignable » : delai d'attente depuis l'arrivee et nombre
+    # minimal d'appels avant de pouvoir declarer l'echec.
+    failure_min_wait_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default="5"
+    )
+    failure_min_call_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     pickup_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     internal_delivery_fee: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     internal_delivery_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -237,4 +251,59 @@ class DeliveryEvent(Base):
     event: Mapped[str] = mapped_column(String(32), nullable=False)
     actor_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     note: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeliveryCodeAttempt(Base):
+    """Essai de saisie du code de remise (reussi ou non), journalise."""
+
+    __tablename__ = "delivery_code_attempts"
+    __table_args__ = (Index("ix_delivery_code_attempts_delivery_id", "delivery_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    delivery_id: Mapped[int] = mapped_column(ForeignKey("deliveries.id"), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+FAILURE_REASONS = {
+    # motif -> a qui incombe l'echec
+    "customer_absent": "customer",
+    "customer_unreachable": "customer",
+    "wrong_address": "customer",
+    "customer_refused": "customer",
+    "order_problem": "restaurant",
+    "other": "customer",
+}
+
+
+class DeliveryFailure(Base):
+    """Echec de livraison declare par le livreur, a traiter par un administrateur
+    (rembourser, retenir des frais, ou relivrer)."""
+
+    __tablename__ = "delivery_failures"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'resolved')", name="ck_delivery_failures_status"),
+        CheckConstraint("fault IN ('customer', 'restaurant')", name="ck_delivery_failures_fault"),
+        Index("ix_delivery_failures_status", "status"),
+        Index("ix_delivery_failures_order_id", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    delivery_id: Mapped[int] = mapped_column(ForeignKey("deliveries.id"), nullable=False)
+    order_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    driver_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    fault: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    call_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    waited_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    # refund | retain | redeliver
+    resolution: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    retained_amount: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    resolved_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

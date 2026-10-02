@@ -164,10 +164,75 @@ le livreur (409 `ORDER_NOT_PAID`). Le livreur ne peut jamais debiter une carte.
 
 ### Limites connues (phase 3)
 
-- Pas encore de code de remise, de gestion d'echec par le livreur, ni de GPS en temps reel (phases 4 et 5).
+- Pas encore de GPS en temps reel (phase 5).
 - Attribution par le comptoir uniquement ; l'auto-attribution par le livreur est prevue en phase 6.
 - Un livreur appartient a un seul etablissement.
 - Le pointage n'est pas bloque cote livraison : un livreur qui depointe pendant une tournee la termine.
+
+## Preuve de remise et echecs de livraison (phase 4)
+
+### Code de remise a 4 chiffres
+
+- Le client voit un code a 4 chiffres (`GET /orders/{id}/delivery-code`, **proprietaire de la commande uniquement**, livraison
+  confirmee et pas terminee, 404 sinon, 30/min). Il le recoit aussi dans la notification de depart ; un client sans compte
+  (commande saisie au comptoir) le recoit **par SMS** au depart.
+- Le code n'est **jamais stocke** : `proof.derive_code` le recalcule (HMAC-SHA256 de `JWT_SECRET`, du tenant, de la commande et
+  d'une graine aleatoire `orders.delivery_code_nonce`). Une fuite de la base ne donne aucun code. Changer la graine invalide le
+  code (relivraison apres un echec). **Faire tourner `JWT_SECRET` change tous les codes en cours** : a eviter pendant le service.
+- Le livreur saisit le code a la livraison (`POST /delivery/driver/deliveries/{id}/delivered`, champ `code`). Verification a
+  temps constant, **avant** tout encaissement : un mauvais code ne regle rien.
+- **5 essais rates maximum** par livraison (423 `DELIVERY_CODE_LOCKED` ensuite, meme avec le bon code). Chaque essai est journalise
+  (`delivery_code_attempts`, committe avant l'erreur pour que le compteur survive). Un code mal forme (pas 4 chiffres) n'est pas
+  un essai.
+- **Livraison sans code** : `POST /delivery/dispatch/orders/{order_id}/deliver-without-code`, **administrateur uniquement**, motif
+  obligatoire (3 caracteres), evenement `delivered_without_code` avec l'auteur et le motif. Elle respecte le reglement : une
+  empreinte non regle refuse (`PAYMENT_SETTLEMENT_REQUIRED`) et rien n'est journalise.
+
+### Drapeau `delivery_proof_required` (coupe par defaut)
+
+- **Coupe** : le code est facultatif (verifie s'il est fourni). Les anciennes apps client, qui n'affichent pas le code,
+  ne bloquent donc aucune livraison.
+- **Actif** : le code est obligatoire (422 `DELIVERY_CODE_REQUIRED`) et la route generique `PATCH /orders/{id}/status -> delivered`
+  est refusee pour une livraison avec livreur (409 `DELIVERY_PROOF_REQUIRED`) : le personnel ne peut pas contourner le code.
+  Une livraison **sans livreur** reste regie par le comportement historique.
+- Reglable dans `PUT /delivery/settings` (administrateur, audite), avec `failure_min_wait_minutes` (0 a 60, defaut 5) et
+  `failure_min_call_attempts` (0 a 5, defaut 1).
+
+### Echecs de livraison
+
+`POST /delivery/driver/deliveries/{id}/failed` (role `driver`, propre livraison, en route ou arrivee) :
+
+| Motif | Faute | Regle |
+|---|---|---|
+| `customer_absent`, `customer_unreachable` | client | arrivee signalee, attente de `failure_min_wait_minutes` depuis l'arrivee, au moins `failure_min_call_attempts` appels (409 `FAILURE_ARRIVAL_REQUIRED` / `FAILURE_TOO_EARLY`, 422 `FAILURE_CALL_REQUIRED`) |
+| `wrong_address`, `customer_refused` | client | aucune attente |
+| `order_problem` | **restaurant** | aucune attente ; aucun frais ne pourra etre retenu |
+| `other` | client | precision obligatoire |
+
+L'echec est enregistre (`delivery_failures`) et la commande passe `delivery_failed` **dans la meme transaction** : il n'existe pas
+d'echec sans enregistrement a traiter ni l'inverse. La livraison est close (`failed`).
+
+### Traitement par l'administrateur
+
+`GET /delivery/failures?status=pending|resolved` (`orders:read`) ; `POST /delivery/failures/{id}/resolve` (**administrateur**, 30/min) :
+
+| Action | Commande payee en ligne / au comptoir | Empreinte bancaire |
+|---|---|---|
+| `refund` | remboursement total | empreinte liberee |
+| `retain` (`amount` en centimes + `note`, **faute du client uniquement**) | rembourse le reste, garde `amount` | debite `amount` (capture partielle), libere le reste |
+| `redeliver` | commande `delivery_failed -> ready`, **nouveau code**, retour dans « A attribuer » | idem |
+
+`redeliver` exige une commande encore reglee (`paid` ou `guaranteed`, 409 `REDELIVERY_NOT_POSSIBLE`). La transition
+`delivery_failed -> ready` n'est possible que par cette action (la route generique la refuse). Un echec ne se traite qu'une fois
+(409 `FAILURE_ALREADY_RESOLVED`) ; un rejeu apres un succes partiel (remboursement deja fait) aboutit sans rembourser deux fois.
+
+### Limites connues (phase 4)
+
+- Le GPS en temps reel (preuve de presence, delai d'attente verifie par position) est prevu en phase 5 ; le delai d'attente repose
+  aujourd'hui sur l'arrivee declaree par le livreur et le nombre d'appels qu'il declare.
+- Un client sans compte ni telephone ne peut pas recevoir son code : l'administrateur conclut alors sans code (motif).
+- Le code a 4 chiffres reste devinable (1 chance sur 2000 avec 5 essais) : il prouve une remise de bonne foi, il ne remplace pas une
+  verification d'identite.
 
 ## Sécurité
 

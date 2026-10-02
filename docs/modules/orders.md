@@ -111,6 +111,11 @@ Annuler ou rejeter une commande `guaranteed` libere l'empreinte automatiquement 
 `ready -> out_for_delivery` exige un livreur assigne (409 `DRIVER_REQUIRED`, sans rien modifier). Depart, livraison,
 annulation, rejet et echec mettent a jour la livraison dans la meme transaction que le statut de la commande.
 
+**Preuve de remise** : quand `delivery_proof_required` est actif, `-> delivered` d'une livraison avec livreur exige la preuve
+(code du client, ou livraison sans code d'un administrateur) : 409 `DELIVERY_PROOF_REQUIRED` pour la route generique.
+`delivery_failed -> ready` n'est possible que par le traitement admin d'un echec (relivraison). `GET /orders/{id}/delivery-code`
+renvoie le code au client proprietaire.
+
 ## Comportements metier
 
 **Creation (`POST /orders`)**

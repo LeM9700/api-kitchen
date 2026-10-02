@@ -85,6 +85,18 @@ API (webhook manqué — Stripe down, erreur 500 transitoire, etc.).
   `orders.update_status`. Ne jamais modifier `deliveries` a la main sans modifier la commande.
 - **Desactiver un livreur** : refuse tant qu'il a des livraisons vivantes (retirer ou reattribuer d'abord). La desactivation
   du profil ne ferme pas son compte ; pour couper aussi la connexion, desactiver l'utilisateur depuis l'administration.
+- **Livreur bloque : « trop de codes incorrects »** (423 `DELIVERY_CODE_LOCKED`) : la livraison est verrouillee apres 5 essais.
+  Un administrateur la conclut sans code (page Dispatch, « Livrer sans code », motif obligatoire) ou la traite comme un echec.
+- **Le client n'a pas son code** : app client non a jour, ou client sans compte et sans telephone. Verifier que
+  `delivery_proof_required` n'est actif que si l'app client affichant le code est deployee ; sinon le couper
+  (`PUT /api/v1/delivery/settings`, administrateur) ou livrer sans code avec un motif.
+- **Echecs « a traiter » qui s'accumulent** : la page Dispatch les liste en tete ; seul un administrateur les traite
+  (rembourser, retenir des frais si la faute est au client, relivrer). Une commande en echec non traitee garde son
+  paiement : a surveiller pour les empreintes (elles expirent seules apres ~7 jours).
+- **Rotation de `JWT_SECRET`** : change tous les codes de remise en cours (ils sont recalcules, jamais stockes). A faire hors
+  service, ou prevoir des livraisons sans code pour les commandes en route.
+- **Rollback de la migration `0077`** : `alembic downgrade 0076` supprime les echecs et le journal des essais de code (donnees
+  perdues) et la graine des codes ; memes precautions que pour `0076`.
 - **Rollback de la migration `0076`** : `alembic downgrade 0075` supprime les tables livreurs/livraisons (donnees perdues).
   Sur une base avec beaucoup de schemas tenant, une seule transaction peut echouer (`out of shared memory`, voir
   `max_locks_per_transaction`) : dans ce cas supprimer schema par schema puis `alembic stamp 0075`.

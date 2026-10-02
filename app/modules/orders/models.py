@@ -67,6 +67,10 @@ class Order(Base):
     # Stocké pour permettre la désactivation du code promo à la confirmation de paiement.
     # Nécessite une migration Alembic : ALTER TABLE orders ADD COLUMN promo_code VARCHAR(64).
     promo_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Graine du code de remise a 4 chiffres (voir delivery/proof.py) : le code n'est jamais
+    # stocke, il se recalcule a partir de cette graine et d'un secret serveur. La changer
+    # invalide le code precedent (nouvelle livraison apres un echec).
+    delivery_code_nonce: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

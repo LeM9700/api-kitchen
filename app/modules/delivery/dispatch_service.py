@@ -23,7 +23,7 @@ from app.core.auth.security import get_password_hash
 from app.core.http.errors import AppError
 from app.core.i18n.translate import t
 from app.modules.auth.models import User
-from app.modules.delivery import lifecycle
+from app.modules.delivery import failures, lifecycle, proof
 from app.modules.delivery.models import (
     DELIVERY_ACTIVE_STATUSES,
     Delivery,
@@ -490,12 +490,22 @@ async def driver_deliveries(session: AsyncSession, driver: DriverProfile) -> lis
         )
     ).all()
     counts = await _items_counts(session, [order.id for _, order in rows])
+    rules = await failures.get_rules(session)
+    locked = {
+        delivery.id: await proof.failed_attempts(session, delivery.id) >= proof.MAX_FAILED_ATTEMPTS
+        for delivery, _ in rows
+    }
     return [
         {
             "id": delivery.id,
             "order_id": order.id,
             "status": delivery.status,
             "phase": _phase(delivery, order),
+            "proof_required": rules["proof_required"],
+            "code_locked": locked[delivery.id],
+            "failure_min_wait_minutes": rules["min_wait_minutes"],
+            "failure_min_call_attempts": rules["min_call_attempts"],
+            "arrived_at": delivery.arrived_at,
             "run_id": delivery.run_id,
             "customer_name": order.customer_name,
             "customer_phone": order.customer_phone,
@@ -609,6 +619,7 @@ async def driver_deliver(
     cash_received: float | None,
     user_id: int,
     tenant_slug: str,
+    code: str | None = None,
     arq_pool=None,
 ) -> Delivery:
     from app.modules.orders import service as orders_service
@@ -622,6 +633,27 @@ async def driver_deliver(
     payment_status = order.payment_status
     total = float(order.total)
     await session.rollback()  # libere les verrous avant le reglement et la livraison
+
+    # Preuve de remise AVANT tout encaissement : un mauvais code ne doit rien regler.
+    rules = await failures.get_rules(session)
+    delivery_proof = "not_required"
+    if rules["proof_required"] or code:
+        if not code:
+            raise AppError(
+                "DELIVERY_CODE_REQUIRED",
+                "Demandez au client son code de remise a 4 chiffres.",
+                422,
+                "code",
+            )
+        await proof.verify_code(
+            session,
+            tenant_slug=tenant_slug,
+            delivery_id=delivery_id,
+            order_id=order_id,
+            user_id=user_id,
+            submitted=code,
+        )
+        delivery_proof = "code"
 
     if payment_status == "guaranteed":
         if cash_received is None:
@@ -650,6 +682,7 @@ async def driver_deliver(
         arq_pool=arq_pool,
         actor_user_id=user_id,
         is_staff=True,
+        delivery_proof=delivery_proof,
     )
     refreshed = await session.get(Delivery, delivery_id, populate_existing=True)
     return refreshed
@@ -703,3 +736,53 @@ async def driver_recap(session: AsyncSession, driver: DriverProfile, day: date |
             for delivery, order in rows
         ],
     }
+
+
+async def admin_deliver_without_code(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    reason: str,
+    admin_user_id: int,
+    tenant_slug: str,
+    arq_pool=None,
+) -> Delivery:
+    """Livraison conclue **sans** le code du client : administrateur uniquement, motif obligatoire,
+    tracee dans le journal de la livraison."""
+    from app.modules.orders import service as orders_service
+
+    reason = (reason or "").strip()
+    if len(reason) < 3:
+        raise AppError("OVERRIDE_REASON_REQUIRED", "Un motif est requis pour livrer sans code.", 422, "reason")
+    delivery = await lifecycle.active_delivery(session, order_id, lock=True)
+    if delivery is None or delivery.status not in ("out_for_delivery", "arrived"):
+        raise AppError(
+            "DELIVERY_NOT_EN_ROUTE", "Cette commande n'a pas de livraison en route.", 409
+        )
+    delivery_id = delivery.id
+    lifecycle.add_event(
+        session,
+        delivery,
+        order_id=order_id,
+        event="delivered_without_code",
+        actor_user_id=admin_user_id,
+        note=reason,
+    )
+    # Le journal et la livraison sont committes ensemble par update_status ; s'il refuse
+    # (reglement manquant par exemple), l'evenement est annule avec lui.
+    try:
+        await orders_service.update_status(
+            session,
+            order_id,
+            "delivered",
+            f"Livraison sans code : {reason}",
+            tenant_slug=tenant_slug,
+            arq_pool=arq_pool,
+            actor_user_id=admin_user_id,
+            is_staff=True,
+            delivery_proof="admin_override",
+        )
+    except AppError:
+        await session.rollback()
+        raise
+    return await session.get(Delivery, delivery_id, populate_existing=True)

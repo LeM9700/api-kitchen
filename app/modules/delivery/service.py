@@ -374,6 +374,9 @@ async def update_delivery_settings(
     *,
     internal_enabled: bool,
     driver_dispatch_enabled: bool | None = None,
+    delivery_proof_required: bool | None = None,
+    failure_min_wait_minutes: int | None = None,
+    failure_min_call_attempts: int | None = None,
     expected_version: int,
     user_id: int,
     user_email: str | None,
@@ -427,6 +430,26 @@ async def update_delivery_settings(
             )
         )
         row.driver_dispatch_enabled = driver_dispatch_enabled
+        row.version = row.version + 1
+    for field, value in (
+        ("delivery_proof_required", delivery_proof_required),
+        ("failure_min_wait_minutes", failure_min_wait_minutes),
+        ("failure_min_call_attempts", failure_min_call_attempts),
+    ):
+        if value is None or getattr(row, field) == value:
+            continue
+        session.add(
+            RestaurantDeliverySettingsAudit(
+                changed_by_user_id=user_id,
+                user_email=user_email,
+                field_name=field,
+                old_value=str(getattr(row, field)).lower(),
+                new_value=str(value).lower(),
+                ip_address=(ip_address or "")[:45] or None,
+                user_agent=user_agent,
+            )
+        )
+        setattr(row, field, value)
         row.version = row.version + 1
     await session.commit()
     await session.refresh(row)

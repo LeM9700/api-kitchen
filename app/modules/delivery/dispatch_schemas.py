@@ -132,6 +132,13 @@ class DriverDeliveryOut(BaseModel):
     estimated_delivery_at: datetime | None = None
     assigned_at: datetime | None = None
     departed_at: datetime | None = None
+    arrived_at: datetime | None = None
+    # Preuve de remise exigee : le livreur doit saisir le code du client.
+    proof_required: bool = False
+    code_locked: bool = False
+    # Regles d'echec « client absent / injoignable » (delai depuis l'arrivee, appels).
+    failure_min_wait_minutes: int = 5
+    failure_min_call_attempts: int = 1
 
 
 class DriverMeOut(BaseModel):
@@ -159,6 +166,9 @@ class DepartRequest(BaseModel):
 class DeliverRequest(BaseModel):
     # Obligatoire pour une commande a regler a la remise ; ignore si deja payee en ligne.
     cash_received: float | None = Field(None, gt=0)
+    # Code de remise a 4 chiffres du client (obligatoire quand la preuve est exigee). Le format
+    # est controle par le service pour renvoyer un message clair.
+    code: str | None = Field(None, max_length=16)
 
 
 class DriverRecapItemOut(BaseModel):
@@ -175,3 +185,47 @@ class DriverRecapOut(BaseModel):
     runs_count: int
     cash_collected: float
     deliveries: list[DriverRecapItemOut]
+
+
+class DriverFailureRequest(BaseModel):
+    reason: str = Field(..., max_length=32)
+    note: str | None = Field(None, max_length=200)
+    # Nombre d'appels passes au client (exige pour « absent » et « injoignable »).
+    call_attempts: int = Field(0, ge=0, le=20)
+
+
+class FailureOut(BaseModel):
+    id: int
+    order_id: int
+    delivery_id: int
+    driver_id: int
+    driver_name: str | None = None
+    reason: str
+    reason_label: str
+    # Qui est en cause : le client ou le restaurant (aucun frais ne peut etre retenu au client
+    # si la faute est celle du restaurant).
+    fault: str
+    note: str | None = None
+    call_attempts: int = 0
+    waited_seconds: int | None = None
+    status: str
+    resolution: str | None = None
+    retained_amount: float | None = None
+    created_at: datetime | None = None
+    resolved_at: datetime | None = None
+    customer_name: str | None = None
+    customer_phone: str | None = None
+    delivery_address: str | None = None
+    total: float
+    payment_status: str
+
+
+class ResolveFailureRequest(BaseModel):
+    action: str = Field(..., pattern="^(refund|retain|redeliver)$")
+    # Centimes, uniquement pour `retain`.
+    amount: int | None = Field(None, gt=0)
+    note: str | None = Field(None, max_length=200)
+
+
+class DeliverWithoutCodeRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=200)

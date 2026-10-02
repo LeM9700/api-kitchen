@@ -171,6 +171,16 @@ async def export_orders_csv(
     )
 
 
+@router.get("/{order_id}/delivery-code")
+@limiter.limit("30/minute")
+async def get_delivery_code(request: Request, order_id: int, current_user=Depends(get_current_user)):
+    """Code a 4 chiffres que le client donne au livreur pour prouver la remise."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await service.get_delivery_code(
+            session, order_id, int(current_user["id"]), current_user["tenant_slug"]
+        )
+
+
 @router.get("/{order_id}", response_model=OrderDetailOut)
 async def get_order_detail(order_id: int, current_user=Depends(get_current_user)):
     role = current_user.get("role")
