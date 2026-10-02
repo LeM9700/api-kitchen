@@ -132,6 +132,8 @@ class LoyaltyReward(Base):
     Types supportés :
     - ``discount_euros`` : réduction monétaire (``discount_amount`` requis).
     - ``free_product`` : produit offert (``product_id`` requis).
+    - ``free_delivery`` : frais de livraison offerts (aucun champ supplementaire ; uniquement
+      applicable a une commande en livraison).
     """
 
     __tablename__ = "loyalty_rewards"
@@ -141,7 +143,7 @@ class LoyaltyReward(Base):
     reward_type: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        comment="discount_euros | free_product",
+        comment="discount_euros | free_product | free_delivery",
     )
     points_required: Mapped[int] = mapped_column(Integer, nullable=False)
     discount_amount: Mapped[float | None] = mapped_column(

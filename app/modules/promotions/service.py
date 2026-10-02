@@ -234,6 +234,11 @@ async def _calculate_discounts(
     discounts: dict[str, float] = {}
 
     for promo in ordered:
+        if promo.free_delivery and float(promo.discount_value) == 0:
+            # Code « livraison offerte » seul : aucune remise sur les produits, mais le code
+            # est valide (les controles d'eligibilite ont deja ete faits ci-dessus).
+            discounts[promo.code] = 0.0
+            continue
         eligible_total = _targeted_total(items, targets_by_id[promo.id], order_total)
         raw_discount = _discount_for_promo(promo, eligible_total)
         discount = _money(min(raw_discount, remaining_order_total))
@@ -265,6 +270,7 @@ def _promotion_out(promo: Promotion, targets: PromotionTargets) -> PromotionOut:
         user_id=promo.user_id,
         is_public=promo.is_public,
         is_stackable=promo.is_stackable,
+        free_delivery=promo.free_delivery,
         email_verified_required=promo.email_verified_required,
         targets=targets,
     )
@@ -278,6 +284,7 @@ def _public_out(promo: Promotion, targets: PromotionTargets) -> PromotionPublicO
         discount_type=promo.discount_type,
         discount_value=float(promo.discount_value),
         min_order_amount=float(promo.min_order_amount),
+        free_delivery=promo.free_delivery,
         starts_at=promo.starts_at,
         ends_at=promo.ends_at,
         targets=targets,
@@ -344,6 +351,14 @@ async def update_promotion(session: AsyncSession, promo_id: int, body: Promotion
     product_ids = data.pop("target_product_ids", None)
     for key, value in data.items():
         setattr(promo, key, value)
+    if float(promo.discount_value) <= 0 and not promo.free_delivery:
+        await session.rollback()
+        raise AppError(
+            "INVALID_PROMOTION",
+            "discount_value must be greater than 0 unless free_delivery is enabled",
+            422,
+            "discount_value",
+        )
     await _set_targets(session, promo.id, category_ids, product_ids)
     await session.commit()
     await session.refresh(promo)
@@ -457,6 +472,7 @@ async def preview_promos(
         discounts=discounts,
         promo_id=promos[0].id if len(promos) == 1 else None,
         promo_ids=[promo.id for promo in promos],
+        free_delivery=any(promo.free_delivery for promo in promos),
     )
 
 

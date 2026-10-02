@@ -197,6 +197,7 @@ async def _resolve_loyalty_reward_discount(
     reward_id: int | None,
     amount_eligible: float,
     resolved_items: list[tuple],
+    order_type: str = "delivery",
 ) -> tuple[float, LoyaltyReward | None]:
     if reward_id is None:
         return 0.0, None
@@ -233,6 +234,18 @@ async def _resolve_loyalty_reward_discount(
                 "loyalty_reward_id",
             )
         return min(min(matching_unit_prices), eligible), reward
+
+    if reward.reward_type == "free_delivery":
+        # Aucune remise sur les produits : la livraison offerte est appliquee par le moteur
+        # de frais (create_order), qui debite aussi les points de la recompense.
+        if order_type != "delivery":
+            raise AppError(
+                "REWARD_DELIVERY_REQUIRED",
+                "Cette recompense ne s'applique qu'a une commande en livraison",
+                422,
+                "loyalty_reward_id",
+            )
+        return 0.0, reward
 
     raise AppError("INVALID_REWARD", "Type de recompense non supporte", 422, "loyalty_reward_id")
 
@@ -391,31 +404,37 @@ async def _resolve_delivery(
     delivery_lat: float | None = None,
     delivery_lng: float | None = None,
     source: str = "customer",
-) -> tuple[float, int, int | None]:
-    """Calcule delivery_fee, delai de trajet additionnel, et delivery_zone_id effectif.
+    establishment_id: int | None = None,
+    promo_free: bool = False,
+    loyalty_free: bool = False,
+) -> tuple[float, int, int | None, int | None]:
+    """Calcule ``(frais, delai de trajet, zone effective, etablissement de la zone)``.
 
-    Pour order_type == "pickup" ou "dine_in" : pas de frais, pas de delai de
-    trajet. delivery_zone_id est ignore meme s'il est envoye par le client.
+    Pour ``pickup`` / ``dine_in`` : aucun frais, aucun delai, ``delivery_zone_id`` ignore.
 
     Pour une livraison, le serveur est la seule autorite sur la zone et les frais :
 
-    - avec des coordonnees GPS : la zone est retrouvee a partir du point
-      (``delivery_zone_id`` envoye par le client est ignore), hors zone => 422
-      DELIVERY_ZONE_UNREACHABLE ;
-    - sans coordonnees : refuse pour une commande client (422
-      DELIVERY_COORDINATES_REQUIRED). Une commande saisie au comptoir
-      (``source="manual"``) peut designer une zone choisie par le staff, en
-      attendant la saisie d'adresse sur carte ; a defaut, 422
-      DELIVERY_ZONE_REQUIRED.
+    - la livraison doit etre activee (``DELIVERY_DISABLED`` 409 sinon) ;
+    - avec des coordonnees GPS : la zone est retrouvee a partir du point, parmi les zones de
+      l'etablissement demande (ou de tous si aucun) ; ``delivery_zone_id`` envoye par le client
+      est ignore ; hors zone => 422 ``DELIVERY_ZONE_UNREACHABLE`` ;
+    - sans coordonnees : refuse pour une commande client (422 ``DELIVERY_COORDINATES_REQUIRED``).
+      Une commande saisie au comptoir (``source="manual"``) peut designer une zone choisie par le
+      staff ; a defaut, 422 ``DELIVERY_ZONE_REQUIRED``.
 
-    Une livraison ne peut donc plus etre creee sans zone, donc jamais a 0 EUR de
-    frais faute de controle.
+    Les frais viennent de ``delivery.service.quote_for_zone`` : le meme calcul que
+    ``POST /delivery/check``, pour que ce qui est annonce soit ce qui est facture (regles de zone
+    horaires, livraison offerte des X EUR, code promo ou recompense « livraison offerte »). Le seuil
+    est evalue sur le sous-total avant remises, comme dans ``/delivery/check``.
     """
     if order_type in NON_DELIVERY_ORDER_TYPES:
-        return 0.0, 0, None
+        return 0.0, 0, None, None
+
+    if not await delivery_service.is_delivery_enabled(session):
+        raise AppError("DELIVERY_DISABLED", "La livraison est momentanement indisponible", 409)
 
     if delivery_lat is not None and delivery_lng is not None:
-        zone = await delivery_service.check_address(session, delivery_lat, delivery_lng)
+        zone = await delivery_service.check_address(session, delivery_lat, delivery_lng, establishment_id)
     elif source == "manual":
         if delivery_zone_id is None:
             raise AppError(
@@ -425,6 +444,19 @@ async def _resolve_delivery(
                 "delivery_zone_id",
             )
         zone = await session.get(DeliveryZone, delivery_zone_id)
+        out_of_scope = (
+            zone is not None
+            and establishment_id is not None
+            and zone.establishment_id is not None
+            and zone.establishment_id != establishment_id
+        )
+        if out_of_scope:
+            raise AppError(
+                "INVALID_DELIVERY_ZONE",
+                "Cette zone n'appartient pas a l'etablissement de la commande",
+                422,
+                "delivery_zone_id",
+            )
     else:
         raise AppError(
             "DELIVERY_COORDINATES_REQUIRED",
@@ -435,14 +467,18 @@ async def _resolve_delivery(
 
     if zone is None or not zone.is_active:
         raise AppError("INVALID_DELIVERY_ZONE", "Delivery zone not found or inactive", 422, "delivery_zone_id")
-    if subtotal < float(zone.min_order_amount or 0):
+
+    quote = await delivery_service.quote_for_zone(
+        session, zone, subtotal, promo_free=promo_free, loyalty_free=loyalty_free
+    )
+    if quote.min_order_met is False:
         raise AppError(
             "DELIVERY_MIN_ORDER_NOT_MET",
-            "Order subtotal is below the delivery zone minimum",
+            f"Order subtotal is below the delivery zone minimum ({quote.min_order_amount:.2f})",
             422,
             "delivery_zone_id",
         )
-    return _money(zone.fee), int(zone.estimated_minutes or 0), zone.id
+    return _money(quote.pricing.fee), quote.estimated_minutes, zone.id, quote.establishment_id
 
 
 async def _resolve_extras(session: AsyncSession, product_id: int, item_extras: list) -> tuple[list[dict], float]:
@@ -622,7 +658,26 @@ async def create_order(
 
     # [SECURITE] discount_total calcule cote serveur uniquement.
     discount_total: float = 0.0
+    promo_free_delivery = False
     if body.promo_code:
+        promo_flags = (
+            await session.execute(
+                select(Promotion.free_delivery, Promotion.discount_value).where(
+                    Promotion.code == body.promo_code.strip().upper()
+                )
+            )
+        ).first()
+        if promo_flags is not None and bool(promo_flags[0]):
+            if (getattr(body, "order_type", None) or "delivery") != "delivery" and float(promo_flags[1]) == 0:
+                # Un code « livraison offerte » seul n'a aucun effet hors livraison : on le
+                # refuse plutot que de consommer silencieusement une utilisation.
+                raise AppError(
+                    "PROMO_DELIVERY_ONLY",
+                    "Ce code ne s'applique qu'a une commande en livraison",
+                    422,
+                    "promo_code",
+                )
+            promo_free_delivery = True
         promo_items = [
             PromotionCartItem(
                 product_id=item.product_id,
@@ -670,6 +725,7 @@ async def create_order(
             loyalty_reward_id,
             max(0.0, subtotal - discount_total),
             resolved_items,
+            order_type=getattr(body, "order_type", None) or "delivery",
         )
         discount_total = _money(discount_total + loyalty_discount)
     if loyalty_points_to_use:
@@ -692,7 +748,14 @@ async def create_order(
             422,
             "customer_phone",
         )
-    delivery_fee, delivery_minutes, effective_delivery_zone_id = await _resolve_delivery(
+    # Une livraison est rattachee a l'etablissement dont la zone couvre le point ; on resout
+    # l'etablissement demande AVANT pour restreindre la recherche de zone. Pickup / sur place :
+    # l'ordre des requetes reste inchange (l'etablissement est resolu plus bas).
+    establishment_id: int | None = None
+    requested_establishment_id = getattr(body, "establishment_id", None)
+    if order_type == "delivery" and requested_establishment_id is not None:
+        establishment_id = await _resolve_establishment_id(session, requested_establishment_id)
+    delivery_fee, delivery_minutes, effective_delivery_zone_id, zone_establishment_id = await _resolve_delivery(
         session,
         order_type,
         getattr(body, "delivery_zone_id", None),
@@ -700,9 +763,15 @@ async def create_order(
         delivery_lat=getattr(body, "delivery_lat", None),
         delivery_lng=getattr(body, "delivery_lng", None),
         source=source,
+        establishment_id=establishment_id,
+        promo_free=promo_free_delivery,
+        loyalty_free=loyalty_reward is not None and loyalty_reward.reward_type == "free_delivery",
     )
+    if establishment_id is None and zone_establishment_id is not None:
+        establishment_id = zone_establishment_id
     estimated_delivery_at = await _estimate_delivery_at(session, delivery_minutes)
-    establishment_id = await _resolve_establishment_id(session, getattr(body, "establishment_id", None))
+    if establishment_id is None:
+        establishment_id = await _resolve_establishment_id(session, requested_establishment_id)
 
     total = _money(subtotal - discount_total + delivery_fee)
     order = Order(

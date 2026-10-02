@@ -109,6 +109,7 @@ La transition `pending -> confirmed` est refusee tant que `payment_status != pai
 - Les prix sont resolus depuis `Product.base_price`, `ProductVariant.price_delta` et les `Extra` autorises via `ProductExtra`.
 - Les extras sont sauvegardes en snapshot JSON dans `order_items.extras_snapshot`.
 - `delivery_fee` est calcule cote serveur depuis la zone qui couvre le point GPS de livraison.
+- Les frais suivent le moteur de `docs/modules/delivery.md` (regles de zone horaires, livraison offerte des X EUR, code promo ou recompense « livraison offerte »), avec les memes regles que `POST /delivery/check`. L'etablissement de la commande est celui dont la zone couvre le point (ou `establishment_id` demande, qui restreint la recherche). Livraison coupee par l'admin : 409 `DELIVERY_DISABLED`.
 - Une livraison sans coordonnees est refusee (422 `DELIVERY_COORDINATES_REQUIRED`), hors zone aussi (422 `DELIVERY_ZONE_UNREACHABLE`), sans telephone aussi (422 `CUSTOMER_PHONE_REQUIRED`). Une livraison manuelle sans point ni zone donne 422 `DELIVERY_ZONE_REQUIRED`.
 - `update_status` verrouille la ligne de commande (`FOR UPDATE`) : deux validations simultanees sont serialisees, la seconde est rejetee (`INVALID_STATUS_TRANSITION`).
 - Pour `pickup` et `dine_in`, l'API ignore adresse/zone de livraison et force `delivery_fee = 0`.

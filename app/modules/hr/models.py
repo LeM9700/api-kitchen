@@ -11,6 +11,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -34,6 +35,10 @@ class Establishment(Base):
         String(64), nullable=False, default="Europe/Paris", server_default="Europe/Paris"
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Position de l'etablissement (WGS84) : centre des cartes de livraison et du point de depart
+    # des zones par rayon / temps de trajet. NULL tant qu'elle n'est pas renseignee.
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

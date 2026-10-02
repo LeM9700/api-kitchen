@@ -56,6 +56,11 @@ class Promotion(Base):
     user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"), nullable=False)
     is_stackable: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False)
+    # Si True, ce code offre aussi les frais de livraison (cumulable avec une remise sur
+    # les produits ; discount_value peut etre 0 pour un code « livraison offerte » seul).
+    free_delivery: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
     email_verified_required: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

@@ -105,6 +105,7 @@ python -m arq worker.main.WorkerSettings
 Variables d'environnement requises : voir `.env.example`. À définir sur Railway (jamais commitées) :
 `DATABASE_URL`, `MONGO_URL`, `ARQ_REDIS_URL`, `REDIS_URL`, `JWT_SECRET`, `STRIPE_SECRET_KEY`,
 `STRIPE_WEBHOOK_SECRET`, `CLOUDINARY_*`, `CORS_ORIGINS`, `APP_BASE_URL`, `ENVIRONMENT=production`,
+`MAPBOX_ACCESS_TOKEN` (géocodage et zones par temps de trajet, voir `docs/modules/delivery.md`),
 et optionnellement `SENTRY_DSN`, `JWT_HMAC_SECRET`, `KDS_QR_ENCRYPTION_KEY`,
 `STRIPE_WEBHOOK_CONNECT_SECRET`, `SMTP_*`, `APNS_*`, `FCM_*`.
 

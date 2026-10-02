@@ -242,6 +242,9 @@ class TenantEstablishmentResponse(BaseModel):
     name: str
     timezone: str
     is_active: bool
+    # Position (WGS84) : centre des cartes de livraison. None tant qu'elle n'est pas renseignee.
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class TenantSuspendRequest(BaseModel):

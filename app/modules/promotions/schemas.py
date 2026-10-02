@@ -16,7 +16,8 @@ class PromotionCreate(BaseModel):
     code: str = Field(..., min_length=1, max_length=64)
     description: str | None = Field(None, max_length=255)
     discount_type: DiscountType
-    discount_value: float = Field(..., gt=0)
+    # 0 est autorise uniquement pour un code « livraison offerte » (free_delivery=True).
+    discount_value: float = Field(..., ge=0)
     min_order_amount: float = Field(0, ge=0)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
@@ -28,6 +29,7 @@ class PromotionCreate(BaseModel):
     user_id: int | None = None
     is_public: bool = True
     is_stackable: bool = False
+    free_delivery: bool = False
     email_verified_required: bool = False
     target_category_ids: list[int] = Field(default_factory=list)
     target_product_ids: list[int] = Field(default_factory=list)
@@ -41,6 +43,8 @@ class PromotionCreate(BaseModel):
     def validate_dates(self) -> "PromotionCreate":
         if self.starts_at and self.ends_at and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be after starts_at")
+        if self.discount_value <= 0 and not self.free_delivery:
+            raise ValueError("discount_value must be greater than 0 unless free_delivery is enabled")
         return self
 
 
@@ -48,7 +52,7 @@ class PromotionUpdate(BaseModel):
     code: str | None = Field(None, min_length=1, max_length=64)
     description: str | None = Field(None, max_length=255)
     discount_type: DiscountType | None = None
-    discount_value: float | None = Field(None, gt=0)
+    discount_value: float | None = Field(None, ge=0)
     min_order_amount: float | None = Field(None, ge=0)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
@@ -60,6 +64,7 @@ class PromotionUpdate(BaseModel):
     user_id: int | None = None
     is_public: bool | None = None
     is_stackable: bool | None = None
+    free_delivery: bool | None = None
     email_verified_required: bool | None = None
     target_category_ids: list[int] | None = None
     target_product_ids: list[int] | None = None
@@ -90,6 +95,7 @@ class PromotionOut(BaseModel):
     user_id: int | None = None
     is_public: bool = True
     is_stackable: bool = False
+    free_delivery: bool = False
     email_verified_required: bool = False
     targets: PromotionTargets = Field(default_factory=PromotionTargets)
 
@@ -101,6 +107,7 @@ class PromotionPublicOut(BaseModel):
     discount_type: DiscountType
     discount_value: float
     min_order_amount: float = 0
+    free_delivery: bool = False
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     targets: PromotionTargets = Field(default_factory=PromotionTargets)
@@ -157,6 +164,8 @@ class PromotionValidateOut(BaseModel):
     discounts: dict[str, float] = Field(default_factory=dict)
     promo_id: int | None = None
     promo_ids: list[int] = Field(default_factory=list)
+    # True si au moins un des codes offre les frais de livraison.
+    free_delivery: bool = False
 
 
 class PromotionUsageOut(BaseModel):

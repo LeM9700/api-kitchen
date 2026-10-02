@@ -56,7 +56,7 @@ Sources principales : `order`, `reward`, `checkout`, `staff`, `admin`, `system`.
 
 **`loyalty_rules`** : regles de bonus `category_multiplier`, `period_multiplier`, `day_multiplier`, `first_order`.
 
-**`loyalty_rewards`** : recompenses `discount_euros` ou `free_product`.
+**`loyalty_rewards`** : recompenses `discount_euros`, `free_product` ou `free_delivery` (frais de livraison offerts : echangee par le client elle genere un code promo a usage unique `REWARD-...` ; appliquee au comptoir elle debite les points ; refusee hors livraison, voir `docs/modules/delivery.md`).
 
 **`loyalty_point_reservations`** : reservations checkout avec `reserved`, `confirmed`, `cancelled`, `expired`.
 

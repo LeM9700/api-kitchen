@@ -378,6 +378,27 @@ async def redeem_reward(
 
     promo_code: str | None = None
 
+    if reward.reward_type == "free_delivery":
+        # Code a usage unique qui offre les frais de livraison : meme mecanisme que la
+        # remise en euros, il se saisit dans le champ ``promo_code`` de ``POST /orders``.
+        code = f"REWARD-{uuid.uuid4().hex[:10].upper()}"
+        promo = Promotion(
+            code=code,
+            description=f"Récompense fidélité : {reward.name}",
+            discount_type="fixed",
+            discount_value=0,
+            free_delivery=True,
+            max_uses=1,
+            max_uses_per_user=1,
+            user_id=user_id,
+            is_public=False,
+            is_active=True,
+        )
+        session.add(promo)
+        await session.commit()
+        await session.refresh(promo)
+        promo_code = promo.code
+
     if reward.reward_type == "discount_euros" and reward.discount_amount is not None:
         # Générer un code promo à usage unique lié à cet utilisateur.
         # Le code est non-public (invisible dans la liste publique) et ne peut être

@@ -21,7 +21,7 @@ Gestion des codes promo : CRUD admin, validation, application serveur-side dans 
 
 ## Modèles de données
 
-**`promotions`** (migration `0004` + `0009` + `0014` + `0029`) : `id`, `code` (unique, majuscules), `description`, `discount_type` (`fixed` | `percent`), `discount_value`, `min_order_amount`, `starts_at`, `ends_at`, `is_active`, `max_uses` (nullable = illimité), `max_uses_per_user` (nullable), `current_uses`, `first_order_only`, `campaign_id`, `user_id`, `is_public`, `is_stackable`, `email_verified_required`.
+**`promotions`** (migration `0004` + `0009` + `0014` + `0029`) : `id`, `code` (unique, majuscules), `description`, `discount_type` (`fixed` | `percent`), `discount_value`, `min_order_amount`, `starts_at`, `ends_at`, `is_active`, `max_uses` (nullable = illimité), `max_uses_per_user` (nullable), `current_uses`, `first_order_only`, `campaign_id`, `user_id`, `is_public`, `is_stackable`, `free_delivery` (le code offre aussi les frais de livraison ; `discount_value` peut valoir 0, migration `0074`), `email_verified_required`.
 
 **`promo_code_usages`** (migration `0014`) : `id`, `promo_code_id`, `user_id`, `order_id`, `used_at`. Contrainte unique `(promo_code_id, order_id)` — prévient les doublons sur retry.
 

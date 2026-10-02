@@ -100,7 +100,7 @@ class LoyaltyRewardCreate(BaseModel):
     """POST payload for a redeemable reward."""
 
     name: str = Field(..., max_length=128)
-    reward_type: str = Field(..., pattern="^(discount_euros|free_product)$")
+    reward_type: str = Field(..., pattern="^(discount_euros|free_product|free_delivery)$")
     points_required: int = Field(..., ge=1)
     discount_amount: Decimal | None = Field(None, gt=0)
     product_id: int | None = None
@@ -167,8 +167,9 @@ class RedeemResponse(BaseModel):
         free_product_id: ID du produit offert (uniquement si reward_type='free_product').
         remaining_points: Solde de points restant après débit.
         promo_code: Code promo à usage unique généré automatiquement pour les récompenses
-            de type 'discount_euros'. À passer dans le champ ``promo_code`` lors de la
-            création d'une commande. None pour les récompenses de type 'free_product'.
+            de type 'discount_euros' ou 'free_delivery'. À passer dans le champ
+            ``promo_code`` lors de la création d'une commande. None pour les récompenses de
+            type 'free_product'.
     """
 
     discount_euros: float | None = None

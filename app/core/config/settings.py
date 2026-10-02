@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     # Sentry — APM + tracking d'erreurs. Vide = désactivé (ex: en local/CI).
     sentry_dsn: str = ""
 
+    # Mapbox (geocodage d'adresses, isochrones des zones de livraison). Jeton SECRET, cote
+    # serveur uniquement : il ne doit jamais etre embarque dans une app. Vide = fonctions de
+    # geocodage desactivees (503 GEOCODING_NOT_CONFIGURED), le reste de la livraison continue
+    # de fonctionner avec des coordonnees deja connues.
+    mapbox_access_token: str = ""
+    # A activer si les coordonnees renvoyees sont conservees (c'est le cas : elles sont
+    # enregistrees sur la commande). Mapbox facture/autorise le stockage via son mode
+    # « permanent » : verifier que l'option est activee sur le compte avant de le passer a true.
+    mapbox_geocoding_permanent: bool = False
+
     jwt_access_expire_minutes: int = 15
     jwt_refresh_expire_days: int = 30
 
