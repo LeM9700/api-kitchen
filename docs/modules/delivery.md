@@ -273,7 +273,10 @@ revérifie les droits, aucun canal ciblé n'est à créer, et une coupure résea
 
 ### Limites connues (phase 5)
 
-- Partage **au premier plan uniquement** (pas de service d'arrière-plan vérifié) ; voir `PRIVACY.md`.
+- **Arrière-plan** (Android : service de premier plan + notification permanente ; iPhone : mode `location` + indicateur) : implémenté mais **non vérifié sur
+  appareil réel**. Application fermée/tuée : le partage s'arrête. Nouvelle version du texte (`2026-10-03-bg`) : l'accord est redemandé.
+- Le partage est piloté par la coque livreur (tous les onglets), qui vérifie les livraisons toutes les 15 s ; le serveur reste l'autorité
+  (`LOCATION_NOT_ACTIVE` arrête l'envoi).
 - ETA approximative, sans trafic ni itinéraire.
 - Pas de journal des consultations de la carte.
 

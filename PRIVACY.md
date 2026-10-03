@@ -74,6 +74,8 @@
 - **Accord du livreur, versionné** : sans accord à la version courante du texte, aucune position n'est acceptée
   (`403 LOCATION_CONSENT_REQUIRED`). L'accord se retire à tout moment depuis l'application : le partage s'arrête
   immédiatement. Le texte d'information annonce la durée de conservation réelle (donnée par le serveur).
+- **Texte d'information versionné** : il annonce le suivi en arrière-plan (`2026-10-03-bg`) ; un livreur qui avait accepté une version
+  précédente doit **accepter de nouveau** avant que sa position soit partagée.
 - **Qui voit quoi** : le **client** voit uniquement la position du livreur **de sa commande**, uniquement tant qu'elle est
   `out_for_delivery` (une position, jamais l'historique, ni vitesse, ni précision, ni identifiant du livreur ; seulement son
   prénom). Le **personnel autorisé** (permission commandes) voit la carte des livreurs **en route** (position, signal).
@@ -89,9 +91,13 @@
 
 **Limites connues**
 
-- Le partage ne fonctionne qu'**application ouverte au premier plan** : aucun service d'arrière-plan n'est configuré ni
-  vérifié sur appareil. Un livreur qui verrouille son téléphone ou quitte l'application n'envoie plus de position (le client
-  voit alors « dernière position il y a N min » et le comptoir une alerte « signal perdu » après 2 minutes).
+- **Arrière-plan** : le partage continue application en arrière-plan ou écran verrouillé, **pendant une livraison en route seulement**.
+  Sur Android, un service de premier plan affiche une **notification permanente** (« Livraison en cours ») ; sur iPhone, l'indicateur de
+  localisation reste visible. Il s'arrête dès que la dernière livraison en route se termine (vérifié toutes les 15 s, et confirmé par le serveur),
+  au retrait de l'accord, à la déconnexion, ou si le livreur retire l'autorisation dans les réglages du téléphone.
+  **Limites** : si l'application est **fermée** (balayée des applications récentes) ou tuée par le système (économiseur de batterie agressif selon la
+  marque), le partage s'arrête : le client voit « dernière position il y a N min » et le comptoir une alerte « signal perdu » après 2 minutes.
+  Cette configuration n'a **pas été vérifiée sur appareil réel** dans l'environnement de développement.
 - Aucune journalisation de **qui a consulté** la carte des livreurs n'existe encore.
 - Le retrait de l'accord arrête le traitement futur ; les positions déjà enregistrées restent jusqu'à leur purge (96 h).
 - L'export/effacement individuel des positions d'un livreur n'est pas implémenté (passe par la purge ou une requête

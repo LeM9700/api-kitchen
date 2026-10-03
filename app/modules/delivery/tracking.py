@@ -32,7 +32,8 @@ from app.modules.hr.models import EmployeeProfile, TimeClockEntry
 from app.modules.orders.models import Order
 
 # Version du texte d'information montre au livreur ; la changer redemande son accord.
-LOCATION_NOTICE_VERSION = "2026-10-03"
+# 2026-10-03-bg : le texte annonce desormais le partage en arriere-plan / ecran verrouille.
+LOCATION_NOTICE_VERSION = "2026-10-03-bg"
 
 MAX_BATCH = 30
 MAX_POINT_AGE = timedelta(minutes=10)

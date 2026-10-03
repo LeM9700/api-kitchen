@@ -96,9 +96,11 @@ API (webhook manqué — Stripe down, erreur 500 transitoire, etc.).
 - **Rotation de `JWT_SECRET`** : change tous les codes de remise en cours (ils sont recalcules, jamais stockes). A faire hors
   service, ou prevoir des livraisons sans code pour les commandes en route.
 - **Le client ne voit pas son livreur / la carte est vide** : vérifier dans l'ordre (1) la commande est `out_for_delivery` ; (2) le livreur a **accepté**
-  le partage (page Dispatch : « n'a pas accepté le partage de position ») ; (3) l'application du livreur est **ouverte au premier plan** (pas
-  de suivi en arrière-plan) et la localisation autorisée sur le téléphone ; (4) `GET /delivery/live` montre `signal_lost`.
-- **Livreur « signal perdu »** : appeler le livreur. Si l'application est fermée, la position se met à jour dès qu'il la rouvre (les points accumulés
+  le partage (page Dispatch : « n'a pas accepté le partage de position ») ; (3) l'application du livreur n'a **pas été fermée** (balayée des
+  applications récentes) et la localisation reste autorisée ; sur Android, la **notification « Livraison en cours »** doit être visible et
+  l'application exclue de l'optimisation de batterie (Réglages > Applications > Batterie > Sans restriction, surtout Xiaomi, Huawei,
+  Samsung, Oppo) ; sur iPhone, l'indicateur de localisation doit être visible ; (4) `GET /delivery/live` montre `signal_lost`.
+- **Livreur « signal perdu »** : appeler le livreur. Si l'application a été fermée ou tuée par le système, la position se met à jour dès qu'il la rouvre (les points accumulés
   hors réseau sont renvoyés, au plus 30).
 - **Purge GPS** : tâche ARQ `purge_driver_locations` (04 h 15 UTC). Vérifier dans les logs du worker `gps purge done`. Si elle ne tourne pas, les
   positions s'accumulent au-delà de 96 h (voir `PRIVACY.md`) : redémarrer le worker (§3). Ne **jamais** réduire `GPS_RETENTION_HOURS` sous 96
