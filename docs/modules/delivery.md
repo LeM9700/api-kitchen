@@ -234,6 +234,49 @@ d'echec sans enregistrement a traiter ni l'inverse. La livraison est close (`fai
 - Le code a 4 chiffres reste devinable (1 chance sur 2000 avec 5 essais) : il prouve une remise de bonne foi, il ne remplace pas une
   verification d'identite.
 
+## Suivi GPS des livreurs (phase 5)
+
+Voir aussi `PRIVACY.md` §5bis (traitement des données, conservation, limites).
+
+### Principes
+
+- **Accord du livreur, versionné** : `POST /delivery/driver/location-consent {version}` (409 `LOCATION_NOTICE_OUTDATED` si le texte a changé), `DELETE`
+  pour le retirer. `GET /delivery/driver/me` renvoie `location_consent`, `location_notice_version` et `location_retention_hours` (la
+  durée affichée au livreur vient du serveur).
+- **Envoi** : `POST /delivery/driver/location {points:[...]}` (1 à 30 points, 60 requêtes/min, role `driver`). Refusé sans accord (403
+  `LOCATION_CONSENT_REQUIRED`) et **hors livraison en route** (409 `LOCATION_NOT_ACTIVE`) ; l'app s'arrête alors. Un lot permet de renvoyer
+  des points accumulés hors réseau.
+- **Qualité** : points hors bornes, précision > 500 m, plus vieux que 10 min : ignorés ; horloge du téléphone en avance : ramenée à
+  l'heure serveur ; un lot en retard ne fait pas reculer la dernière position.
+- **Échantillonnage** : un point d'historique toutes les 20 s ou tous les 30 m ; la dernière position (`driver_last_locations`) est
+  toujours à jour ; chaque point porte la tournée (`run_id`) pour retrouver une course.
+- **Purge** : tâche ARQ `purge_driver_locations` (quotidienne, 04 h 15 UTC) ; conservation `GPS_RETENTION_HOURS` (défaut et plancher **96 h**).
+
+### Lecture
+
+| Route | Qui | Contenu |
+|---|---|---|
+| `GET /orders/{id}/driver-location` | client propriétaire, 30/min | position du livreur de **cette** commande tant qu'elle est `out_for_delivery` : `lat`, `lng`, `heading`, `age_seconds`, `stale` (> 60 s), `eta_minutes`, destination, prénom. 404 pour la commande d'un autre, 409 hors livraison. Jamais l'historique. |
+| `GET /delivery/live` | `orders:read` | livreurs actifs : `state` (`free`, `assigned`, `en_route`), position **seulement en route**, `stale`, `signal_lost` (> 120 s), consentement, livraisons. |
+
+La position d'une **course précédente** (antérieure au départ) n'est jamais présentée comme celle de la course en cours.
+
+### Estimation d'arrivée
+
+`eta_minutes` = distance à vol d'oiseau × 1,3 à 25 km/h (minimum 1 minute), recalculée à chaque position. C'est une **estimation**, pas un itinéraire
+(aucun appel Mapbox Directions) ; elle disparaît à l'arrivée du livreur.
+
+### Choix de transport
+
+Le client et le comptoir **interrogent** le serveur (toutes les 8 s et 10 s) plutôt que de recevoir des positions par WebSocket : chaque lecture
+revérifie les droits, aucun canal ciblé n'est à créer, et une coupure réseau est sans effet. Un canal WebSocket dédié reste possible plus tard.
+
+### Limites connues (phase 5)
+
+- Partage **au premier plan uniquement** (pas de service d'arrière-plan vérifié) ; voir `PRIVACY.md`.
+- ETA approximative, sans trafic ni itinéraire.
+- Pas de journal des consultations de la carte.
+
 ## Sécurité
 
 - Le contour des zones n'est lisible que du personnel (`/zones/manage`) : la liste publique ne l'expose pas.

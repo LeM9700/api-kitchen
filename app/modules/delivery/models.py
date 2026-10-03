@@ -176,6 +176,10 @@ class DriverProfile(Base):
     vehicle: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Inactif : ne recoit plus de livraison et n'a plus acces a l'ecran de livraison.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Consentement du livreur au partage de sa position pendant une livraison (voir
+    # delivery/tracking.py). Sans lui, aucune position n'est acceptee. Retire = NULL.
+    location_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    location_consent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -307,3 +311,45 @@ class DeliveryFailure(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolution_note: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# --------------------------------------------------------------------------- GPS livreur (phase 5)
+
+
+class DriverLocationPoint(Base):
+    """Historique **echantillonne** des positions d'un livreur pendant une livraison active.
+    Purge au-dela de ``gps_retention_hours`` (au moins 96 h) par une tache planifiee."""
+
+    __tablename__ = "driver_location_points"
+    __table_args__ = (
+        Index("ix_driver_location_points_driver_id_recorded_at", "driver_id", "recorded_at"),
+        Index("ix_driver_location_points_recorded_at", "recorded_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("driver_profiles.id"), nullable=False)
+    # Tournee en cours au moment de la mesure (pour retrouver une course en cas de litige).
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_runs.id"), nullable=True)
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    accuracy_m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speed_mps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    heading: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class DriverLastLocation(Base):
+    """Derniere position connue de chaque livreur (une ligne par livreur, ecrasee a chaque envoi)."""
+
+    __tablename__ = "driver_last_locations"
+
+    driver_id: Mapped[int] = mapped_column(ForeignKey("driver_profiles.id"), primary_key=True)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_runs.id"), nullable=True)
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    accuracy_m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speed_mps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    heading: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

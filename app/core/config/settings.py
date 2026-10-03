@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # « permanent » : verifier que l'option est activee sur le compte avant de le passer a true.
     mapbox_geocoding_permanent: bool = False
 
+    # Positions GPS des livreurs : duree de conservation de l'historique, en heures. Plancher de 96 h
+    # impose par le code (decision du restaurant : pouvoir verifier un litige) ; une valeur plus basse
+    # est ignoree, une valeur plus haute allonge la conservation (a declarer dans PRIVACY.md).
+    gps_retention_hours: int = 96
+
     jwt_access_expire_minutes: int = 15
     jwt_refresh_expire_days: int = 30
 

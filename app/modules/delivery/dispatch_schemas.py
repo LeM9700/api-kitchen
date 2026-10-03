@@ -144,6 +144,11 @@ class DriverDeliveryOut(BaseModel):
 class DriverMeOut(BaseModel):
     id: int
     user_id: int
+    # Partage de position : accord du livreur a la version courante du texte d'information.
+    location_consent: bool = False
+    location_notice_version: str = ""
+    # Duree de conservation des positions annoncee au livreur (heures).
+    location_retention_hours: int = 96
     full_name: str | None = None
     phone: str | None = None
     vehicle: str | None = None
@@ -229,3 +234,74 @@ class ResolveFailureRequest(BaseModel):
 
 class DeliverWithoutCodeRequest(BaseModel):
     reason: str = Field(..., min_length=3, max_length=200)
+
+
+class LocationPointIn(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    accuracy_m: float | None = Field(None, ge=0, le=100000)
+    speed_mps: float | None = Field(None, ge=0, le=200)
+    heading: float | None = Field(None, ge=0, le=360)
+    # Heure de la mesure sur le telephone (renseignee quand des points ont ete accumules hors reseau).
+    recorded_at: datetime | None = None
+
+
+class LocationBatchIn(BaseModel):
+    points: list[LocationPointIn] = Field(..., min_length=1, max_length=30)
+
+
+class LocationAckOut(BaseModel):
+    received: int
+    stored: int
+    active_deliveries: int
+
+
+class LocationConsentIn(BaseModel):
+    version: str = Field(..., min_length=1, max_length=32)
+
+
+class ClientDriverLocationOut(BaseModel):
+    """Ce que le client voit du livreur de sa commande : une position, jamais l'historique."""
+
+    available: bool
+    driver_first_name: str | None = None
+    destination_lat: float | None = None
+    destination_lng: float | None = None
+    arrived: bool = False
+    lat: float | None = None
+    lng: float | None = None
+    heading: float | None = None
+    recorded_at: datetime | None = None
+    age_seconds: int | None = None
+    stale: bool = False
+    eta_minutes: int | None = None
+
+
+class LiveDeliveryOut(BaseModel):
+    delivery_id: int
+    order_id: int
+    status: str
+    address: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+
+
+class LivePositionOut(BaseModel):
+    lat: float
+    lng: float
+    heading: float | None = None
+    recorded_at: datetime | None = None
+
+
+class LiveDriverOut(BaseModel):
+    driver_id: int
+    driver_name: str | None = None
+    clocked_in: bool = False
+    # free | assigned | en_route : la position n'est donnee que pour `en_route`.
+    state: str
+    position: LivePositionOut | None = None
+    age_seconds: int | None = None
+    stale: bool = False
+    signal_lost: bool = False
+    sharing_consent: bool = False
+    deliveries: list[LiveDeliveryOut] = Field(default_factory=list)

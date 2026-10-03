@@ -16,6 +16,7 @@ from app.core.http.deps import get_arq_pool, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.modules.delivery import dispatch_service as svc
 from app.modules.delivery import failures as failures_svc
+from app.modules.delivery import tracking
 from app.modules.delivery.dispatch_schemas import (
     AssignRequest,
     DeliverRequest,
@@ -32,6 +33,10 @@ from app.modules.delivery.dispatch_schemas import (
     DriverOut,
     DriverRecapOut,
     DriverUpdate,
+    LiveDriverOut,
+    LocationAckOut,
+    LocationBatchIn,
+    LocationConsentIn,
     ResolveFailureRequest,
     UnassignRequest,
 )
@@ -302,3 +307,43 @@ async def deliver_without_code(
             arq_pool=arq_pool,
         )
         return _action(delivery)
+
+
+# --------------------------------------------------------------------------- GPS
+
+
+@router.post("/driver/location-consent", status_code=204)
+async def grant_location_consent(body: LocationConsentIn, current_user=Depends(require_role("driver"))):
+    """Le livreur accepte le partage de sa position pendant ses livraisons (version du texte incluse)."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        await tracking.grant_consent(session, driver, body.version)
+
+
+@router.delete("/driver/location-consent", status_code=204)
+async def withdraw_location_consent(current_user=Depends(require_role("driver"))):
+    """Retire l'accord : plus aucune position n'est acceptee."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        await tracking.withdraw_consent(session, driver)
+
+
+@router.post("/driver/location", response_model=LocationAckOut)
+@limiter.limit("60/minute")
+async def driver_location(
+    request: Request, body: LocationBatchIn, current_user=Depends(require_role("driver"))
+):
+    """Positions du livreur (un point, ou un lot accumule hors reseau). Refusees hors livraison active."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        return await tracking.ingest(session, driver, [p.model_dump() for p in body.points])
+
+
+@router.get("/live", response_model=list[LiveDriverOut])
+async def live_drivers(
+    establishment_id: int | None = Query(None, ge=1),
+    current_user=Depends(require_permission("orders:read", "staff", "admin")),
+):
+    """Carte du comptoir : livreurs actifs, position (seulement en livraison), signal, charge."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await tracking.live_board(session, establishment_id)

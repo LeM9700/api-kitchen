@@ -181,6 +181,18 @@ async def get_delivery_code(request: Request, order_id: int, current_user=Depend
         )
 
 
+@router.get("/{order_id}/driver-location")
+@limiter.limit("30/minute")
+async def get_driver_location(request: Request, order_id: int, current_user=Depends(get_current_user)):
+    """Position du livreur de cette commande, pour son client, pendant la livraison seulement."""
+    from app.modules.delivery import tracking
+    from app.modules.delivery.dispatch_schemas import ClientDriverLocationOut
+
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        data = await tracking.client_view(session, order_id, int(current_user["id"]))
+        return ClientDriverLocationOut(**data)
+
+
 @router.get("/{order_id}", response_model=OrderDetailOut)
 async def get_order_detail(order_id: int, current_user=Depends(get_current_user)):
     role = current_user.get("role")

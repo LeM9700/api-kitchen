@@ -14,6 +14,7 @@ from worker.tasks.emails import (
     send_verification_email,
 )
 from worker.tasks.fx_rates_sync import refresh_fx_rates
+from worker.tasks.gps_purge import purge_driver_locations
 from worker.tasks.haccp_alerts import check_haccp_cooling_alerts, check_haccp_nc_alerts
 from worker.tasks.hr_alerts import (
     check_labor_cost_risk,
@@ -54,6 +55,7 @@ class WorkerSettings:
         aggregate_stock_snapshot,
         sync_catalog_from_hub,
         sync_stale_catalog_connections,
+        purge_driver_locations,
     ]
     # Cron jobs ARQ : les fonctions recoivent uniquement ctx (pas de parametres dynamiques).
     cron_jobs: ClassVar[list] = [
@@ -66,6 +68,7 @@ class WorkerSettings:
         # de concurrencer le pic du soir. Timeout étendu à 600s (au lieu des 120s
         # globaux ci-dessous) pour les tenants avec beaucoup d'utilisateurs.
         cron(expire_loyalty_points, hour=3, minute=0, timeout=600),
+        cron(purge_driver_locations, hour=4, minute=15, timeout=600),
         cron(aggregate_stock_snapshot, hour=set(range(24)), minute={0}),
         cron(check_weekly_overtime, hour=2, minute=0),
         cron(check_labor_cost_risk, hour=3, minute=0),

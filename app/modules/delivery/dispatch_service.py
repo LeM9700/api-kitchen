@@ -23,7 +23,7 @@ from app.core.auth.security import get_password_hash
 from app.core.http.errors import AppError
 from app.core.i18n.translate import t
 from app.modules.auth.models import User
-from app.modules.delivery import failures, lifecycle, proof
+from app.modules.delivery import failures, lifecycle, proof, tracking
 from app.modules.delivery.models import (
     DELIVERY_ACTIVE_STATUSES,
     Delivery,
@@ -464,6 +464,9 @@ async def driver_me(session: AsyncSession, driver: DriverProfile) -> dict:
         "establishment_id": driver.establishment_id,
         "clocked_in": out["clocked_in"],
         "on_break": out["on_break"],
+        "location_consent": tracking.has_consent(driver),
+        "location_notice_version": tracking.LOCATION_NOTICE_VERSION,
+        "location_retention_hours": tracking.retention_hours(),
     }
 
 
