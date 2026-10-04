@@ -55,7 +55,7 @@ def _dlc_gate_message(critical_count: int, *, gate_enabled: bool) -> str | None:
     if gate_enabled:
         return (
             f"{critical_count} {noun} bloquent la validation HACCP. "
-            "Regularisez, retirez du stock disponible ou forcez avec trace manager."
+            "Regularisez ou retirez les lots du stock disponible."
         )
     return (
         f"{critical_count} {noun} a traiter avant d'activer le gate DLC strict "
@@ -84,37 +84,12 @@ async def _dlc_gate_snapshot(session: AsyncSession) -> dict:
     }
 
 
-def _record_dlc_force_trace(
-    session: AsyncSession,
-    *,
-    check_session: HaccpCheckSession,
-    user_id: int,
-    snapshot: dict,
-) -> None:
-    critical_count = int(snapshot.get("critical_count") or 0)
-    if critical_count <= 0:
-        return
-    description = (
-        f"Validation manager avec {critical_count} risque(s) DLC critique(s) "
-        f"sur le check {check_session.session_type} du {check_session.date}."
-    )
-    session.add(
-        HaccpNonConformity(
-            session_id=check_session.id,
-            source_type="dlc",
-            source_id=None,
-            description=description,
-            corrective_action="Validation forcee par manager; DLC a regulariser.",
-            validated_by=user_id,
-            validated_at=datetime.now(timezone.utc),
-            status="open",
-        )
-    )
-
-
 # ─── Equipment ───────────────────────────────────────────────────────────────
 
-async def list_equipment(session: AsyncSession, active_only: bool = True) -> list[HaccpEquipment]:
+
+async def list_equipment(
+    session: AsyncSession, active_only: bool = True
+) -> list[HaccpEquipment]:
     """Retourne les équipements du tenant.
 
     Args:
@@ -161,7 +136,9 @@ async def create_equipment(session: AsyncSession, data: dict) -> HaccpEquipment:
     return equipment
 
 
-async def update_equipment(session: AsyncSession, equipment_id: int, data: dict) -> HaccpEquipment:
+async def update_equipment(
+    session: AsyncSession, equipment_id: int, data: dict
+) -> HaccpEquipment:
     """Met à jour un équipement (champs fournis uniquement).
 
     Raises:
@@ -177,6 +154,7 @@ async def update_equipment(session: AsyncSession, equipment_id: int, data: dict)
 
 
 # ─── Check Sessions ───────────────────────────────────────────────────────────
+
 
 async def get_or_create_session(
     session: AsyncSession,
@@ -222,7 +200,9 @@ async def get_or_create_session(
     return check_session
 
 
-async def get_session_by_id(session: AsyncSession, session_id: int) -> HaccpCheckSession:
+async def get_session_by_id(
+    session: AsyncSession, session_id: int
+) -> HaccpCheckSession:
     """Récupère une session par ID.
 
     Raises:
@@ -243,18 +223,15 @@ async def complete_session(
 ) -> HaccpCheckSession:
     """Marque une session comme complète.
 
-    Si ``force=True``, utilise le statut ``incomplete_validated`` pour
-    permettre la validation même avec des éléments manquants (décision manager).
-
-    [⚠️ PROD] Un session ``complete`` ou ``incomplete_validated`` déverrouille
-    le gate ouverture/fermeture côté app client.
+    ``force=True`` est refusé. Ce service historique n'accorde jamais
+    une validation au parcours strict par établissement.
 
     Args:
         session: Session DB tenant.
         session_id: ID de la session à compléter.
         user_id: ID du manager qui valide.
         notes: Notes optionnelles.
-        force: Si True → incomplete_validated même si des checks manquent.
+        force: Conservé pour refuser explicitement les anciens clients.
 
     Returns:
         Session mise à jour.
@@ -262,25 +239,32 @@ async def complete_session(
     Raises:
         AppError: CONFLICT si déjà complétée.
     """
+    if force:
+        raise AppError(
+            "HACCP_FORCE_FORBIDDEN",
+            "Un contrôle incomplet ne peut pas être validé de force.",
+            422,
+        )
     check_session = await get_session_by_id(session, session_id)
 
     if check_session.status in ("complete", "incomplete_validated"):
         raise AppError("CONFLICT", "Cette session est déjà complétée.", 409)
 
     # Vérification des éléments requis
-    equipment_count = await _count_equipment_for_session(session, check_session.session_type)
+    equipment_count = await _count_equipment_for_session(
+        session, check_session.session_type
+    )
     temp_count = await _count_temperature_logs(session, session_id)
-    cleaning_count = await _count_cleaning_tasks_for_session(session, check_session.session_type)
+    cleaning_count = await _count_cleaning_tasks_for_session(
+        session, check_session.session_type
+    )
     cleaning_done = await _count_cleaning_logs(session, session_id)
 
     all_done = (temp_count >= equipment_count) and (cleaning_done >= cleaning_count)
     dlc_snapshot = await _dlc_gate_snapshot(session)
-    dlc_blocks = (
-        dlc_snapshot["enabled"]
-        and dlc_snapshot["critical_count"] > 0
-    )
+    dlc_blocks = dlc_snapshot["enabled"] and dlc_snapshot["critical_count"] > 0
 
-    if dlc_blocks and not force:
+    if dlc_blocks:
         raise AppError(
             "HACCP_DLC_GATE_BLOCKED",
             dlc_snapshot["message"]
@@ -289,32 +273,21 @@ async def complete_session(
             "dlc",
         )
 
-    if not all_done and not force:
+    if not all_done:
         missing = []
         if temp_count < equipment_count:
-            missing.append(f"{equipment_count - temp_count} relevé(s) de température manquant(s)")
+            missing.append(
+                f"{equipment_count - temp_count} relevé(s) de température manquant(s)"
+            )
         if cleaning_done < cleaning_count:
             missing.append(f"{cleaning_count - cleaning_done} tâche(s) ND manquante(s)")
         raise AppError(
             "INCOMPLETE_SESSION",
-            f"Session incomplète : {', '.join(missing)}. Utilisez force=true pour valider quand même.",
+            f"Session incomplète : {', '.join(missing)}. Complétez les contrôles requis.",
             422,
         )
 
-    if force and dlc_snapshot["critical_count"] > 0:
-        _record_dlc_force_trace(
-            session,
-            check_session=check_session,
-            user_id=user_id,
-            snapshot=dlc_snapshot,
-        )
-
-    new_status = (
-        "complete"
-        if all_done and not (force and dlc_snapshot["critical_count"] > 0)
-        else "incomplete_validated"
-    )
-    check_session.status = new_status
+    check_session.status = "complete"
     check_session.completed_by = user_id
     check_session.completed_at = datetime.now(timezone.utc)
     check_session.notes = notes
@@ -327,30 +300,52 @@ async def complete_session(
 async def _count_equipment_for_session(session: AsyncSession, session_type: str) -> int:
     """Nombre d'équipements actifs qui doivent être contrôlés pour ce type de session."""
     if session_type == "opening":
-        stmt = select(func.count()).select_from(HaccpEquipment).where(
-            and_(HaccpEquipment.is_active.is_(True), HaccpEquipment.check_at_opening.is_(True))
+        stmt = (
+            select(func.count())
+            .select_from(HaccpEquipment)
+            .where(
+                and_(
+                    HaccpEquipment.is_active.is_(True),
+                    HaccpEquipment.check_at_opening.is_(True),
+                )
+            )
         )
     else:
-        stmt = select(func.count()).select_from(HaccpEquipment).where(
-            and_(HaccpEquipment.is_active.is_(True), HaccpEquipment.check_at_closing.is_(True))
+        stmt = (
+            select(func.count())
+            .select_from(HaccpEquipment)
+            .where(
+                and_(
+                    HaccpEquipment.is_active.is_(True),
+                    HaccpEquipment.check_at_closing.is_(True),
+                )
+            )
         )
     result = await session.execute(stmt)
     return result.scalar_one() or 0
 
 
 async def _count_temperature_logs(session: AsyncSession, session_id: int) -> int:
-    stmt = select(func.count()).select_from(HaccpTemperatureLog).where(
-        HaccpTemperatureLog.session_id == session_id
+    stmt = (
+        select(func.count())
+        .select_from(HaccpTemperatureLog)
+        .where(HaccpTemperatureLog.session_id == session_id)
     )
     result = await session.execute(stmt)
     return result.scalar_one() or 0
 
 
-async def _count_cleaning_tasks_for_session(session: AsyncSession, session_type: str) -> int:
-    stmt = select(func.count()).select_from(HaccpCleaningTask).where(
-        and_(
-            HaccpCleaningTask.is_active.is_(True),
-            HaccpCleaningTask.session_type.in_([session_type, "both"]),
+async def _count_cleaning_tasks_for_session(
+    session: AsyncSession, session_type: str
+) -> int:
+    stmt = (
+        select(func.count())
+        .select_from(HaccpCleaningTask)
+        .where(
+            and_(
+                HaccpCleaningTask.is_active.is_(True),
+                HaccpCleaningTask.session_type.in_([session_type, "both"]),
+            )
         )
     )
     result = await session.execute(stmt)
@@ -358,14 +353,17 @@ async def _count_cleaning_tasks_for_session(session: AsyncSession, session_type:
 
 
 async def _count_cleaning_logs(session: AsyncSession, session_id: int) -> int:
-    stmt = select(func.count()).select_from(HaccpCleaningLog).where(
-        HaccpCleaningLog.session_id == session_id
+    stmt = (
+        select(func.count())
+        .select_from(HaccpCleaningLog)
+        .where(HaccpCleaningLog.session_id == session_id)
     )
     result = await session.execute(stmt)
     return result.scalar_one() or 0
 
 
 # ─── Temperature Logs ─────────────────────────────────────────────────────────
+
 
 async def log_temperature(
     session: AsyncSession,
@@ -399,7 +397,11 @@ async def log_temperature(
     # Calcul conformité
     is_compliant = True
     if equipment.target_min_temp is not None and equipment.target_max_temp is not None:
-        is_compliant = equipment.target_min_temp <= data["measured_temp"] <= equipment.target_max_temp
+        is_compliant = (
+            equipment.target_min_temp
+            <= data["measured_temp"]
+            <= equipment.target_max_temp
+        )
 
     log = HaccpTemperatureLog(
         session_id=session_id,
@@ -431,15 +433,20 @@ async def log_temperature(
     return log
 
 
-async def list_temperature_logs(session: AsyncSession, session_id: int) -> list[HaccpTemperatureLog]:
-    stmt = select(HaccpTemperatureLog).where(
-        HaccpTemperatureLog.session_id == session_id
-    ).order_by(HaccpTemperatureLog.logged_at)
+async def list_temperature_logs(
+    session: AsyncSession, session_id: int
+) -> list[HaccpTemperatureLog]:
+    stmt = (
+        select(HaccpTemperatureLog)
+        .where(HaccpTemperatureLog.session_id == session_id)
+        .order_by(HaccpTemperatureLog.logged_at)
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
 # ─── DLC Checks ───────────────────────────────────────────────────────────────
+
 
 async def _create_dlc_check(
     session: AsyncSession,
@@ -513,10 +520,14 @@ async def create_standalone_dlc_check(
     return await _create_dlc_check(session, None, data, user_id)
 
 
-async def list_dlc_checks(session: AsyncSession, session_id: int) -> list[HaccpDlcCheck]:
-    stmt = select(HaccpDlcCheck).where(
-        HaccpDlcCheck.session_id == session_id
-    ).order_by(HaccpDlcCheck.logged_at)
+async def list_dlc_checks(
+    session: AsyncSession, session_id: int
+) -> list[HaccpDlcCheck]:
+    stmt = (
+        select(HaccpDlcCheck)
+        .where(HaccpDlcCheck.session_id == session_id)
+        .order_by(HaccpDlcCheck.logged_at)
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -564,6 +575,7 @@ async def delete_dlc_check(session: AsyncSession, dlc_id: int) -> None:
 
 # ─── Cleaning Tasks ───────────────────────────────────────────────────────────
 
+
 async def list_cleaning_tasks(
     session: AsyncSession,
     session_type: str | None = None,
@@ -591,7 +603,9 @@ async def create_cleaning_task(session: AsyncSession, data: dict) -> HaccpCleani
     return task
 
 
-async def update_cleaning_task(session: AsyncSession, task_id: int, data: dict) -> HaccpCleaningTask:
+async def update_cleaning_task(
+    session: AsyncSession, task_id: int, data: dict
+) -> HaccpCleaningTask:
     task = await session.get(HaccpCleaningTask, task_id)
     if not task:
         raise AppError("NOT_FOUND", "Tâche ND introuvable.", 404)
@@ -641,15 +655,20 @@ async def log_cleaning(
     return log
 
 
-async def list_cleaning_logs(session: AsyncSession, session_id: int) -> list[HaccpCleaningLog]:
-    stmt = select(HaccpCleaningLog).where(
-        HaccpCleaningLog.session_id == session_id
-    ).order_by(HaccpCleaningLog.completed_at)
+async def list_cleaning_logs(
+    session: AsyncSession, session_id: int
+) -> list[HaccpCleaningLog]:
+    stmt = (
+        select(HaccpCleaningLog)
+        .where(HaccpCleaningLog.session_id == session_id)
+        .order_by(HaccpCleaningLog.completed_at)
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
 # ─── Non-Conformities ─────────────────────────────────────────────────────────
+
 
 async def list_non_conformities(
     session: AsyncSession,
@@ -705,6 +724,7 @@ async def update_non_conformity(
 
 # ─── Reception Controls ───────────────────────────────────────────────────────
 
+
 async def create_reception_control(
     session: AsyncSession,
     data: dict,
@@ -731,6 +751,7 @@ async def list_reception_controls(
 
 
 # ─── Cooling Logs ─────────────────────────────────────────────────────────────
+
 
 async def create_cooling_log(
     session: AsyncSession,
@@ -783,7 +804,9 @@ async def update_cooling_log(
     return log
 
 
-async def list_cooling_logs(session: AsyncSession, active_only: bool = False) -> list[HaccpCoolingLog]:
+async def list_cooling_logs(
+    session: AsyncSession, active_only: bool = False
+) -> list[HaccpCoolingLog]:
     stmt = select(HaccpCoolingLog)
     if active_only:
         stmt = stmt.where(HaccpCoolingLog.ended_at.is_(None))
@@ -793,6 +816,7 @@ async def list_cooling_logs(session: AsyncSession, active_only: bool = False) ->
 
 
 # ─── Training Records ─────────────────────────────────────────────────────────
+
 
 async def create_training_record(
     session: AsyncSession,
@@ -820,6 +844,7 @@ async def list_training_records(
 
 # ─── Frying Oil Logs ─────────────────────────────────────────────────────────
 
+
 async def log_frying_oil(
     session: AsyncSession,
     session_id: int,
@@ -840,7 +865,11 @@ async def log_frying_oil(
     # data vient de body.model_dump() : color_ok/odor_ok sont toujours presentes
     # (None si non renseignees) -- dict.get(cle, defaut) n'applique le defaut
     # que si la cle est absente, jamais si elle vaut deja None explicitement.
-    is_compliant = polarity_ok and data.get("color_ok") is not False and data.get("odor_ok") is not False
+    is_compliant = (
+        polarity_ok
+        and data.get("color_ok") is not False
+        and data.get("odor_ok") is not False
+    )
 
     log = HaccpFryingOilLog(
         session_id=session_id,
@@ -854,7 +883,9 @@ async def log_frying_oil(
     if not is_compliant:
         reasons = []
         if not polarity_ok:
-            reasons.append(f"polarité {data['polarity_percent']}% ≥ {OIL_POLARITY_LIMIT}%")
+            reasons.append(
+                f"polarité {data['polarity_percent']}% ≥ {OIL_POLARITY_LIMIT}%"
+            )
         if not data.get("color_ok", True):
             reasons.append("couleur non conforme")
         if not data.get("odor_ok", True):
@@ -875,6 +906,7 @@ async def log_frying_oil(
 
 
 # ─── Status (gate bloquant) ───────────────────────────────────────────────────
+
 
 async def get_haccp_status(session: AsyncSession, today: date) -> HaccpStatusResponse:
     """Retourne l'état HACCP du jour (gate bloquant ouverture/fermeture).
@@ -917,18 +949,24 @@ async def get_haccp_status(session: AsyncSession, today: date) -> HaccpStatusRes
         temps_done = await _count_temperature_logs(session, cs.id)
         temps_total = await _count_equipment_for_session(session, stype)
 
-        dlc_stmt = select(func.count()).select_from(HaccpDlcCheck).where(
-            HaccpDlcCheck.session_id == cs.id
+        dlc_stmt = (
+            select(func.count())
+            .select_from(HaccpDlcCheck)
+            .where(HaccpDlcCheck.session_id == cs.id)
         )
         dlc_done = (await session.execute(dlc_stmt)).scalar_one() or 0
 
         cleaning_done = await _count_cleaning_logs(session, cs.id)
         cleaning_total = await _count_cleaning_tasks_for_session(session, stype)
 
-        nc_stmt = select(func.count()).select_from(HaccpNonConformity).where(
-            and_(
-                HaccpNonConformity.session_id == cs.id,
-                HaccpNonConformity.status != "closed",
+        nc_stmt = (
+            select(func.count())
+            .select_from(HaccpNonConformity)
+            .where(
+                and_(
+                    HaccpNonConformity.session_id == cs.id,
+                    HaccpNonConformity.status != "closed",
+                )
             )
         )
         has_nc = ((await session.execute(nc_stmt)).scalar_one() or 0) > 0
@@ -948,13 +986,15 @@ async def get_haccp_status(session: AsyncSession, today: date) -> HaccpStatusRes
     closing_summary = await _build_summary("closing")
 
     # Compter les NC ouvertes toutes sessions confondues
-    open_nc_stmt = select(func.count()).select_from(HaccpNonConformity).where(
-        HaccpNonConformity.status != "closed"
+    open_nc_stmt = (
+        select(func.count())
+        .select_from(HaccpNonConformity)
+        .where(HaccpNonConformity.status != "closed")
     )
     open_nc = (await session.execute(open_nc_stmt)).scalar_one() or 0
 
-    can_open = opening_summary.status in ("complete", "incomplete_validated")
-    can_close = closing_summary.status in ("complete", "incomplete_validated")
+    can_open = opening_summary.status == "complete"
+    can_close = closing_summary.status == "complete"
     dlc_snapshot = await _dlc_gate_snapshot(session)
     if dlc_snapshot["status"] == "blocked":
         can_open = False

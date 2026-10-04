@@ -37,6 +37,9 @@ Permissions actuellement gate-keepées par `require_permission(...)` dans le cod
 | `catalog:write`               | Modification du catalogue produits          |
 | `catalog:availability`        | Bascule de disponibilité produit             |
 | `haccp:read`                  | Consultation des relevés HACCP               |
+| `haccp:write`                 | Démarrage d'une checklist et saisie des preuves HACCP |
+| `haccp:validate`              | Validation complète et régularisation d'une session HACCP |
+| `haccp:manage`                | Affectation du staff à un établissement HACCP |
 | `orders:read`                 | Consultation des commandes                   |
 | `orders:write`                | Modification des commandes                   |
 | `orders:manual`               | Création de commandes manuelles (guichet)    |
