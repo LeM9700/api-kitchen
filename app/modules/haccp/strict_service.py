@@ -726,6 +726,8 @@ async def decision(session, site):
         "daily_haccp_satisfied": not reasons,
         "blockers": reasons,
         "strict_enabled": bool(config and config.strict_enabled),
-        "ordering_enforced": False,
+        # Expose the effective gate state to supervision clients. The order
+        # service remains authoritative; this field is informational only.
+        "ordering_enforced": bool(config and config.strict_enabled),
         "activation_available": False,
     }
