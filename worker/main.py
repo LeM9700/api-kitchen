@@ -16,6 +16,7 @@ from worker.tasks.emails import (
 from worker.tasks.fx_rates_sync import refresh_fx_rates
 from worker.tasks.gps_purge import purge_driver_locations
 from worker.tasks.haccp_alerts import check_haccp_cooling_alerts, check_haccp_nc_alerts
+from worker.tasks.haccp_opening_reminders import schedule_haccp_opening_reminders
 from worker.tasks.hr_alerts import (
     check_labor_cost_risk,
     check_weekly_overtime,
@@ -79,6 +80,10 @@ class WorkerSettings:
         ),
         # HACCP : alerte NC en retard — 8h00 quotidien (début de service).
         cron(check_haccp_nc_alerts, hour=8, minute=0),
+        cron(
+            schedule_haccp_opening_reminders,
+            minute={0, 15, 30, 45},
+        ),
         cron(
             process_scheduled_closures,
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},

@@ -6,6 +6,7 @@ Les consignes opérationnelles de chaque phase sont conservées dans des fichier
 - [Phase 2 — contrôles stricts et régularisation](haccp-phase2-production.md)
 - [Phase 3 — stock local, lots et allocations](haccp-phase3-production.md)
 - [Phase 4 — commandes et paiements](haccp-phase4-production.md)
+- [Phase 5 — rappels d'ouverture](haccp-phase5-production.md)
 
 Les phases suivantes ajouteront leur guide dans ce même répertoire. Chaque guide précise les
 préconditions, les vérifications après déploiement et la stratégie de retour arrière. Aucun guide
