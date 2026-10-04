@@ -83,9 +83,14 @@ uv run alembic check                 # vérifier que les modèles ORM correspond
 ```
 
 Les migrations appliquent le DDL à **tous les tenants existants** (boucle sur `public.tenants`).
-Un nouveau tenant est provisionné directement via `_TENANT_DDL_STATEMENTS`
-(`app/modules/auth/service.py`) — toute modification de schéma doit être répercutée aux deux
-endroits (migration Alembic + cette liste), voir le commentaire en tête de fichier.
+Un nouveau tenant est provisionné via `Base.metadata.create_all` dans
+`app/core/tenancy/provisioning.py`. Toute modification doit être présente dans la migration
+Alembic et les modèles enregistrés dans `app/core/database/tenant_models.py`, avec des seeds
+cohérents pour les tenants neufs et existants.
+
+La migration HACCP `haccp_p1_20261003` est additive et refuse le downgrade destructif.
+Consulter [la procédure de livraison de la phase 1](docs/operations/haccp-phase1-production.md)
+avant son déploiement ou un retour à la version précédente de l'application.
 
 ## Endpoints d'exploitation
 

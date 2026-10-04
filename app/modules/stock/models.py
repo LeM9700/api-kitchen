@@ -106,6 +106,7 @@ class StockMovement(Base):
 class IngredientBatch(Base):
     __tablename__ = "ingredient_batches"
     __table_args__ = (
+        UniqueConstraint("id", "ingredient_id", name="uq_batch_id_ingredient"),
         Index("ix_ingredient_batches_ingredient", "ingredient_id"),
         Index("ix_ingredient_batches_expires_at", "expires_at"),
         CheckConstraint(
