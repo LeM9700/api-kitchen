@@ -576,7 +576,7 @@ def _create_tables(bind):
                 ],
                 name="fk_position_site_stock",
             ),
-            sa.PrimaryKeyConstraint("batch_id"),
+            sa.PrimaryKeyConstraint("batch_id", "establishment_id", "ingredient_id"),
             sa.UniqueConstraint(
                 "batch_id",
                 "establishment_id",

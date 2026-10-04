@@ -1,8 +1,8 @@
 """Additive stock foundations. Legacy services do not write these tables yet.
 
-A position assigns one physical batch to exactly one establishment. NULL
-remaining_quantity means unknown, never zero or usable. Reconciliation and
-allocation services are deliberately deferred to sprint phase 3.
+    A position scopes one physical batch to one establishment. The same batch
+    may therefore be tracked independently at multiple establishments. NULL
+    remaining_quantity means unknown, never zero or usable.
 """
 
 from datetime import datetime
@@ -84,8 +84,8 @@ class StockBatchPosition(Base):
     )
 
     batch_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    establishment_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    ingredient_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    establishment_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ingredient_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     remaining_quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     excluded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

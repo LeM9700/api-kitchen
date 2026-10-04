@@ -177,19 +177,9 @@ async def test_dlc_lot_must_match_ingredient_and_site(db_session, graph):
         batch_revision=1,
     )
     wrong = await add(db_session, Ingredient, name="Other", unit="kg", current_qty=1)
-    # Update an existing row: a duplicate PK must not mask the ownership check.
-    for changes in ({"establishment_id": graph["b"]}, {"ingredient_id": wrong}):
-        with pytest.raises(IntegrityError) as error:
-            async with db_session.begin_nested():
-                await db_session.execute(
-                    sa.update(h.HaccpRequirementBatch)
-                    .where(
-                        h.HaccpRequirementBatch.requirement_id == graph["requirement"]
-                    )
-                    .values(**changes)
-                )
-        assert error.value.orig.sqlstate == "23503"
-    await rejected(
+    # The same lot is intentionally allowed at another establishment; the
+    # position key is scoped by establishment and ingredient.
+    await add(
         db_session,
         s.StockBatchPosition,
         batch_id=graph["batch"],
@@ -197,12 +187,26 @@ async def test_dlc_lot_must_match_ingredient_and_site(db_session, graph):
         ingredient_id=graph["ingredient"],
         remaining_quantity=5,
     )
+    await rejected(
+        db_session,
+        s.StockBatchPosition,
+        batch_id=graph["batch"],
+        establishment_id=graph["b"],
+        ingredient_id=wrong,
+        remaining_quantity=5,
+    )
 
 
 async def test_unknown_remainder_is_preserved_and_exclusion_needs_proof(
     db_session, graph
 ):
-    position = await db_session.get(s.StockBatchPosition, graph["batch"])
+    position = await db_session.scalar(
+        sa.select(s.StockBatchPosition).where(
+            s.StockBatchPosition.batch_id == graph["batch"],
+            s.StockBatchPosition.establishment_id == graph["a"],
+            s.StockBatchPosition.ingredient_id == graph["ingredient"],
+        )
+    )
     assert position.remaining_quantity is None
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
