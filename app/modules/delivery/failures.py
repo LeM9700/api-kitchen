@@ -44,13 +44,22 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def get_rules(session: AsyncSession) -> dict:
+async def get_rules(session: AsyncSession, establishment_id: int | None = None) -> dict:
+    """Regles de preuve (generales) et d'echec. Les regles d'echec d'un etablissement priment sur le
+    reglage general du tenant quand elles sont definies (voir ``dispatch_settings``)."""
     row = await session.scalar(select(RestaurantDeliverySettings).order_by(RestaurantDeliverySettings.id).limit(1))
-    return {
+    rules = {
         "proof_required": bool(row.delivery_proof_required) if row else False,
         "min_wait_minutes": int(row.failure_min_wait_minutes) if row else 5,
         "min_call_attempts": int(row.failure_min_call_attempts) if row else 1,
     }
+    if establishment_id is not None:
+        from app.modules.delivery import dispatch_settings
+
+        effective = await dispatch_settings.get_effective(session, establishment_id)
+        rules["min_wait_minutes"] = effective["failure_min_wait_minutes"]
+        rules["min_call_attempts"] = effective["failure_min_call_attempts"]
+    return rules
 
 
 async def report_failure(
@@ -80,7 +89,7 @@ async def report_failure(
 
     waited: int | None = None
     if reason in WAITING_REASONS:
-        rules = await get_rules(session)
+        rules = await get_rules(session, driver.establishment_id)
         if delivery.status != "arrived" or delivery.arrived_at is None:
             raise AppError(
                 "FAILURE_ARRIVAL_REQUIRED",

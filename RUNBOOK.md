@@ -107,6 +107,22 @@ API (webhook manqué — Stripe down, erreur 500 transitoire, etc.).
   (ignoré par le code) ; l'augmenter exige de mettre `PRIVACY.md` à jour.
 - **Litige sur une course** : les positions échantillonnées d'un livreur (`driver_location_points`, avec `run_id`) sont conservées 96 h minimum après
   la mesure ; les extraire **avant** la purge si nécessaire.
+- **Un livreur ne voit aucune commande « Disponibles »** : vérifier dans l'ordre (1) `driver_dispatch_enabled` actif ; (2) l'établissement est en mode
+  `self_assign` (page Dispatch, carte de l'établissement) ; (3) la commande est une livraison confirmée (statut `confirmed`, `queued`, `preparing` ou `ready`) de **son** établissement ;
+  (4) elle n'est pas déjà attribuée (`ORDER_ALREADY_TAKEN`, voir « En cours » au comptoir).
+- **« Plafond atteint » (409 `DRIVER_CAPACITY_REACHED`)** : le livreur a déjà le maximum de livraisons `assigned`/`out_for_delivery`/`arrived`. Il livre ou rend
+  une commande ; le comptoir peut toujours attribuer au-delà. Le plafond se règle par établissement (1 à 10).
+- **Une commande est restée coincée chez un livreur absent** : le comptoir la retire (bouton « Retirer » de la page Dispatch) ; seule une commande **non partie** peut être
+  rendue/retirée. Après départ : échec de livraison ou annulation.
+- **Repasser un établissement en mode comptoir en urgence** : page Dispatch, carte de l'établissement (administrateur), ou `PUT
+  /delivery/establishments/{id}/dispatch-settings` avec `{"expected_version": N, "dispatch_mode": "counter"}`. Les livraisons déjà prises restent attribuées.
+  Pour couper toute prise libre partout : `driver_dispatch_enabled` à faux.
+- **Règles d'échec différentes selon l'établissement** : `GET .../dispatch-settings` montre les valeurs effectives et `failure_rules_overridden`. Remettre
+  `null` sur une règle pour qu'elle suive de nouveau le réglage général.
+- **Retard affiché à tort** : l'estimation est recalculée au départ ; sans coordonnées de l'établissement ni zone, c'est celle de la commande qui s'applique.
+  Renseigner la position de l'établissement.
+- **Rollback de la migration `0079`** : `alembic downgrade 0078` supprime les réglages par établissement (retour : mode comptoir, plafond 3, règles
+  générales). Les livraisons prises en libre-service ne sont pas touchées. Même réserve que `0076` sur `out of shared memory` localement.
 - **Rollback de la migration `0078`** : `alembic downgrade 0077` supprime l'historique GPS, les dernières positions et les consentements ; mêmes
   précautions que `0076`/`0077`.
 - **Rollback de la migration `0077`** : `alembic downgrade 0076` supprime les echecs et le journal des essais de code (donnees

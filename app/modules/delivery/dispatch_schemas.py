@@ -149,6 +149,11 @@ class DriverMeOut(BaseModel):
     location_notice_version: str = ""
     # Duree de conservation des positions annoncee au livreur (heures).
     location_retention_hours: int = 96
+    # Attribution (phase 6) : mode de l'etablissement et charge du livreur.
+    dispatch_mode: str = "counter"
+    max_active_deliveries: int = 3
+    active_deliveries: int = 0
+    remaining_capacity: int = 3
     full_name: str | None = None
     phone: str | None = None
     vehicle: str | None = None
@@ -305,3 +310,46 @@ class LiveDriverOut(BaseModel):
     signal_lost: bool = False
     sharing_consent: bool = False
     deliveries: list[LiveDeliveryOut] = Field(default_factory=list)
+
+
+class AvailableOrdersOut(BaseModel):
+    """Commandes que le livreur peut prendre lui-meme (vide hors mode self_assign)."""
+
+    enabled: bool
+    dispatch_mode: str
+    max_active_deliveries: int
+    active_deliveries: int
+    remaining_capacity: int
+    orders: list[DispatchOrderOut] = Field(default_factory=list)
+
+
+class ClaimRequest(BaseModel):
+    order_ids: list[int] = Field(..., min_length=1, max_length=10)
+
+    @field_validator("order_ids")
+    @classmethod
+    def _unique(cls, value: list[int]) -> list[int]:
+        if len(set(value)) != len(value) or any(v < 1 for v in value):
+            raise ValueError("Liste de commandes invalide")
+        return value
+
+
+class EstablishmentDispatchSettingsOut(BaseModel):
+    establishment_id: int
+    dispatch_mode: str
+    max_active_deliveries: int
+    # Valeurs effectives : propres a l'etablissement, ou heritees du reglage general.
+    failure_min_wait_minutes: int
+    failure_min_call_attempts: int
+    failure_rules_overridden: bool = False
+    # 0 tant qu'aucun reglage propre n'a ete enregistre.
+    version: int = 0
+
+
+class EstablishmentDispatchSettingsUpdate(BaseModel):
+    expected_version: int = Field(..., ge=0)
+    dispatch_mode: str | None = Field(None, pattern="^(counter|self_assign)$")
+    max_active_deliveries: int | None = Field(None, ge=1, le=10)
+    # `null` explicite = revenir au reglage general ; champ absent = inchange.
+    failure_min_wait_minutes: int | None = Field(None, ge=0, le=60)
+    failure_min_call_attempts: int | None = Field(None, ge=0, le=5)

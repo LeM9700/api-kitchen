@@ -11,19 +11,22 @@ import circulaire.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
+from app.modules.delivery import estimates
 from app.modules.delivery.models import (
     DELIVERY_ACTIVE_STATUSES,
     Delivery,
     DeliveryEvent,
     DeliveryRun,
+    DeliveryZone,
     RestaurantDeliverySettings,
 )
+from app.modules.hr.models import Establishment
 
 
 def _now() -> datetime:
@@ -88,14 +91,33 @@ async def ensure_driver_for_departure(session: AsyncSession, order) -> None:
         )
 
 
+async def _refresh_estimate(session: AsyncSession, order, now: datetime, other_stops: int) -> None:
+    """Recalcule l'heure de remise estimee au depart (trajet depuis le restaurant, arrets de la tournee).
+    Sans position connue ni zone, l'estimation faite a la commande est conservee."""
+    establishment = await session.get(Establishment, order.establishment_id) if order.establishment_id else None
+    zone = await session.get(DeliveryZone, order.delivery_zone_id) if order.delivery_zone_id else None
+    minutes = estimates.departure_minutes(
+        origin=(
+            (establishment.latitude, establishment.longitude) if establishment is not None else (None, None)
+        ),
+        destination=(order.delivery_lat, order.delivery_lng),
+        zone_minutes=zone.estimated_minutes if zone is not None else None,
+        other_stops=other_stops,
+    )
+    if minutes is not None:
+        order.estimated_delivery_at = now + timedelta(minutes=minutes)
+
+
 async def on_departure(session: AsyncSession, order, actor_user_id: int | None) -> None:
     """La commande part en livraison : la livraison assignee passe ``out_for_delivery`` et rejoint
-    la tournee en cours du livreur (ou en ouvre une)."""
+    la tournee en cours du livreur (ou en ouvre une). L'heure de remise estimee est recalculee."""
     if order.order_type != "delivery":
         return
     delivery = await active_delivery(session, order.id, lock=True)
     if delivery is None:
-        return  # dispatch coupe et aucun livreur : comportement historique
+        # Dispatch coupe et aucun livreur : comportement historique, mais l'estimation reste a jour.
+        await _refresh_estimate(session, order, _now(), 0)
+        return
     now = _now()
     run = await session.scalar(
         select(DeliveryRun)
@@ -107,6 +129,14 @@ async def on_departure(session: AsyncSession, order, actor_user_id: int | None) 
         run = DeliveryRun(driver_id=delivery.driver_id, status="active", started_at=now)
         session.add(run)
         await session.flush()
+    others = await session.scalar(
+        select(func.count(Delivery.id)).where(
+            Delivery.run_id == run.id,
+            Delivery.id != delivery.id,
+            Delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
+        )
+    )
+    await _refresh_estimate(session, order, now, int(others or 0))
     delivery.status = "out_for_delivery"
     delivery.departed_at = now
     delivery.run_id = run.id

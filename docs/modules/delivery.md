@@ -280,6 +280,58 @@ revérifie les droits, aucun canal ciblé n'est à créer, et une coupure résea
 - ETA approximative, sans trafic ni itinéraire.
 - Pas de journal des consultations de la carte.
 
+## Auto-attribution, plafond et réglages par établissement (phase 6)
+
+### Réglages par établissement (migration `0079`, table `establishment_dispatch_settings`)
+
+Sans ligne pour un établissement : **mode comptoir**, plafond de **3** livraisons en cours par livreur, règles d'échec du réglage général.
+
+| Champ | Valeurs | Remarque |
+|---|---|---|
+| `dispatch_mode` | `counter` (défaut) / `self_assign` | qui attribue les courses |
+| `max_active_deliveries` | 1 à 10 (défaut 3) | plafond de la **prise libre** ; le comptoir peut attribuer au-delà |
+| `failure_min_wait_minutes` | 0 à 60, ou `NULL` | `NULL` = hérite du réglage général du tenant |
+| `failure_min_call_attempts` | 0 à 5, ou `NULL` | idem |
+
+- `GET /delivery/establishments/{id}/dispatch-settings` (permission `orders:read`) renvoie les valeurs **effectives** (héritage résolu), `failure_rules_overridden` et la `version`.
+- `PUT` (administrateur, 20/min) : champs partiels + `expected_version` (0 = pas encore de ligne). Version périmée : 409 `DISPATCH_SETTINGS_CONFLICT`.
+  `null` explicite sur une règle d'échec = revenir au réglage général ; `dispatch_mode` et le plafond ne s'effacent pas. Chaque changement est audité
+  (`establishment_{id}.{champ}` dans l'audit des réglages de livraison).
+- Les règles d'échec appliquées à un livreur sont celles **de son établissement** (`failures.get_rules(session, establishment_id)`). Le réglage général du
+  tenant reste le défaut (page Dispatch, carte « règles générales »).
+- Le drapeau tenant `driver_dispatch_enabled` reste l'interrupteur général : coupé, aucune prise libre n'est possible quel que soit le mode.
+
+### Prise en libre-service (`self_assign`)
+
+- `GET /delivery/driver/available` : commandes de livraison de **son** établissement (ou sans établissement), aux statuts `confirmed`, `queued`, `preparing` ou `ready` (une commande non confirmée,
+  donc non payée ni garantie, n'apparaît pas), **sans livraison vivante**.
+  Vide (`enabled: false`) en mode comptoir ou dispatch coupé. Renvoie aussi plafond, charge et capacité restante.
+- `POST /delivery/driver/claim` (30/min) : 1 à 10 commandes, **tout ou rien**. Ordre des contrôles : dispatch actif (409 `DISPATCH_DISABLED`), mode
+  `self_assign` (409 `SELF_ASSIGN_DISABLED`), livreur actif et **pointé** (409 `DRIVER_NOT_CLOCKED_IN`), puis par commande : livraison, même établissement
+  (409 `DRIVER_WRONG_ESTABLISHMENT`), **pas déjà prise** (409 `ORDER_ALREADY_TAKEN`), statut attribuable, et enfin le plafond (409 `DRIVER_CAPACITY_REACHED`).
+- `POST /delivery/driver/deliveries/{id}/release` : le livreur rend une commande **qu'il a prise, tant qu'elle n'est pas partie** (statut `assigned`), mode
+  `self_assign` uniquement. En mode comptoir, seul le comptoir retire une attribution.
+- **Verrous contre la double prise** : la ligne du livreur est verrouillée (`FOR UPDATE`, ses prises sont sérialisées, donc le plafond ne se contourne pas
+  avec deux requêtes parallèles), puis les commandes sont verrouillées dans l'ordre des identifiants (pas d'interblocage). L'index unique
+  `uq_deliveries_one_active_per_order` est le filet final : une collision devient `ORDER_ALREADY_TAKEN`. Une prise **ne vole jamais** une commande déjà
+  attribuée, même à un autre livreur ; seul le comptoir réattribue. La charge compte les livraisons `assigned`, `out_for_delivery` et `arrived`.
+- Le journal de la livraison porte les événements `claimed` et `released_by_driver`.
+
+### Durée estimée dynamique
+
+Au départ en livraison (`lifecycle.on_departure`), `orders.estimated_delivery_at` est **recalculé** : trajet estimé depuis les coordonnées de l'établissement
+(vol d'oiseau × 1,3 à 25 km/h, `delivery/estimates.py`), sinon les minutes de la zone, plus **4 min par autre arrêt** de la tournée. Sans position ni zone, l'estimation
+faite à la commande est conservée. L'app du comptoir affiche « Prévue 19:42 (dans 12 min) » ou « En retard de 8 min » ; le badge **Retard** d'une livraison se
+déclenche quand l'heure estimée est dépassée (30 min après la création quand il n'y a pas d'estimation, comme avant).
+
+### Limites connues (phase 6)
+
+- Pas de priorisation ni d'équité entre livreurs : le plus rapide prend. Pas de notification aux livreurs quand une commande devient disponible (l'écran se
+  rafraîchit toutes les 15 s).
+- Le plafond ne bride pas le comptoir (choix volontaire : jugement humain).
+- Estimation sans trafic ni itinéraire ; aucune mise à jour pendant la course (au départ uniquement).
+- Changer le mode d'un établissement n'affecte pas les livraisons déjà attribuées.
+
 ## Sécurité
 
 - Le contour des zones n'est lisible que du personnel (`/zones/manage`) : la liste publique ne l'expose pas.

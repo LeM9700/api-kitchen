@@ -258,6 +258,32 @@ class DeliveryEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class EstablishmentDispatchSettings(Base):
+    """Reglages de livraison propres a un etablissement (phase 6). Une ligne par etablissement, creee a la
+    premiere ecriture ; sans ligne, les valeurs par defaut s'appliquent (attribution au comptoir, plafond 3).
+
+    Les regles d'echec ``NULL`` heritent du reglage general du tenant (``restaurant_delivery_settings``)."""
+
+    __tablename__ = "establishment_dispatch_settings"
+    __table_args__ = (
+        CheckConstraint("dispatch_mode IN ('counter', 'self_assign')", name="ck_establishment_dispatch_mode"),
+        CheckConstraint(
+            "max_active_deliveries BETWEEN 1 AND 10", name="ck_establishment_dispatch_max_active"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    establishment_id: Mapped[int] = mapped_column(ForeignKey("establishments.id"), nullable=False, unique=True)
+    # counter : seul le comptoir attribue. self_assign : les livreurs pointes peuvent aussi prendre une commande.
+    dispatch_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="counter", server_default="counter")
+    # Plafond de livraisons en cours (attribuees ou en route) par livreur pour la prise en libre-service.
+    max_active_deliveries: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default="3")
+    failure_min_wait_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_min_call_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class DeliveryCodeAttempt(Base):
     """Essai de saisie du code de remise (reussi ou non), journalise."""
 

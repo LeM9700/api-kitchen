@@ -15,9 +15,14 @@ from app.core.database import get_tenant_session
 from app.core.http.deps import get_arq_pool, require_permission, require_role
 from app.core.http.limiter import limiter
 from app.modules.delivery import dispatch_service as svc
+from app.modules.delivery import dispatch_settings
 from app.modules.delivery import failures as failures_svc
 from app.modules.delivery import tracking
 from app.modules.delivery.dispatch_schemas import (
+    AvailableOrdersOut,
+    ClaimRequest,
+    EstablishmentDispatchSettingsOut,
+    EstablishmentDispatchSettingsUpdate,
     AssignRequest,
     DeliverRequest,
     DeliverWithoutCodeRequest,
@@ -347,3 +352,77 @@ async def live_drivers(
     """Carte du comptoir : livreurs actifs, position (seulement en livraison), signal, charge."""
     async with get_tenant_session(current_user["tenant_slug"]) as session:
         return await tracking.live_board(session, establishment_id)
+
+
+# --------------------------------------------------------------------------- auto-attribution
+
+
+@router.get("/driver/available", response_model=AvailableOrdersOut)
+async def driver_available(current_user=Depends(require_role("driver"))):
+    """Commandes que le livreur peut prendre lui-meme (mode self_assign de son etablissement)."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        return await svc.claimable_orders(session, driver)
+
+
+@router.post("/driver/claim", response_model=list[DeliveryActionOut])
+@limiter.limit("30/minute")
+async def driver_claim(
+    request: Request, body: ClaimRequest, current_user=Depends(require_role("driver"))
+):
+    """Prend une ou plusieurs commandes (tout ou rien). Jamais une commande deja prise."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        deliveries = await svc.claim(session, driver, body.order_ids, user_id=int(current_user["id"]))
+        return [_action(d) for d in deliveries]
+
+
+@router.post("/driver/deliveries/{delivery_id}/release", response_model=DeliveryActionOut)
+@limiter.limit("30/minute")
+async def driver_release(
+    request: Request, delivery_id: int, current_user=Depends(require_role("driver"))
+):
+    """Repose une commande prise et pas encore partie (mode self_assign)."""
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        driver = await svc.get_driver_for_user(session, int(current_user["id"]))
+        delivery = await svc.release(session, driver, delivery_id, user_id=int(current_user["id"]))
+        return _action(delivery)
+
+
+@router.get(
+    "/establishments/{establishment_id}/dispatch-settings",
+    response_model=EstablishmentDispatchSettingsOut,
+)
+async def get_dispatch_settings(
+    establishment_id: int,
+    current_user=Depends(require_permission("orders:read", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await dispatch_settings.get_effective(session, establishment_id)
+
+
+@router.put(
+    "/establishments/{establishment_id}/dispatch-settings",
+    response_model=EstablishmentDispatchSettingsOut,
+)
+@limiter.limit("20/minute")
+async def put_dispatch_settings(
+    request: Request,
+    establishment_id: int,
+    body: EstablishmentDispatchSettingsUpdate,
+    current_user=Depends(require_role("admin")),
+):
+    """Mode d'attribution, plafond et regles d'echec d'un etablissement (administrateur, audite)."""
+    values = body.model_dump(exclude_unset=True)
+    expected_version = values.pop("expected_version")
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await dispatch_settings.update(
+            session,
+            establishment_id,
+            values,
+            expected_version=expected_version,
+            user_id=int(current_user["id"]),
+            user_email=current_user.get("email"),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )

@@ -17,13 +17,14 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, exists, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth.security import get_password_hash
 from app.core.http.errors import AppError
 from app.core.i18n.translate import t
 from app.modules.auth.models import User
-from app.modules.delivery import failures, lifecycle, proof, tracking
+from app.modules.delivery import dispatch_settings, failures, lifecycle, proof, tracking
 from app.modules.delivery.models import (
     DELIVERY_ACTIVE_STATUSES,
     Delivery,
@@ -467,6 +468,7 @@ async def driver_me(session: AsyncSession, driver: DriverProfile) -> dict:
         "location_consent": tracking.has_consent(driver),
         "location_notice_version": tracking.LOCATION_NOTICE_VERSION,
         "location_retention_hours": tracking.retention_hours(),
+        **await _self_assign_summary(session, driver),
     }
 
 
@@ -493,7 +495,7 @@ async def driver_deliveries(session: AsyncSession, driver: DriverProfile) -> lis
         )
     ).all()
     counts = await _items_counts(session, [order.id for _, order in rows])
-    rules = await failures.get_rules(session)
+    rules = await failures.get_rules(session, driver.establishment_id)
     locked = {
         delivery.id: await proof.failed_attempts(session, delivery.id) >= proof.MAX_FAILED_ATTEMPTS
         for delivery, _ in rows
@@ -633,12 +635,13 @@ async def driver_deliver(
         raise AppError("DELIVERY_NOT_EN_ROUTE", "Cette livraison n'est pas en route.", 409)
     order = await session.get(Order, delivery.order_id, with_for_update=True, populate_existing=True)
     order_id = delivery.order_id
+    establishment_id = driver.establishment_id
     payment_status = order.payment_status
     total = float(order.total)
     await session.rollback()  # libere les verrous avant le reglement et la livraison
 
     # Preuve de remise AVANT tout encaissement : un mauvais code ne doit rien regler.
-    rules = await failures.get_rules(session)
+    rules = await failures.get_rules(session, establishment_id)
     delivery_proof = "not_required"
     if rules["proof_required"] or code:
         if not code:
@@ -789,3 +792,199 @@ async def admin_deliver_without_code(
         await session.rollback()
         raise
     return await session.get(Delivery, delivery_id, populate_existing=True)
+
+
+# --------------------------------------------------------------------------- auto-attribution (phase 6)
+
+
+async def _active_count(session: AsyncSession, driver_id: int) -> int:
+    return int(
+        await session.scalar(
+            select(func.count(Delivery.id)).where(
+                Delivery.driver_id == driver_id, Delivery.status.in_(DELIVERY_ACTIVE_STATUSES)
+            )
+        )
+        or 0
+    )
+
+
+async def _self_assign_summary(session: AsyncSession, driver: DriverProfile) -> dict:
+    """Mode d'attribution de l'etablissement du livreur et sa charge actuelle."""
+    effective = await dispatch_settings.get_effective(session, driver.establishment_id)
+    active = await _active_count(session, driver.id)
+    cap = effective["max_active_deliveries"]
+    return {
+        "dispatch_mode": effective["dispatch_mode"],
+        "max_active_deliveries": cap,
+        "active_deliveries": active,
+        "remaining_capacity": max(0, cap - active),
+    }
+
+
+async def claimable_orders(session: AsyncSession, driver: DriverProfile) -> dict:
+    """Commandes que ce livreur peut prendre lui-meme. Vide hors mode ``self_assign`` ou si le dispatch par
+    livreurs est coupe."""
+    summary = await _self_assign_summary(session, driver)
+    enabled = summary["dispatch_mode"] == "self_assign" and await lifecycle.is_dispatch_enabled(session)
+    orders: list[dict] = []
+    if enabled:
+        has_active = exists().where(
+            Delivery.order_id == Order.id, Delivery.status.in_(DELIVERY_ACTIVE_STATUSES)
+        )
+        rows = (
+            await session.execute(
+                select(Order)
+                .where(
+                    Order.order_type == "delivery",
+                    Order.status.in_(ASSIGNABLE_ORDER_STATUSES),
+                    ~has_active,
+                    (Order.establishment_id == driver.establishment_id) | (Order.establishment_id.is_(None)),
+                )
+                .order_by(Order.created_at, Order.id)
+            )
+        ).scalars()
+        rows = list(rows)
+        counts = await _items_counts(session, [o.id for o in rows])
+        orders = [_order_dict(o, counts.get(o.id, 0)) for o in rows]
+    return {"enabled": enabled, **summary, "orders": orders}
+
+
+async def claim(
+    session: AsyncSession,
+    driver: DriverProfile,
+    order_ids: list[int],
+    *,
+    user_id: int,
+) -> list[Delivery]:
+    """Prise en libre-service, tout ou rien : un refus annule toutes les prises de la requete."""
+    try:
+        return await _claim_locked(session, driver, order_ids, user_id=user_id)
+    except AppError:
+        await session.rollback()
+        raise
+
+
+async def _claim_locked(
+    session: AsyncSession,
+    driver: DriverProfile,
+    order_ids: list[int],
+    *,
+    user_id: int,
+) -> list[Delivery]:
+    """Le livreur prend lui-meme une ou plusieurs commandes (mode ``self_assign``).
+
+    Contre la double prise : verrou sur la ligne du livreur (ses prises sont serialisees, le plafond ne peut pas
+    etre depasse par deux requetes simultanees), verrou sur les commandes dans un ordre stable, et index unique
+    en base (une seule livraison vivante par commande) en dernier recours. Une commande deja prise, meme par un
+    autre livreur, n'est **jamais** reprise : seul le comptoir reattribue.
+    """
+    driver_id, establishment_id = driver.id, driver.establishment_id
+    if not await lifecycle.is_dispatch_enabled(session):
+        raise AppError("DISPATCH_DISABLED", "Le dispatch par livreurs n'est pas active.", 409)
+    settings_row = await dispatch_settings.get_effective(session, establishment_id)
+    if settings_row["dispatch_mode"] != "self_assign":
+        raise AppError(
+            "SELF_ASSIGN_DISABLED",
+            "Dans cet etablissement, c'est le comptoir qui attribue les livraisons.",
+            409,
+        )
+    if not order_ids or len(set(order_ids)) != len(order_ids):
+        raise AppError("ORDER_IDS_INVALID", "Liste de commandes invalide.", 422, "order_ids")
+    if len(order_ids) > 10:
+        raise AppError("ORDER_IDS_INVALID", "10 commandes au maximum par prise.", 422, "order_ids")
+
+    locked_driver = await session.get(DriverProfile, driver_id, with_for_update=True, populate_existing=True)
+    if locked_driver is None or not locked_driver.is_active:
+        raise AppError("DRIVER_INACTIVE", "Votre compte livreur est desactive.", 403)
+    if locked_driver.user_id not in await _presence(session, [locked_driver.user_id]):
+        raise AppError("DRIVER_NOT_CLOCKED_IN", "Pointez avant de prendre une livraison.", 409)
+
+    orders = {
+        o.id: o
+        for o in (
+            await session.execute(
+                select(Order).where(Order.id.in_(order_ids)).order_by(Order.id).with_for_update()
+            )
+        ).scalars()
+    }
+    missing = [oid for oid in order_ids if oid not in orders]
+    if missing:
+        raise AppError("ORDER_NOT_FOUND", f"Commande introuvable : #{missing[0]}", 404, "order_ids")
+
+    created: list[Delivery] = []
+    for order_id in sorted(order_ids):
+        order = orders[order_id]
+        if order.order_type != "delivery":
+            raise AppError("ORDER_NOT_DELIVERY", f"La commande #{order_id} n'est pas une livraison.", 422, "order_ids")
+        if order.establishment_id is not None and order.establishment_id != establishment_id:
+            raise AppError(
+                "DRIVER_WRONG_ESTABLISHMENT",
+                f"La commande #{order_id} appartient a un autre etablissement.",
+                409,
+                "order_ids",
+            )
+        if await lifecycle.active_delivery(session, order_id, lock=True) is not None:
+            raise AppError(
+                "ORDER_ALREADY_TAKEN",
+                f"La commande #{order_id} est deja prise.",
+                409,
+                "order_ids",
+            )
+        if order.status not in ASSIGNABLE_ORDER_STATUSES:
+            raise AppError(
+                "ORDER_NOT_ASSIGNABLE",
+                f"La commande #{order_id} ne peut pas etre prise dans son etat actuel.",
+                409,
+                "order_ids",
+            )
+        delivery = Delivery(
+            order_id=order_id,
+            driver_id=driver_id,
+            status="assigned",
+            assigned_by_user_id=user_id,
+            assigned_at=_now(),
+        )
+        session.add(delivery)
+        await session.flush()
+        lifecycle.add_event(
+            session, delivery, order_id=order_id, event="claimed", actor_user_id=user_id
+        )
+        created.append(delivery)
+
+    active = await _active_count(session, driver_id)
+    cap = settings_row["max_active_deliveries"]
+    if active > cap:  # `active` compte deja les livraisons ajoutees (flush) : on ne depasse jamais le plafond
+        raise AppError(
+            "DRIVER_CAPACITY_REACHED",
+            f"Plafond atteint : {cap} livraison(s) en cours au maximum (vous en avez {active - len(created)}).",
+            409,
+            "order_ids",
+        )
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise AppError("ORDER_ALREADY_TAKEN", "Une commande vient d'etre prise par un autre livreur.", 409) from exc
+    return created
+
+
+async def release(session: AsyncSession, driver: DriverProfile, delivery_id: int, *, user_id: int) -> Delivery:
+    """Le livreur repose une commande qu'il avait prise et qui n'est pas encore partie (mode ``self_assign``)."""
+    settings_row = await dispatch_settings.get_effective(session, driver.establishment_id)
+    if settings_row["dispatch_mode"] != "self_assign":
+        raise AppError(
+            "SELF_ASSIGN_DISABLED",
+            "Dans cet etablissement, seul le comptoir peut retirer une livraison.",
+            409,
+        )
+    delivery = await _own_delivery(session, driver, delivery_id)
+    if delivery.status != "assigned":
+        raise AppError("DELIVERY_ALREADY_STARTED", "Vous etes deja parti avec cette commande.", 409)
+    delivery.status = "cancelled"
+    delivery.finished_at = _now()
+    lifecycle.add_event(
+        session, delivery, order_id=delivery.order_id, event="released_by_driver", actor_user_id=user_id
+    )
+    await session.commit()
+    await session.refresh(delivery)
+    return delivery

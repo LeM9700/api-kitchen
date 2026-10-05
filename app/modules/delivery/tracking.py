@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.http.errors import AppError
 from app.modules.auth.models import User
 from app.modules.delivery import lifecycle
+from app.modules.delivery.estimates import AVERAGE_SPEED_MPS, ROAD_FACTOR, eta_minutes, haversine_m  # noqa: F401
 from app.modules.delivery.models import (
     Delivery,
     DriverLastLocation,
@@ -44,11 +45,6 @@ MIN_SAMPLE_DISTANCE_M = 30.0
 STALE_AFTER_SECONDS = 60
 SIGNAL_LOST_SECONDS = 120
 MIN_RETENTION_HOURS = 96
-# Estimation d'arrivee : distance a vol d'oiseau majoree, vitesse moyenne urbaine. Une estimation, pas un
-# itineraire.
-ROAD_FACTOR = 1.3
-AVERAGE_SPEED_MPS = 25 / 3.6
-
 EN_ROUTE_STATUSES = ("out_for_delivery", "arrived")
 
 
@@ -58,21 +54,6 @@ def _now() -> datetime:
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
-
-def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    radius = 6_371_000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lng2 - lng1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
-
-
-def eta_minutes(lat: float, lng: float, dest_lat: float | None, dest_lng: float | None) -> int | None:
-    if dest_lat is None or dest_lng is None:
-        return None
-    meters = haversine_m(lat, lng, dest_lat, dest_lng) * ROAD_FACTOR
-    return max(1, math.ceil(meters / AVERAGE_SPEED_MPS / 60))
 
 
 def retention_hours() -> int:
