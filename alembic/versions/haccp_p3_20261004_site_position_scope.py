@@ -35,11 +35,9 @@ def upgrade() -> None:
                      AND constraint_type = 'PRIMARY KEY'
                    LIMIT 1;
 
-                  IF primary_key_name IS NOT NULL THEN
-                    EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', schema_name, 'stock_batch_positions', primary_key_name);
+                  IF primary_key_name IS NULL THEN
+                    EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT stock_batch_positions_pkey PRIMARY KEY (batch_id, establishment_id, ingredient_id)', schema_name, 'stock_batch_positions');
                   END IF;
-
-                  EXECUTE format('ALTER TABLE %I.stock_batch_positions ADD CONSTRAINT stock_batch_positions_pkey PRIMARY KEY (batch_id, establishment_id, ingredient_id)', schema_name);
                 END IF;
               END LOOP;
             END $migration$;
@@ -69,11 +67,9 @@ def downgrade() -> None:
                      AND constraint_type = 'PRIMARY KEY'
                    LIMIT 1;
 
-                  IF primary_key_name IS NOT NULL THEN
-                    EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', schema_name, 'stock_batch_positions', primary_key_name);
+                  IF primary_key_name IS NULL THEN
+                    EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT stock_batch_positions_pkey PRIMARY KEY (batch_id)', schema_name, 'stock_batch_positions');
                   END IF;
-
-                  EXECUTE format('ALTER TABLE %I.stock_batch_positions ADD CONSTRAINT stock_batch_positions_pkey PRIMARY KEY (batch_id)', schema_name);
                 END IF;
               END LOOP;
             END $migration$;
