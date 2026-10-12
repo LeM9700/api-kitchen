@@ -20,13 +20,25 @@ def upgrade() -> None:
             """
             DO $migration$
             DECLARE schema_name text;
+            DECLARE primary_key_name text;
             BEGIN
               FOR schema_name IN
                 SELECT nspname FROM pg_namespace
                 WHERE nspname LIKE 'tenant\\_%'
               LOOP
-                IF to_regclass(format('%I.stock_batch_positions', schema_name)) IS NOT NULL THEN
-                  EXECUTE format('ALTER TABLE %I.stock_batch_positions DROP CONSTRAINT stock_batch_positions_pkey', schema_name);
+                IF to_regclass(format('%I.%I', schema_name, 'stock_batch_positions')) IS NOT NULL THEN
+                  SELECT constraint_name
+                    INTO primary_key_name
+                    FROM information_schema.table_constraints
+                   WHERE table_schema = schema_name
+                     AND table_name = 'stock_batch_positions'
+                     AND constraint_type = 'PRIMARY KEY'
+                   LIMIT 1;
+
+                  IF primary_key_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', schema_name, 'stock_batch_positions', primary_key_name);
+                  END IF;
+
                   EXECUTE format('ALTER TABLE %I.stock_batch_positions ADD CONSTRAINT stock_batch_positions_pkey PRIMARY KEY (batch_id, establishment_id, ingredient_id)', schema_name);
                 END IF;
               END LOOP;
@@ -42,13 +54,25 @@ def downgrade() -> None:
             """
             DO $migration$
             DECLARE schema_name text;
+            DECLARE primary_key_name text;
             BEGIN
               FOR schema_name IN
                 SELECT nspname FROM pg_namespace
                 WHERE nspname LIKE 'tenant\\_%'
               LOOP
-                IF to_regclass(format('%I.stock_batch_positions', schema_name)) IS NOT NULL THEN
-                  EXECUTE format('ALTER TABLE %I.stock_batch_positions DROP CONSTRAINT stock_batch_positions_pkey', schema_name);
+                IF to_regclass(format('%I.%I', schema_name, 'stock_batch_positions')) IS NOT NULL THEN
+                  SELECT constraint_name
+                    INTO primary_key_name
+                    FROM information_schema.table_constraints
+                   WHERE table_schema = schema_name
+                     AND table_name = 'stock_batch_positions'
+                     AND constraint_type = 'PRIMARY KEY'
+                   LIMIT 1;
+
+                  IF primary_key_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', schema_name, 'stock_batch_positions', primary_key_name);
+                  END IF;
+
                   EXECUTE format('ALTER TABLE %I.stock_batch_positions ADD CONSTRAINT stock_batch_positions_pkey PRIMARY KEY (batch_id)', schema_name);
                 END IF;
               END LOOP;
