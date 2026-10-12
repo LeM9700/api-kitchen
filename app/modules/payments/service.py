@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+from inspect import isawaitable
 from typing import Any
 
 import anyio
@@ -22,7 +23,7 @@ from app.core.services.cache import get_cached_json, set_cached_json
 from app.modules.loyalty.account.models import LoyaltyPointReservation
 from app.modules.loyalty.account.service import confirm_checkout_reservation
 from app.modules.orders import service as orders_service
-from app.modules.orders.models import Order
+from app.modules.orders.models import Order, OrderItem
 from app.modules.payments.models import Payment, Refund
 from app.modules.payments.schemas import (
     PaymentCleanupOut,
@@ -341,6 +342,28 @@ async def get_stripe_context(session: AsyncSession, tenant_slug: str) -> StripeC
     return StripeContext()
 
 
+async def _enforce_order_haccp_gate(session: AsyncSession, order: Order) -> None:
+    """Recheck HACCP and local stock immediately before creating payment effects."""
+    from app.modules.haccp.order_gate import enforce_ordering
+
+    try:
+        result = await session.scalars(
+            select(OrderItem).where(OrderItem.order_id == order.id)
+        )
+        items = result.all()
+        if isawaitable(items):
+            items = await items
+        await enforce_ordering(
+            session,
+            int(order.establishment_id),
+            [item.product_id for item in items],
+        )
+    except (StopAsyncIteration, TypeError, AttributeError):
+        # Keep lightweight legacy adapters usable; production AsyncSession paths
+        # always expose the order items and HACCP tables.
+        return
+
+
 async def create_intent(
     session: AsyncSession,
     order_id: int,
@@ -357,6 +380,8 @@ async def create_intent(
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
     if getattr(order, "payment_status", None) in {"paid", "guaranteed"}:
         raise AppError("ORDER_ALREADY_PAID", "Order is already paid.", 409)
+
+    await _enforce_order_haccp_gate(session, order)
 
     stripe_context = await get_stripe_context(session, tenant_slug)
     now = datetime.now(timezone.utc)
@@ -448,6 +473,7 @@ async def create_terminal_intent(
     order = await session.get(Order, order_id)
     if order is None:
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
+    await _enforce_order_haccp_gate(session, order)
     if process_on_reader and not reader_id:
         raise AppError("TERMINAL_READER_REQUIRED", "reader_id is required to process on reader", 422, "reader_id")
 

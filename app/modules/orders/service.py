@@ -775,6 +775,14 @@ async def create_order(
     if establishment_id is None:
         establishment_id = await _resolve_establishment_id(session, requested_establishment_id)
 
+    from app.modules.haccp.order_gate import enforce_ordering
+
+    await enforce_ordering(
+        session,
+        establishment_id,
+        [item.product_id for item in body.items],
+    )
+
     total = _money(subtotal - discount_total + delivery_fee)
     order = Order(
         user_id=user_id,

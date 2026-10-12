@@ -31,6 +31,7 @@ from fastapi import APIRouter, Depends
 from app.core.database import get_tenant_session
 from app.core.http.deps import get_current_user, require_role
 from app.modules.haccp import service
+from app.modules.haccp.strict_router import router as strict_router
 from app.modules.haccp.schemas import (
     HaccpCleaningLogCreate,
     HaccpCleaningLogResponse,
@@ -65,8 +66,11 @@ from app.modules.haccp.schemas import (
 
 router = APIRouter()
 
+router.include_router(strict_router)
+
 
 # ─── Status (gate bloquant) ───────────────────────────────────────────────────
+
 
 @router.get(
     "/status/today",
@@ -90,6 +94,7 @@ async def get_today_status(
 
 
 # ─── Sessions ─────────────────────────────────────────────────────────────────
+
 
 @router.post(
     "/sessions",
@@ -129,7 +134,7 @@ async def get_today_sessions(
     current_user: dict = Depends(get_current_user),
 ) -> list[HaccpSessionResponse]:
     """GET /haccp/sessions/today — retourne les sessions en cours aujourd'hui."""
-    from sqlalchemy import select, and_
+    from sqlalchemy import select
     from app.modules.haccp.models import HaccpCheckSession
 
     today = date.today()
@@ -156,9 +161,9 @@ async def complete_session(
 
     Marque la session comme complète. Si des éléments sont manquants et
     que ``force=false`` (défaut), retourne 422 avec la liste des manquants.
-    Si ``force=true``, valide avec statut ``incomplete_validated``.
+    ``force=true`` est refusé ; les anciens statuts forcés restent historiques.
 
-    Une session ``complete`` ou ``incomplete_validated`` débloque le gate :
+    Seule une session ``complete`` satisfait l'indicateur historique :
     - opening → le restaurant peut ouvrir
     - closing → la fermeture peut être confirmée
     """
@@ -175,6 +180,7 @@ async def complete_session(
 
 
 # ─── Equipment ────────────────────────────────────────────────────────────────
+
 
 @router.get(
     "/equipment",
@@ -226,6 +232,7 @@ async def update_equipment(
 
 # ─── Temperature Logs ─────────────────────────────────────────────────────────
 
+
 @router.post(
     "/sessions/{session_id}/temperatures",
     response_model=HaccpTemperatureResponse,
@@ -245,7 +252,9 @@ async def log_temperature(
     """
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        log = await service.log_temperature(session, session_id, body.model_dump(), user_id)
+        log = await service.log_temperature(
+            session, session_id, body.model_dump(), user_id
+        )
         return HaccpTemperatureResponse.model_validate(log)
 
 
@@ -265,6 +274,7 @@ async def list_temperatures(
 
 # ─── DLC Checks ───────────────────────────────────────────────────────────────
 
+
 @router.post(
     "/sessions/{session_id}/dlc",
     response_model=HaccpDlcCheckResponse,
@@ -283,7 +293,9 @@ async def log_dlc(
     """
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        check = await service.log_dlc_check(session, session_id, body.model_dump(), user_id)
+        check = await service.log_dlc_check(
+            session, session_id, body.model_dump(), user_id
+        )
         return HaccpDlcCheckResponse.model_validate(check)
 
 
@@ -330,7 +342,9 @@ async def create_standalone_dlc(
 ) -> HaccpDlcCheckResponse:
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        check = await service.create_standalone_dlc_check(session, body.model_dump(), user_id)
+        check = await service.create_standalone_dlc_check(
+            session, body.model_dump(), user_id
+        )
         return HaccpDlcCheckResponse.model_validate(check)
 
 
@@ -365,6 +379,7 @@ async def delete_dlc(
 
 
 # ─── Cleaning Tasks ───────────────────────────────────────────────────────────
+
 
 @router.get(
     "/cleaning-tasks",
@@ -425,7 +440,9 @@ async def log_cleaning(
 ) -> HaccpCleaningLogResponse:
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        log = await service.log_cleaning(session, session_id, body.model_dump(), user_id)
+        log = await service.log_cleaning(
+            session, session_id, body.model_dump(), user_id
+        )
         return HaccpCleaningLogResponse.model_validate(log)
 
 
@@ -444,6 +461,7 @@ async def list_cleaning_logs(
 
 
 # ─── Non-Conformities ─────────────────────────────────────────────────────────
+
 
 @router.get(
     "/non-conformities",
@@ -499,6 +517,7 @@ async def update_non_conformity(
 
 # ─── Reception Controls ───────────────────────────────────────────────────────
 
+
 @router.post(
     "/reception-controls",
     response_model=HaccpReceptionResponse,
@@ -511,7 +530,9 @@ async def create_reception(
 ) -> HaccpReceptionResponse:
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        control = await service.create_reception_control(session, body.model_dump(), user_id)
+        control = await service.create_reception_control(
+            session, body.model_dump(), user_id
+        )
         return HaccpReceptionResponse.model_validate(control)
 
 
@@ -529,6 +550,7 @@ async def list_reception(
 
 
 # ─── Cooling Logs ─────────────────────────────────────────────────────────────
+
 
 @router.post(
     "/cooling",
@@ -579,6 +601,7 @@ async def list_cooling(
 
 # ─── Training Records ─────────────────────────────────────────────────────────
 
+
 @router.post(
     "/training",
     response_model=HaccpTrainingResponse,
@@ -591,7 +614,9 @@ async def create_training(
 ) -> HaccpTrainingResponse:
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        record = await service.create_training_record(session, body.model_dump(), user_id)
+        record = await service.create_training_record(
+            session, body.model_dump(), user_id
+        )
         return HaccpTrainingResponse.model_validate(record)
 
 
@@ -610,6 +635,7 @@ async def list_training(
 
 
 # ─── Frying Oil Logs ─────────────────────────────────────────────────────────
+
 
 @router.post(
     "/sessions/{session_id}/oil",
@@ -630,5 +656,7 @@ async def log_oil(
     """
     user_id = int(current_user["id"])
     async with get_tenant_session(current_user["tenant_slug"]) as session:
-        log = await service.log_frying_oil(session, session_id, body.model_dump(), user_id)
+        log = await service.log_frying_oil(
+            session, session_id, body.model_dump(), user_id
+        )
         return HaccpFryingOilResponse.model_validate(log)

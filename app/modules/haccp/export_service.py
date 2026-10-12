@@ -18,7 +18,6 @@ bloquer l'event loop FastAPI.
 import asyncio
 import csv
 import io
-import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 

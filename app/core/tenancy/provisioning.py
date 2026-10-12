@@ -88,6 +88,12 @@ async def _provision_tenant_schema(conn: AsyncConnection, slug: str) -> None:
         )
     )
 
+    # Foundation only: do not enable strict HACCP before the later sprint phases.
+    await conn.execute(
+        text("""INSERT INTO establishment_operations (establishment_id)
+                SELECT id FROM establishments ON CONFLICT DO NOTHING""")
+    )
+
     # Import local : evite de charger tout le module catalog/allergen (et ses
     # propres dependances) au chargement de ce module, pour les appelants qui
     # n'ont besoin que de create_tenant_schema_on/ProvisionedTenant.

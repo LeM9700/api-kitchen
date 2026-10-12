@@ -23,6 +23,7 @@ from app.core.database import Base
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
+        UniqueConstraint("id", "establishment_id", name="uq_orders_id_establishment"),
         Index("ix_orders_user_id", "user_id"),
         Index("ix_orders_status", "status"),
         Index("ix_orders_created_at", "created_at"),

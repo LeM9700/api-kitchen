@@ -24,12 +24,15 @@ from app.core.http.errors import AppError
 
 
 async def _register_admin(client, slug: str) -> dict:
-    resp = await client.post("/api/v1/auth/register", json={
-        "tenant_slug": slug,
-        "tenant_name": f"Pizzeria {slug}",
-        "email": f"admin-{slug}@test.com",
-        "password": "Valid1!aa",
-    })
+    resp = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "tenant_slug": slug,
+            "tenant_name": f"Pizzeria {slug}",
+            "email": f"admin-{slug}@test.com",
+            "password": "Valid1!aa",
+        },
+    )
     assert resp.status_code == 201, resp.text
     token = resp.json()["access_token"]
     return {"token": token, "headers": {"Authorization": f"Bearer {token}"}}
@@ -128,7 +131,9 @@ async def test_haccp_full_happy_path(client, unique_slug):
     )
     assert task_update.status_code == 200, task_update.text
 
-    assert (await client.get("/api/v1/haccp/cleaning-tasks", headers=h)).status_code == 200
+    assert (
+        await client.get("/api/v1/haccp/cleaning-tasks", headers=h)
+    ).status_code == 200
 
     cleaning_log = await client.post(
         f"/api/v1/haccp/sessions/{session_id}/cleaning",
@@ -150,7 +155,9 @@ async def test_haccp_full_happy_path(client, unique_slug):
     assert nc_resp.status_code == 201, nc_resp.text
     nc_id = nc_resp.json()["id"]
 
-    assert (await client.get("/api/v1/haccp/non-conformities", headers=h)).status_code == 200
+    assert (
+        await client.get("/api/v1/haccp/non-conformities", headers=h)
+    ).status_code == 200
 
     nc_update = await client.patch(
         f"/api/v1/haccp/non-conformities/{nc_id}",
@@ -175,7 +182,9 @@ async def test_haccp_full_happy_path(client, unique_slug):
     )
     assert reception_resp.status_code == 201, reception_resp.text
 
-    assert (await client.get("/api/v1/haccp/reception-controls", headers=h)).status_code == 200
+    assert (
+        await client.get("/api/v1/haccp/reception-controls", headers=h)
+    ).status_code == 200
 
     # ── Refroidissement ──────────────────────────────────────────────────
     cooling_resp = await client.post(
@@ -224,7 +233,7 @@ async def test_haccp_full_happy_path(client, unique_slug):
     # ── Completion de session (gate) ─────────────────────────────────────
     complete_resp = await client.patch(
         f"/api/v1/haccp/sessions/{session_id}/complete",
-        json={"force": True},
+        json={"force": False},
         headers=h,
     )
     assert complete_resp.status_code == 200, complete_resp.text
@@ -241,8 +250,12 @@ async def test_haccp_full_happy_path(client, unique_slug):
     )
     assert csv_resp.status_code == 200, csv_resp.text
     assert csv_resp.headers["content-type"].startswith("text/csv")
-    assert "Mozzarella" in csv_resp.text  # ingredient DLC exporte dans la section correspondante
-    assert "RELEV" in csv_resp.text  # en-tete section temperature (accents encodes utf-8-sig)
+    assert (
+        "Mozzarella" in csv_resp.text
+    )  # ingredient DLC exporte dans la section correspondante
+    assert (
+        "RELEV" in csv_resp.text
+    )  # en-tete section temperature (accents encodes utf-8-sig)
 
     # ── Stats (admin/staff) ──────────────────────────────────────────────
     stats_resp = await client.get(
@@ -316,9 +329,13 @@ async def test_haccp_complete_session_blocks_when_strict_dlc_gate_enabled(monkey
         return check_session
 
     monkeypatch.setattr(service, "get_session_by_id", fake_get_session)
-    monkeypatch.setattr(service, "_count_equipment_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        service, "_count_equipment_for_session", AsyncMock(return_value=0)
+    )
     monkeypatch.setattr(service, "_count_temperature_logs", AsyncMock(return_value=0))
-    monkeypatch.setattr(service, "_count_cleaning_tasks_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        service, "_count_cleaning_tasks_for_session", AsyncMock(return_value=0)
+    )
     monkeypatch.setattr(service, "_count_cleaning_logs", AsyncMock(return_value=0))
     monkeypatch.setattr(
         service,
@@ -348,9 +365,9 @@ async def test_haccp_complete_session_blocks_when_strict_dlc_gate_enabled(monkey
     fake_session.commit.assert_not_awaited()
 
 
-async def test_haccp_complete_session_force_records_manager_trace_for_dlc(monkeypatch):
+async def test_haccp_complete_session_force_is_rejected_even_for_manager(monkeypatch):
     from app.modules.haccp import service
-    from app.modules.haccp.models import HaccpCheckSession, HaccpNonConformity
+    from app.modules.haccp.models import HaccpCheckSession
 
     check_session = HaccpCheckSession(
         session_type="closing",
@@ -368,9 +385,13 @@ async def test_haccp_complete_session_force_records_manager_trace_for_dlc(monkey
         return check_session
 
     monkeypatch.setattr(service, "get_session_by_id", fake_get_session)
-    monkeypatch.setattr(service, "_count_equipment_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        service, "_count_equipment_for_session", AsyncMock(return_value=0)
+    )
     monkeypatch.setattr(service, "_count_temperature_logs", AsyncMock(return_value=0))
-    monkeypatch.setattr(service, "_count_cleaning_tasks_for_session", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        service, "_count_cleaning_tasks_for_session", AsyncMock(return_value=0)
+    )
     monkeypatch.setattr(service, "_count_cleaning_logs", AsyncMock(return_value=0))
     monkeypatch.setattr(
         service,
@@ -386,20 +407,15 @@ async def test_haccp_complete_session_force_records_manager_trace_for_dlc(monkey
         ),
     )
 
-    result = await service.complete_session(
-        fake_session,
-        session_id=84,
-        user_id=7,
-        notes="validation manager",
-        force=True,
-    )
-
-    assert result.status == "incomplete_validated"
-    assert result.completed_by == 7
-    fake_session.commit.assert_awaited_once()
-    trace = fake_session.add.call_args.args[0]
-    assert isinstance(trace, HaccpNonConformity)
-    assert trace.source_type == "dlc"
-    assert trace.session_id == 84
-    assert trace.status == "open"
-    assert trace.validated_by == 7
+    with pytest.raises(AppError) as error:
+        await service.complete_session(
+            fake_session,
+            session_id=84,
+            user_id=7,
+            notes="validation manager",
+            force=True,
+        )
+    assert error.value.code == "HACCP_FORCE_FORBIDDEN"
+    fake_session.commit.assert_not_awaited()
+    fake_session.add.assert_not_called()
+    assert check_session.status == "in_progress"
