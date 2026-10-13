@@ -27,6 +27,20 @@ class OrderItemCreate(BaseModel):
     # exclusivement depuis le catalogue côté serveur (orders/service.py::create_order).
 
 
+class MenuProductSelectionCreate(BaseModel):
+    group_id: int = Field(..., ge=1)
+    product_id: int = Field(..., ge=1)
+    variant_id: int | None = Field(None, ge=1)
+    quantity: int = Field(1, ge=1, le=20)
+    extras: list[OrderItemExtraCreate] = Field(default_factory=list)
+
+
+class MenuItemCreate(BaseModel):
+    menu_id: int = Field(..., ge=1)
+    quantity: int = Field(1, ge=1, le=99)
+    selections: list[MenuProductSelectionCreate] = Field(..., min_length=1)
+
+
 _PHONE_RE = re.compile(r"^\+?[0-9 ().-]{6,32}$")
 
 
@@ -49,7 +63,8 @@ class OrderCreate(BaseModel):
     # des clients existants mais n'a aucun effet sur la commande créée.
     discount_total: float = 0
     promo_code: str | None = None
-    items: list[OrderItemCreate] = Field(..., min_length=1)
+    items: list[OrderItemCreate] = Field(default_factory=list)
+    menu_items: list[MenuItemCreate] = Field(default_factory=list)
 
     @field_validator("customer_phone", mode="before")
     @classmethod
@@ -73,6 +88,8 @@ class OrderCreate(BaseModel):
 
     @model_validator(mode="after")
     def _validate_delivery_fields(self) -> "OrderCreate":
+        if not self.items and not self.menu_items:
+            raise ValueError("items ou menu_items doit contenir au moins une ligne")
         if self.order_type == "delivery" and not self.delivery_address:
             raise ValueError("delivery_address est requis pour une commande en livraison")
         if (self.delivery_lat is None) != (self.delivery_lng is None):
@@ -187,12 +204,20 @@ class OrderItemExtraOut(BaseModel):
 
 class OrderItemOut(BaseModel):
     id: int
-    product_id: int
+    item_type: Literal["product", "menu", "menu_component"] = "product"
+    parent_item_id: int | None = None
+    menu_id: int | None = None
+    menu_name: str | None = None
+    menu_group_id: int | None = None
+    menu_group_name: str | None = None
+    menu_snapshot: dict[str, Any] | None = None
+    product_id: int | None = None
     variant_id: int | None = None
     product_name: str | None = None
     variant_name: str | None = None
     quantity: int
     unit_price: float
+    catalog_unit_price: float | None = None
     extras_total: float = 0
     total: float
     extras: list[OrderItemExtraOut] = Field(default_factory=list)
@@ -200,6 +225,7 @@ class OrderItemOut(BaseModel):
     preparation_station: PreparationStation = "kitchen"
     prepared_at: datetime | None = None
     prepared_by_user_id: int | None = None
+    components: list["OrderItemOut"] = Field(default_factory=list)
 
 
 class OrderStationSummaryOut(BaseModel):
@@ -236,15 +262,19 @@ class ReorderItemOut(BaseModel):
 class ReorderOut(BaseModel):
     source_order_id: int
     items: list[ReorderItemOut]
+    menu_items: list[MenuItemCreate] = Field(default_factory=list)
     unavailable_items: list[ReorderItemOut] = Field(default_factory=list)
 
 
 class ReceiptItemOut(BaseModel):
     label: str
+    item_type: Literal["product", "menu", "menu_component"] = "product"
     quantity: int
     unit_price: float
+    catalog_unit_price: float | None = None
     extras: list[OrderItemExtraOut] = Field(default_factory=list)
     total: float
+    components: list["ReceiptItemOut"] = Field(default_factory=list)
 
 
 class OrderReceiptOut(BaseModel):

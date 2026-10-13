@@ -223,7 +223,10 @@ async def _items_counts(session: AsyncSession, order_ids: list[int]) -> dict[int
         return {}
     rows = await session.execute(
         select(OrderItem.order_id, func.coalesce(func.sum(OrderItem.quantity), 0))
-        .where(OrderItem.order_id.in_(order_ids))
+        .where(
+            OrderItem.order_id.in_(order_ids),
+            OrderItem.parent_item_id.is_(None),
+        )
         .group_by(OrderItem.order_id)
     )
     return {order_id: int(count) for order_id, count in rows.all()}

@@ -36,7 +36,7 @@ Creation et cycle de vie des commandes : pricing serveur-side, application des p
 
 **`orders`** : `id`, `user_id`, `customer_email`, `customer_name`, `customer_phone`, `order_type`, `status`, `payment_status`, `source`, `created_by_user_id`, `subtotal`, `discount_total`, `delivery_fee`, `total`, `delivery_address`, `delivery_zone_id`, `delivery_lat`, `delivery_lng`, `delivery_instructions`, `table_number`, `estimated_delivery_at`, `idempotency_key`, `promo_code`, `created_at`.
 
-**`order_items`** : `id`, `order_id`, `product_id`, `variant_id`, `product_name_snapshot`, `variant_name_snapshot`, `extras_snapshot`, `extras_total`, `quantity`, `unit_price`, `total`, `preparation_status`, `preparation_station`, `prepared_at`, `prepared_by_user_id`.
+**`order_items`** : `id`, `order_id`, `item_type`, `parent_item_id`, `menu_id`, `menu_name_snapshot`, `menu_group_id`, `menu_group_name_snapshot`, `menu_snapshot`, `product_id`, `variant_id`, `product_name_snapshot`, `variant_name_snapshot`, `extras_snapshot`, `extras_total`, `quantity`, `unit_price`, `catalog_unit_price_snapshot`, `total`, `preparation_status`, `preparation_station`, `prepared_at`, `prepared_by_user_id`.
 
 **`order_status_history`** : `id`, `order_id`, `status`, `note`, `created_at`.
 
@@ -61,6 +61,14 @@ La migration `0035_admin_staff_api_contracts.py` ajoute :
 - `orders.customer_name`, `orders.customer_phone`, `orders.source`, `orders.created_by_user_id`, `orders.table_number`
 - `order_items.preparation_status`, `order_items.preparation_station`, `order_items.prepared_at`, `order_items.prepared_by_user_id`
 - les contraintes de statut/station de preparation.
+
+La migration `0081_order_menu_hierarchy.py` ajoute la hierarchie des menus commandes :
+
+- `item_type = product | menu | menu_component` ;
+- une ligne parent `menu`, facturee au prix fixe et sans `product_id` ;
+- des lignes enfants `menu_component`, rattachees par `parent_item_id`, non refacturees ;
+- les snapshots du menu, du groupe, du produit, de la variante, des extras et du prix catalogue ;
+- des contraintes DB qui interdisent les formes de ligne incoherentes.
 
 ## Types de commande
 
@@ -125,6 +133,9 @@ renvoie le code au client proprietaire.
 - `items[].unit_price`, `discount_total` et `delivery_fee` client ne sont pas source de verite.
 - Les prix sont resolus depuis `Product.base_price`, `ProductVariant.price_delta` et les `Extra` autorises via `ProductExtra`.
 - Les extras sont sauvegardes en snapshot JSON dans `order_items.extras_snapshot`.
+- `menu_items` permet de commander une formule avec ses selections par groupe. Le serveur valide le menu actif et sa fenetre de disponibilite, les minimums/maximums, les produits autorises, variantes, extras et disponibilites operationnelles.
+- Le prix d'un menu vient uniquement de `Menu.fixed_price`. Les prix catalogue des composants sont conserves pour audit mais les lignes enfants ont `unit_price = 0` et `total = 0` afin d'eviter une double facturation.
+- Une promotion generique s'applique au prix fixe du menu. Une promotion ciblee sur un produit ou une categorie ne cible pas implicitement les composants inclus dans le menu.
 - `delivery_fee` est calcule cote serveur depuis la zone qui couvre le point GPS de livraison.
 - Les frais suivent le moteur de `docs/modules/delivery.md` (regles de zone horaires, livraison offerte des X EUR, code promo ou recompense « livraison offerte »), avec les memes regles que `POST /delivery/check`. L'etablissement de la commande est celui dont la zone couvre le point (ou `establishment_id` demande, qui restreint la recherche). Livraison coupee par l'admin : 409 `DELIVERY_DISABLED`.
 - Une livraison sans coordonnees est refusee (422 `DELIVERY_COORDINATES_REQUIRED`), hors zone aussi (422 `DELIVERY_ZONE_UNREACHABLE`), sans telephone aussi (422 `CUSTOMER_PHONE_REQUIRED`). Une livraison manuelle sans point ni zone donne 422 `DELIVERY_ZONE_REQUIRED`.
@@ -155,6 +166,7 @@ renvoie le code au client proprietaire.
 - Les commandes terminales (`delivered`, `cancelled`) refusent les changements avec `ORDER_NOT_ACTIVE`.
 - Quand un item passe `ready`, `prepared_at` et `prepared_by_user_id` sont remplis.
 - `OrderDetailOut.station_summary` expose un resume par station : `station`, `total_items`, `ready_items`, `all_ready`.
+- Une ligne parent menu utilise la station `none` et n'est pas preparable directement (`MENU_PARENT_NOT_PREPARABLE`). Les composants sont envoyes a leur station reelle et pilotent l'etat KDS.
 - Le statut global de commande reste pilote par `PATCH /orders/{id}/status`.
 
 **Preparation par station -- bulk (LOT 12, `PATCH /orders/{order_id}/stations/{station}/preparation`)**
@@ -185,6 +197,7 @@ renvoie le code au client proprietaire.
 - Client : seulement ses propres commandes.
 - Staff/admin : commandes du tenant courant.
 - Retourne les items, snapshots produits/variants, extras et historique de statut.
+- Pour un menu, retourne une ligne parent avec ses composants dans `components`.
 
 **Annulation client (`POST /orders/{id}/cancel`)**
 
@@ -196,6 +209,7 @@ renvoie le code au client proprietaire.
 
 - Ne cree pas de commande.
 - Retourne un payload panier pre-rempli a partir des `order_items`.
+- Reconstruit les formules dans `menu_items` depuis le snapshot de commande, sans dupliquer les composants dans `items`.
 - Verifie que produit et variant sont encore disponibles.
 - Signale les items indisponibles dans `unavailable_items`.
 
@@ -203,6 +217,7 @@ renvoie le code au client proprietaire.
 
 - Reserve staff/admin.
 - Retourne un JSON structure : items, extras, totaux, adresse, timestamps et metadata.
+- Les menus sont rendus comme une ligne parent facturee, suivie de composants nommes par produit/variante.
 - Le rendu HTML/PDF/imprimante reste cote interface ou integration caisse.
 
 **Confirmation (`-> confirmed`)**
@@ -235,6 +250,7 @@ renvoie le code au client proprietaire.
 
 - `unit_price`, `discount_total` et `delivery_fee` client ne sont pas fiables.
 - Pricing produit, variant, extras et livraison calcule exclusivement cote serveur.
+- Prix fixe, composition et disponibilite des menus revalides exclusivement cote serveur.
 - `Idempotency-Key` obligatoire pour limiter les doubles commandes.
 - Rate-limit de creation commande base sur `user_id` authentifie, fallback IP si absent.
 - `apply_promo` masque les erreurs derriere `INVALID_PROMO`.
@@ -287,6 +303,13 @@ Etend `OrderListOut` avec :
 
 **`OrderItemOut`**
 
+- `item_type`
+- `parent_item_id`
+- `menu_id`
+- `menu_name`
+- `menu_group_id`
+- `menu_group_name`
+- `menu_snapshot`
 - `product_id`
 - `variant_id`
 - `product_name`
@@ -300,6 +323,7 @@ Etend `OrderListOut` avec :
 - `preparation_station`
 - `prepared_at`
 - `prepared_by_user_id`
+- `components`
 
 **`OrderReceiptOut`**
 

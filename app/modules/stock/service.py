@@ -1472,6 +1472,9 @@ async def _item_recipe_deltas(
 ) -> list[tuple[int, float]]:
     deltas: list[tuple[int, float]] = []
 
+    if item.product_id is None:
+        return deltas
+
     recipes = await session.execute(
         select(ProductIngredient).where(ProductIngredient.product_id == item.product_id)
     )

@@ -86,11 +86,38 @@ class OrderItem(Base):
             "preparation_station IN ('kitchen', 'counter', 'none')",
             name="ck_order_items_preparation_station",
         ),
+        CheckConstraint(
+            "item_type IN ('product', 'menu', 'menu_component')",
+            name="ck_order_items_item_type",
+        ),
+        CheckConstraint(
+            "(item_type = 'product' AND product_id IS NOT NULL "
+            "AND parent_item_id IS NULL AND menu_id IS NULL) OR "
+            "(item_type = 'menu' AND product_id IS NULL "
+            "AND parent_item_id IS NULL AND menu_id IS NOT NULL) OR "
+            "(item_type = 'menu_component' AND product_id IS NOT NULL "
+            "AND parent_item_id IS NOT NULL AND menu_id IS NOT NULL "
+            "AND menu_group_id IS NOT NULL)",
+            name="ck_order_items_type_shape",
+        ),
+        Index("ix_order_items_parent_item_id", "parent_item_id"),
+        Index("ix_order_items_menu_id", "menu_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False)
-    product_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    item_type: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="product", server_default="product"
+    )
+    parent_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("order_items.id", ondelete="CASCADE"), nullable=True
+    )
+    menu_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    menu_name_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    menu_group_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    menu_group_name_snapshot: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    menu_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    product_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     product_name_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     variant_name_snapshot: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -100,6 +127,7 @@ class OrderItem(Base):
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    catalog_unit_price_snapshot: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     total: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     preparation_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending", server_default="pending"

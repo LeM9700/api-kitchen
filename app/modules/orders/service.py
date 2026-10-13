@@ -12,7 +12,17 @@ from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
 from app.core.i18n.translate import t
 from app.modules.admin.tenants.models import TenantConfig
-from app.modules.catalog.models import Category, Extra, Product, ProductExtra, ProductVariant
+from app.modules.catalog import service as catalog_service
+from app.modules.catalog.models import (
+    Category,
+    Extra,
+    Menu,
+    MenuGroup,
+    MenuGroupItem,
+    Product,
+    ProductExtra,
+    ProductVariant,
+)
 from app.modules.delivery import lifecycle as delivery_lifecycle
 from app.modules.delivery import proof as delivery_proof_service
 from app.modules.delivery import service as delivery_service
@@ -304,6 +314,38 @@ def _station_summary(items: list[dict]) -> list[dict]:
     ]
 
 
+def _serialize_order_item(item: OrderItem) -> dict:
+    return {
+        "id": item.id,
+        "item_type": getattr(item, "item_type", None) or "product",
+        "parent_item_id": getattr(item, "parent_item_id", None),
+        "menu_id": getattr(item, "menu_id", None),
+        "menu_name": getattr(item, "menu_name_snapshot", None),
+        "menu_group_id": getattr(item, "menu_group_id", None),
+        "menu_group_name": getattr(item, "menu_group_name_snapshot", None),
+        "menu_snapshot": getattr(item, "menu_snapshot", None),
+        "product_id": item.product_id,
+        "variant_id": item.variant_id,
+        "product_name": getattr(item, "product_name_snapshot", None),
+        "variant_name": getattr(item, "variant_name_snapshot", None),
+        "quantity": item.quantity,
+        "unit_price": _money(item.unit_price),
+        "catalog_unit_price": (
+            _money(item.catalog_unit_price_snapshot)
+            if getattr(item, "catalog_unit_price_snapshot", None) is not None
+            else None
+        ),
+        "extras_total": _money(getattr(item, "extras_total", 0)),
+        "total": _money(item.total),
+        "extras": _extras_from_snapshot(getattr(item, "extras_snapshot", None)),
+        "preparation_status": getattr(item, "preparation_status", None) or "pending",
+        "preparation_station": getattr(item, "preparation_station", None) or "kitchen",
+        "prepared_at": getattr(item, "prepared_at", None),
+        "prepared_by_user_id": getattr(item, "prepared_by_user_id", None),
+        "components": [],
+    }
+
+
 async def _serialize_order_detail(session: AsyncSession, order: Order) -> dict:
     items_result = await session.execute(
         select(OrderItem).where(OrderItem.order_id == order.id).order_by(OrderItem.id)
@@ -314,25 +356,15 @@ async def _serialize_order_detail(session: AsyncSession, order: Order) -> dict:
         .order_by(OrderStatusHistory.created_at, OrderStatusHistory.id)
     )
 
-    serialized_items = [
-        {
-            "id": item.id,
-            "product_id": item.product_id,
-            "variant_id": item.variant_id,
-            "product_name": getattr(item, "product_name_snapshot", None),
-            "variant_name": getattr(item, "variant_name_snapshot", None),
-            "quantity": item.quantity,
-            "unit_price": _money(item.unit_price),
-            "extras_total": _money(getattr(item, "extras_total", 0)),
-            "total": _money(item.total),
-            "extras": _extras_from_snapshot(getattr(item, "extras_snapshot", None)),
-            "preparation_status": getattr(item, "preparation_status", None) or "pending",
-            "preparation_station": getattr(item, "preparation_station", None) or "kitchen",
-            "prepared_at": getattr(item, "prepared_at", None),
-            "prepared_by_user_id": getattr(item, "prepared_by_user_id", None),
-        }
-        for item in items_result.scalars()
-    ]
+    flat_items = [_serialize_order_item(item) for item in items_result.scalars()]
+    items_by_id = {item["id"]: item for item in flat_items}
+    serialized_items: list[dict] = []
+    for item in flat_items:
+        parent_id = item["parent_item_id"]
+        if parent_id is not None and parent_id in items_by_id:
+            items_by_id[parent_id]["components"].append(item)
+        else:
+            serialized_items.append(item)
 
     payload = _serialize_order_list(order)
     payload.update(
@@ -340,7 +372,7 @@ async def _serialize_order_detail(session: AsyncSession, order: Order) -> dict:
             "user_id": order.user_id,
             "promo_code": getattr(order, "promo_code", None),
             "items": serialized_items,
-            "station_summary": _station_summary(serialized_items),
+            "station_summary": _station_summary(flat_items),
             "status_history": [
                 {
                     "status": history.status,
@@ -529,6 +561,190 @@ async def _resolve_preparation_station(session: AsyncSession, product: Product) 
     return getattr(category, "preparation_station", None) or "kitchen"
 
 
+async def _resolve_catalog_item(session: AsyncSession, item) -> dict:
+    product = await session.get(Product, item.product_id)
+    if product is None or not product.is_active:
+        raise AppError(
+            "PRODUCT_NOT_FOUND",
+            f"Product {item.product_id} not found or inactive",
+            404,
+            "product_id",
+        )
+
+    unit_price = float(product.base_price)
+    variant_name = None
+    if item.variant_id is not None:
+        variant = await session.get(ProductVariant, item.variant_id)
+        if variant is None or not variant.is_active or variant.product_id != item.product_id:
+            raise AppError(
+                "PRODUCT_NOT_FOUND",
+                f"Variant {item.variant_id} not found or inactive",
+                404,
+                "variant_id",
+            )
+        unit_price += float(variant.price_delta)
+        variant_name = variant.name
+
+    extras_snapshot, extras_unit_total = await _resolve_extras(
+        session, item.product_id, getattr(item, "extras", [])
+    )
+    unit_price = _money(unit_price + extras_unit_total)
+    return {
+        "request": item,
+        "product": product,
+        "unit_price": unit_price,
+        "product_name": product.name,
+        "variant_name": variant_name,
+        "extras_snapshot": extras_snapshot,
+        "extras_unit_total": extras_unit_total,
+        "category_id": product.category_id,
+        "preparation_station": await _resolve_preparation_station(session, product),
+    }
+
+
+async def _resolve_menu_item(session: AsyncSession, requested_menu) -> dict:
+    menu = await session.scalar(
+        select(Menu).where(Menu.id == requested_menu.menu_id).with_for_update()
+    )
+    now = datetime.now(timezone.utc)
+    if (
+        menu is None
+        or not menu.is_active
+        or (menu.available_from is not None and menu.available_from > now)
+        or (menu.available_until is not None and menu.available_until <= now)
+    ):
+        raise AppError(
+            "MENU_NOT_AVAILABLE",
+            "Menu introuvable ou indisponible",
+            404,
+            "menu_id",
+        )
+
+    groups = list(
+        (
+            await session.execute(
+                select(MenuGroup)
+                .where(MenuGroup.menu_id == menu.id)
+                .order_by(MenuGroup.display_order, MenuGroup.id)
+            )
+        ).scalars()
+    )
+    if not groups:
+        raise AppError("MENU_NOT_AVAILABLE", "Menu incomplet", 409, "menu_id")
+
+    group_by_id = {group.id: group for group in groups}
+    allowed_rows = (
+        await session.execute(
+            select(MenuGroupItem.group_id, MenuGroupItem.product_id).where(
+                MenuGroupItem.group_id.in_(list(group_by_id))
+            )
+        )
+    ).all()
+    allowed_products = {(group_id, product_id) for group_id, product_id in allowed_rows}
+
+    counts_by_group = {group.id: 0 for group in groups}
+    seen_selections: set[tuple[int, int]] = set()
+    resolved_components: list[dict] = []
+    for selection in requested_menu.selections:
+        group = group_by_id.get(selection.group_id)
+        if group is None:
+            raise AppError(
+                "INVALID_MENU_SELECTION",
+                "Un groupe selectionne n'appartient pas a ce menu",
+                422,
+                "menu_items",
+            )
+        selection_key = (selection.group_id, selection.product_id)
+        if selection_key in seen_selections:
+            raise AppError(
+                "INVALID_MENU_SELECTION",
+                "Un produit ne peut apparaitre qu'une fois par groupe",
+                422,
+                "menu_items",
+            )
+        seen_selections.add(selection_key)
+        if selection_key not in allowed_products:
+            raise AppError(
+                "INVALID_MENU_SELECTION",
+                f"Le produit {selection.product_id} n'est pas autorise dans le groupe '{group.name}'",
+                422,
+                "menu_items",
+            )
+        counts_by_group[group.id] += selection.quantity
+        resolved = await _resolve_catalog_item(session, selection)
+        resolved["group"] = group
+        resolved_components.append(resolved)
+
+    for group in groups:
+        selected_count = counts_by_group[group.id]
+        if selected_count < group.min_choices or selected_count > group.max_choices:
+            raise AppError(
+                "INVALID_MENU_SELECTION",
+                f"Le groupe '{group.name}' exige entre {group.min_choices} et "
+                f"{group.max_choices} choix",
+                422,
+                "menu_items",
+            )
+
+    availability = await catalog_service.get_products_operational_availability(
+        session,
+        [component["product"].id for component in resolved_components],
+    )
+    for component in resolved_components:
+        product_availability = availability.get(component["product"].id)
+        if product_availability is not None and not product_availability.available:
+            raise AppError(
+                "MENU_PRODUCT_UNAVAILABLE",
+                product_availability.reason
+                or f"Le produit '{component['product_name']}' est indisponible",
+                409,
+                "menu_items",
+            )
+
+    snapshot_groups: list[dict] = []
+    for group in groups:
+        selections = []
+        for component in resolved_components:
+            if component["group"].id != group.id:
+                continue
+            selection = component["request"]
+            selections.append(
+                {
+                    "group_id": group.id,
+                    "group_name": group.name,
+                    "product_id": component["product"].id,
+                    "product_name": component["product_name"],
+                    "variant_id": selection.variant_id,
+                    "variant_name": component["variant_name"],
+                    "quantity": selection.quantity,
+                    "catalog_unit_price": component["unit_price"],
+                    "extras": component["extras_snapshot"],
+                }
+            )
+        snapshot_groups.append(
+            {
+                "group_id": group.id,
+                "group_name": group.name,
+                "min_choices": group.min_choices,
+                "max_choices": group.max_choices,
+                "selections": selections,
+            }
+        )
+
+    return {
+        "request": requested_menu,
+        "menu": menu,
+        "unit_price": _money(menu.fixed_price),
+        "components": resolved_components,
+        "snapshot": {
+            "menu_id": menu.id,
+            "menu_name": menu.name,
+            "fixed_price": _money(menu.fixed_price),
+            "groups": snapshot_groups,
+        },
+    }
+
+
 async def _find_idempotent_order(
     session: AsyncSession,
     user_id: int | None,
@@ -611,52 +827,30 @@ async def create_order(
     # [SECURITE] Resolution des prix depuis le catalogue -- unit_price client ignore.
     resolved_items: list[tuple] = []
     for item in body.items:
-        product = await session.get(Product, item.product_id)
-        if product is None or not product.is_active:
-            raise AppError(
-                "PRODUCT_NOT_FOUND",
-                f"Product {item.product_id} not found or inactive",
-                404,
-                "product_id",
-            )
-        unit_price = float(product.base_price)
-        if item.variant_id is not None:
-            variant = await session.get(ProductVariant, item.variant_id)
-            if (
-                variant is None
-                or not variant.is_active
-                or variant.product_id != item.product_id
-            ):
-                raise AppError(
-                    "PRODUCT_NOT_FOUND",
-                    f"Variant {item.variant_id} not found or inactive",
-                    404,
-                    "variant_id",
-                )
-            unit_price += float(variant.price_delta)
-            variant_name = variant.name
-        else:
-            variant_name = None
-
-        extras_snapshot, extras_unit_total = await _resolve_extras(
-            session, item.product_id, getattr(item, "extras", [])
-        )
-        unit_price += extras_unit_total
-        preparation_station = await _resolve_preparation_station(session, product)
+        resolved = await _resolve_catalog_item(session, item)
         resolved_items.append(
             (
                 item,
-                unit_price,
-                product.name,
-                variant_name,
-                extras_snapshot,
-                extras_unit_total,
-                product.category_id,
-                preparation_station,
+                resolved["unit_price"],
+                resolved["product_name"],
+                resolved["variant_name"],
+                resolved["extras_snapshot"],
+                resolved["extras_unit_total"],
+                resolved["category_id"],
+                resolved["preparation_station"],
             )
         )
 
-    subtotal = _money(sum(item.quantity * price for item, price, *_ in resolved_items))
+    resolved_menu_items = [
+        await _resolve_menu_item(session, menu_item)
+        for menu_item in getattr(body, "menu_items", [])
+    ]
+    product_subtotal = sum(item.quantity * price for item, price, *_ in resolved_items)
+    menu_subtotal = sum(
+        resolved["request"].quantity * resolved["unit_price"]
+        for resolved in resolved_menu_items
+    )
+    subtotal = _money(product_subtotal + menu_subtotal)
 
     # [SECURITE] discount_total calcule cote serveur uniquement.
     discount_total: float = 0.0
@@ -700,6 +894,18 @@ async def create_order(
             )
             in resolved_items
         ]
+        promo_items.extend(
+            PromotionCartItem(
+                product_id=None,
+                category_id=None,
+                quantity=resolved["request"].quantity,
+                unit_price=resolved["unit_price"],
+                line_total=_money(
+                    resolved["request"].quantity * resolved["unit_price"]
+                ),
+            )
+            for resolved in resolved_menu_items
+        )
         discount_total = await promotions_service.apply_promo(
             session,
             tenant_slug,
@@ -780,7 +986,12 @@ async def create_order(
     await enforce_ordering(
         session,
         establishment_id,
-        [item.product_id for item in body.items],
+        [item.product_id for item in body.items]
+        + [
+            component["product"].id
+            for resolved in resolved_menu_items
+            for component in resolved["components"]
+        ],
     )
 
     total = _money(subtotal - discount_total + delivery_fee)
@@ -886,6 +1097,7 @@ async def create_order(
         session.add(
             OrderItem(
                 order_id=order.id,
+                item_type="product",
                 product_id=item.product_id,
                 variant_id=item.variant_id,
                 product_name_snapshot=product_name,
@@ -894,11 +1106,60 @@ async def create_order(
                 extras_total=_money(item.quantity * extras_unit_total),
                 quantity=item.quantity,
                 unit_price=unit_price,
+                catalog_unit_price_snapshot=unit_price,
                 total=_money(item.quantity * unit_price),
                 preparation_status="pending",
                 preparation_station=preparation_station,
             )
         )
+    for resolved in resolved_menu_items:
+        requested_menu = resolved["request"]
+        menu = resolved["menu"]
+        parent = OrderItem(
+            order_id=order.id,
+            item_type="menu",
+            menu_id=menu.id,
+            menu_name_snapshot=menu.name,
+            menu_snapshot=resolved["snapshot"],
+            product_id=None,
+            product_name_snapshot=menu.name,
+            extras_snapshot=[],
+            extras_total=0,
+            quantity=requested_menu.quantity,
+            unit_price=resolved["unit_price"],
+            catalog_unit_price_snapshot=resolved["unit_price"],
+            total=_money(requested_menu.quantity * resolved["unit_price"]),
+            preparation_status="pending",
+            preparation_station="none",
+        )
+        session.add(parent)
+        await session.flush()
+        for component in resolved["components"]:
+            selection = component["request"]
+            group = component["group"]
+            session.add(
+                OrderItem(
+                    order_id=order.id,
+                    item_type="menu_component",
+                    parent_item_id=parent.id,
+                    menu_id=menu.id,
+                    menu_name_snapshot=menu.name,
+                    menu_group_id=group.id,
+                    menu_group_name_snapshot=group.name,
+                    product_id=selection.product_id,
+                    variant_id=selection.variant_id,
+                    product_name_snapshot=component["product_name"],
+                    variant_name_snapshot=component["variant_name"],
+                    extras_snapshot=component["extras_snapshot"],
+                    extras_total=0,
+                    quantity=requested_menu.quantity * selection.quantity,
+                    unit_price=0,
+                    catalog_unit_price_snapshot=component["unit_price"],
+                    total=0,
+                    preparation_status="pending",
+                    preparation_station=component["preparation_station"],
+                )
+            )
     session.add(OrderStatusHistory(order_id=order.id, status=order.status))
     await session.flush()
     if commit:
@@ -1116,7 +1377,7 @@ async def _credit_loyalty_for_order(
 
     items_result = await session.execute(select(OrderItem).where(OrderItem.order_id == order.id))
     order_items = list(items_result.scalars())
-    product_ids = [item.product_id for item in order_items]
+    product_ids = [item.product_id for item in order_items if item.product_id is not None]
 
     category_ids: list[int] = []
     if product_ids:
@@ -1181,6 +1442,13 @@ async def update_item_preparation(
     item = await session.get(OrderItem, item_id)
     if item is None or item.order_id != order_id:
         raise AppError("ORDER_ITEM_NOT_FOUND", "Order item not found", 404)
+    if getattr(item, "item_type", "product") == "menu":
+        raise AppError(
+            "MENU_PARENT_NOT_PREPARABLE",
+            "La preparation se met a jour sur les composants du menu",
+            422,
+            "item_id",
+        )
 
     _apply_preparation_status(item, status, actor_user_id)
 
@@ -1194,22 +1462,7 @@ async def update_item_preparation(
         )
     await session.commit()
     await session.refresh(item)
-    return {
-        "id": item.id,
-        "product_id": item.product_id,
-        "variant_id": item.variant_id,
-        "product_name": getattr(item, "product_name_snapshot", None),
-        "variant_name": getattr(item, "variant_name_snapshot", None),
-        "quantity": item.quantity,
-        "unit_price": _money(item.unit_price),
-        "extras_total": _money(getattr(item, "extras_total", 0)),
-        "total": _money(item.total),
-        "extras": _extras_from_snapshot(getattr(item, "extras_snapshot", None)),
-        "preparation_status": item.preparation_status,
-        "preparation_station": item.preparation_station,
-        "prepared_at": item.prepared_at,
-        "prepared_by_user_id": item.prepared_by_user_id,
-    }
+    return _serialize_order_item(item)
 
 
 async def update_station_preparation(
@@ -1301,7 +1554,10 @@ async def update_station_preparation(
 
     if status == "ready" and previous_order_status == "preparing":
         remaining_result = await session.execute(
-            select(OrderItem.preparation_status).where(OrderItem.order_id == order_id)
+            select(OrderItem.preparation_status).where(
+                OrderItem.order_id == order_id,
+                OrderItem.preparation_station != "none",
+            )
         )
         remaining_statuses = [row[0] for row in remaining_result.all()]
         if remaining_statuses and all(item_status == "ready" for item_status in remaining_statuses):
@@ -1543,8 +1799,40 @@ async def build_reorder_payload(
         select(OrderItem).where(OrderItem.order_id == order_id).order_by(OrderItem.id)
     )
     items: list[dict] = []
+    menu_items: list[dict] = []
     unavailable: list[dict] = []
     for item in items_result.scalars():
+        item_type = getattr(item, "item_type", None) or "product"
+        if item_type == "menu_component":
+            continue
+        if item_type == "menu":
+            snapshot = getattr(item, "menu_snapshot", None) or {}
+            selections = [
+                {
+                    "group_id": selection["group_id"],
+                    "product_id": selection["product_id"],
+                    "variant_id": selection.get("variant_id"),
+                    "quantity": selection.get("quantity", 1),
+                    "extras": [
+                        {
+                            "extra_id": extra["extra_id"],
+                            "quantity": extra.get("quantity", 1),
+                        }
+                        for extra in selection.get("extras", [])
+                    ],
+                }
+                for group in snapshot.get("groups", [])
+                for selection in group.get("selections", [])
+            ]
+            if item.menu_id is not None and selections:
+                menu_items.append(
+                    {
+                        "menu_id": item.menu_id,
+                        "quantity": item.quantity,
+                        "selections": selections,
+                    }
+                )
+            continue
         warning = None
         available = True
         product = await session.get(Product, item.product_id)
@@ -1573,7 +1861,12 @@ async def build_reorder_payload(
         if not available:
             unavailable.append(payload_item)
 
-    return {"source_order_id": order_id, "items": items, "unavailable_items": unavailable}
+    return {
+        "source_order_id": order_id,
+        "items": items,
+        "menu_items": menu_items,
+        "unavailable_items": unavailable,
+    }
 
 
 async def build_receipt(
@@ -1585,20 +1878,26 @@ async def build_receipt(
         raise AppError("ORDER_NOT_FOUND", "Order not found", 404)
 
     detail = await _serialize_order_detail(session, order)
-    receipt_items = []
-    for item in detail["items"]:
-        label = item["product_name"] or f"Product #{item['product_id']}"
+    def receipt_line(item: dict) -> dict:
+        label = (
+            item["menu_name"]
+            if item["item_type"] == "menu"
+            else item["product_name"] or f"Product #{item['product_id']}"
+        )
         if item["variant_name"]:
             label = f"{label} - {item['variant_name']}"
-        receipt_items.append(
-            {
-                "label": label,
-                "quantity": item["quantity"],
-                "unit_price": item["unit_price"],
-                "extras": item["extras"],
-                "total": item["total"],
-            }
-        )
+        return {
+            "label": label,
+            "item_type": item["item_type"],
+            "quantity": item["quantity"],
+            "unit_price": item["unit_price"],
+            "catalog_unit_price": item["catalog_unit_price"],
+            "extras": item["extras"],
+            "total": item["total"],
+            "components": [receipt_line(component) for component in item["components"]],
+        }
+
+    receipt_items = [receipt_line(item) for item in detail["items"]]
 
     return {
         "order_id": order.id,

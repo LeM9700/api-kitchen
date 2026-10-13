@@ -356,7 +356,7 @@ async def _enforce_order_haccp_gate(session: AsyncSession, order: Order) -> None
         await enforce_ordering(
             session,
             int(order.establishment_id),
-            [item.product_id for item in items],
+            [item.product_id for item in items if item.product_id is not None],
         )
     except (StopAsyncIteration, TypeError, AttributeError):
         # Keep lightweight legacy adapters usable; production AsyncSession paths

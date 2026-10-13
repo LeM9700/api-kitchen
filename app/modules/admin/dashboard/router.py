@@ -242,7 +242,11 @@ async def top_products(
                 func.coalesce(func.sum(OrderItem.total + OrderItem.extras_total), 0).label("revenue"),
             )
             .join(Order, Order.id == OrderItem.order_id)
-            .where(Order.created_at >= since, Order.status != "cancelled")
+            .where(
+                Order.created_at >= since,
+                Order.status != "cancelled",
+                OrderItem.product_id.isnot(None),
+            )
             .group_by(OrderItem.product_id)
             .order_by(func.coalesce(func.sum(OrderItem.quantity), 0).desc())
             .limit(limit)

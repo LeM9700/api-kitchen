@@ -405,6 +405,14 @@ async def _availability_map(session: AsyncSession, product_ids: list[int]) -> di
     return availability
 
 
+async def get_products_operational_availability(
+    session: AsyncSession,
+    product_ids: list[int],
+) -> dict[int, ProductAvailabilityOut]:
+    """Expose la disponibilite stock/override pour les validations serveur internes."""
+    return await _availability_map(session, product_ids)
+
+
 async def build_product_summaries(
     session: AsyncSession,
     products: list[Product],
