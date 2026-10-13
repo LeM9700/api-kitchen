@@ -136,6 +136,12 @@ renvoie le code au client proprietaire.
 - `menu_items` permet de commander une formule avec ses selections par groupe. Le serveur valide le menu actif et sa fenetre de disponibilite, les minimums/maximums, les produits autorises, variantes, extras et disponibilites operationnelles.
 - Le prix d'un menu vient uniquement de `Menu.fixed_price`. Les prix catalogue des composants sont conserves pour audit mais les lignes enfants ont `unit_price = 0` et `total = 0` afin d'eviter une double facturation.
 - Une promotion generique s'applique au prix fixe du menu. Une promotion ciblee sur un produit ou une categorie ne cible pas implicitement les composants inclus dans le menu.
+- Le client n'envoie aucun prix de menu. Le serveur reconstruit la ligne parent et
+  les composants, puis conserve des snapshots immuables pour l'historique, le recu
+  et le rejeu d'une commande.
+- Les variantes et extras des composants sont valides comme pour un produit seul,
+  mais restent inclus dans le prix fixe en V1. Le stock, les allergenes et la
+  preparation s'appliquent aux composants reels, jamais a la ligne parent.
 - `delivery_fee` est calcule cote serveur depuis la zone qui couvre le point GPS de livraison.
 - Les frais suivent le moteur de `docs/modules/delivery.md` (regles de zone horaires, livraison offerte des X EUR, code promo ou recompense « livraison offerte »), avec les memes regles que `POST /delivery/check`. L'etablissement de la commande est celui dont la zone couvre le point (ou `establishment_id` demande, qui restreint la recherche). Livraison coupee par l'admin : 409 `DELIVERY_DISABLED`.
 - Une livraison sans coordonnees est refusee (422 `DELIVERY_COORDINATES_REQUIRED`), hors zone aussi (422 `DELIVERY_ZONE_UNREACHABLE`), sans telephone aussi (422 `CUSTOMER_PHONE_REQUIRED`). Une livraison manuelle sans point ni zone donne 422 `DELIVERY_ZONE_REQUIRED`.

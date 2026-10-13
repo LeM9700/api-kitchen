@@ -212,7 +212,21 @@ d'un autre menu du tenant.
 **Lecture publique des menus** : le backend filtre les brouillons, les menus hors
 fenetre et les compositions incompletes. La complétude est calculee avant
 pagination, puis seuls les produits de la page demandee sont enrichis par lots afin
-d'eviter les appels par produit. Cette API ne cree pas encore de commande menu.
+d'eviter les appels par produit. La selection client est ensuite revalidee par le
+module `orders` avant toute creation de commande ; aucune disponibilite ni aucun
+prix provenant du client ne fait autorite.
+
+**Mode POS `connected`** : le menu est un objet local au tenant. Il peut composer
+des produits synchronises, mais l'ecran menus ne modifie ni leurs donnees POS ni
+leur prix catalogue. La formule garde son propre prix fixe et doit etre republiee
+apres tout changement reel de composition.
+
+**Limites V1** : le prix est fixe pour toute la formule, les variantes et extras
+selectionnes n'ajoutent pas de supplement, et les fenetres de disponibilite sont
+simples (`available_from` / `available_until`). La V1 ne couvre pas les options
+payantes par groupe, les horaires recurrents complexes, l'import CSV de menus, la
+synchronisation de menus POS, les recommandations automatiques ni les analytics
+avances.
 
 **Disponibilité stock** : le résumé et le détail produit exposent une disponibilité de base via lecture du service stock existant (`get_product_availability`) sans modifier le module stock.
 

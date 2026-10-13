@@ -1,5 +1,9 @@
 # Mise en production - Menus phase 7
 
+Version candidate validee par cette barriere : API `0.2.0`, admin `0.2.0+2`,
+client `1.1.0+2`. Le runbook consolide de release se trouve dans
+`docs/operations/menus-v1-release.md`.
+
 Cette phase verrouille les parcours menus par des tests transversaux. Elle ne
 modifie ni le schema de donnees, ni les contrats API, ni les variables
 d'environnement.
