@@ -196,6 +196,40 @@ async def test_menu_order_uses_fixed_price_and_persists_parent_component_snapsho
     assert reorder["menu_items"][0]["selections"][0]["extras"][0]["extra_id"] == graph["extra"].id
 
 
+async def test_menu_order_ignores_forged_client_prices(db_session):
+    graph = await _menu_graph(db_session)
+    payload = _body(graph).model_dump()
+    payload["menu_items"][0].update(
+        {
+            "fixed_price": 0.01,
+            "unit_price": 0.01,
+            "total": 0.01,
+        }
+    )
+    payload["menu_items"][0]["selections"][0].update(
+        {
+            "unit_price": 0.01,
+            "extras_total": 0.01,
+        }
+    )
+
+    body = OrderCreate.model_validate(payload)
+    normalized = body.model_dump()
+    assert "fixed_price" not in normalized["menu_items"][0]
+    assert "unit_price" not in normalized["menu_items"][0]
+    assert "unit_price" not in normalized["menu_items"][0]["selections"][0]
+
+    order = await service.create_order(
+        db_session,
+        body,
+        idempotency_key=f"forged-price-{uuid.uuid4().hex}",
+        commit=False,
+    )
+
+    assert float(order.subtotal) == 18
+    assert float(order.total) == 18
+
+
 async def test_menu_order_rejects_incomplete_or_forged_composition(db_session):
     graph = await _menu_graph(db_session, second_required_group=True)
     valid_body = _body(graph)

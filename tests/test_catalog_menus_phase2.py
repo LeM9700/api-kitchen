@@ -263,6 +263,34 @@ async def test_staff_without_catalog_permission_is_denied(bootstrap_default_tena
     assert write_response.status_code == 403
 
 
+async def test_customer_cannot_access_menu_admin_routes(bootstrap_default_tenant):
+    token = create_access_token(
+        {
+            "sub": str(bootstrap_default_tenant["client_user_id"]),
+            "email": "customer@test.com",
+            "role": "customer",
+            "tenant_id": bootstrap_default_tenant["tenant_id"],
+            "tenant_slug": bootstrap_default_tenant["tenant_slug"],
+            "permissions": [],
+            "must_change_password": False,
+        }
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer " + token},
+    ) as customer_client:
+        read_response = await customer_client.get("/api/v1/catalog/admin/menus")
+        write_response = await customer_client.post(
+            "/api/v1/catalog/admin/menus",
+            json={"name": "Interdit au client", "fixed_price": 10},
+        )
+
+    assert read_response.status_code == 401
+    assert write_response.status_code == 401
+
+
 async def test_connected_tenant_can_create_local_menu(db_engine, authed_client, bootstrap_default_tenant):
     slug = bootstrap_default_tenant["tenant_slug"]
     async with db_engine.begin() as conn:
