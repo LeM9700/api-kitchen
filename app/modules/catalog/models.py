@@ -149,6 +149,67 @@ class ProductRecommendation(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="true")
 
 
+class Menu(Base):
+    __tablename__ = "menus"
+    __table_args__ = (
+        CheckConstraint("fixed_price >= 0", name="ck_menus_fixed_price_non_negative"),
+        CheckConstraint("char_length(btrim(name)) > 0", name="ck_menus_name_not_blank"),
+        CheckConstraint("display_order >= 0", name="ck_menus_display_order_non_negative"),
+        CheckConstraint(
+            "available_from IS NULL OR available_until IS NULL OR available_until > available_from",
+            name="ck_menus_availability_window",
+        ),
+        Index("ix_menus_active_display_order", "is_active", "display_order"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fixed_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    available_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    available_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MenuGroup(Base):
+    __tablename__ = "menu_groups"
+    __table_args__ = (
+        CheckConstraint("char_length(btrim(name)) > 0", name="ck_menu_groups_name_not_blank"),
+        CheckConstraint("min_choices >= 1", name="ck_menu_groups_min_choices_positive"),
+        CheckConstraint("max_choices >= min_choices", name="ck_menu_groups_choice_range"),
+        CheckConstraint("display_order >= 0", name="ck_menu_groups_display_order_non_negative"),
+        Index("ix_menu_groups_menu_display_order", "menu_id", "display_order"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    menu_id: Mapped[int] = mapped_column(ForeignKey("menus.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    min_choices: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    max_choices: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+
+class MenuGroupItem(Base):
+    __tablename__ = "menu_group_items"
+    __table_args__ = (
+        UniqueConstraint("group_id", "product_id", name="uq_menu_group_items_group_product"),
+        CheckConstraint("display_order >= 0", name="ck_menu_group_items_display_order_non_negative"),
+        Index("ix_menu_group_items_group_display_order", "group_id", "display_order"),
+        Index("ix_menu_group_items_product", "product_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("menu_groups.id", ondelete="CASCADE"), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+
 class CatalogPriceAudit(Base):
     __tablename__ = "catalog_price_audits"
     __table_args__ = (

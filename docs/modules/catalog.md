@@ -1,6 +1,6 @@
 # Catalog
 
-Exposition du catalogue produits d'un tenant : catégories, produits, variantes, extras, galerie d'images, allergènes réglementaires (UE 1169/2011) et étiquettes diététiques.
+Exposition du catalogue produits d'un tenant : catégories, produits, variantes, extras, menus composés, galerie d'images, allergènes réglementaires (UE 1169/2011) et étiquettes diététiques.
 
 ## Endpoints
 
@@ -120,6 +120,12 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 **`allergen_change_audit`** (migration `0013`) : `id`, `product_id`, `allergen_id`, `changed_by_user_id`, `changed_at`, `old_level`, `new_level`, `old_source`, `new_source`, `ip_address`, `reason`. Table immuable pour conformité HACCP.
 
 **`product_recommendations`** (migration `0022`) : `id`, `product_id`, `recommended_product_id`, `display_order`, `label`, `is_active`. Associations manuelles pour produits suggérés / bundles simples.
+
+**`menus`** (migration `0080`) : `id`, `name`, `description`, `fixed_price`, `image_url`, `display_order`, `is_active`, `available_from`, `available_until`, `created_at`, `updated_at`. Le prix fixe appartient au menu et ne modifie jamais le prix ou la TVA des produits, y compris les produits synchronisés depuis un POS.
+
+**`menu_groups`** (migration `0080`) : `id`, `menu_id`, `name`, `min_choices`, `max_choices`, `display_order`. Chaque groupe impose au moins un choix et la base garantit `max_choices >= min_choices`.
+
+**`menu_group_items`** (migration `0080`) : `id`, `group_id`, `product_id`, `display_order`. Un produit ne peut apparaître qu'une fois dans un groupe. La suppression d'un menu supprime ses groupes et leurs associations ; un produit référencé ne peut pas être supprimé physiquement. Les variantes et extras restent rattachés au produit et seront validés lors de la création de commande.
 
 **`catalog_price_audits`** (migration `0022`) : `id`, `entity_type` (`product`, `variant`, `extra`), `entity_id`, `old_price`, `new_price`, `changed_by_user_id`, `source` (`admin`, `import`), `reason`, `changed_at`.
 
