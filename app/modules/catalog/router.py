@@ -21,6 +21,7 @@ from app.modules.catalog.menu_schemas import (
     MenuGroupItemCreate,
     MenuGroupItemUpdate,
     MenuGroupUpdate,
+    MenuPublicOut,
     MenuUpdate,
 )
 from app.modules.catalog.schemas import (
@@ -310,6 +311,31 @@ async def admin_delete_menu_group_item(
             ip_address=ip_address,
             user_agent=user_agent,
         )
+
+
+# ---------------------------------------------------------------------------
+# Menus - public/client API
+# ---------------------------------------------------------------------------
+
+
+@router.get("/menus", response_model=CatalogPaginatedResponse[MenuPublicOut])
+@limiter.limit("60/minute")
+async def public_menus(
+    request: Request,
+    pagination: PaginationParams = Depends(get_pagination),
+):
+    slug = _tenant_slug_from_header(request)
+    async with get_tenant_session(slug) as session:
+        items, total = await menu_service.list_public_menus(session, pagination)
+        return CatalogPaginatedResponse.build(items, total, pagination)
+
+
+@router.get("/menus/{menu_id}", response_model=MenuPublicOut)
+@limiter.limit("60/minute")
+async def public_menu_detail(request: Request, menu_id: int):
+    slug = _tenant_slug_from_header(request)
+    async with get_tenant_session(slug) as session:
+        return await menu_service.get_public_menu(session, menu_id)
 
 
 # ---------------------------------------------------------------------------

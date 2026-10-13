@@ -112,6 +112,24 @@ son prix, sa TVA ou son identifiant externe. Le prix fixe appartient exclusiveme
 au menu. La suppression d'un menu est definitive pour sa composition et conserve
 une trace dans `admin_audit_logs`.
 
+### Menus composes - API publique client
+| Methode | Path | Auth | Limite |
+|---------|------|------|--------|
+| GET | `/api/v1/catalog/menus` | Public, header `X-Tenant-Slug` | 60/minute |
+| GET | `/api/v1/catalog/menus/{menu_id}` | Public, header `X-Tenant-Slug` | 60/minute |
+
+Le listing est pagine et expose uniquement les menus actifs, dans leur fenetre de
+disponibilite, possedant au moins un groupe et assez de produits actifs pour tous
+les choix obligatoires. Un detail non publiable retourne `404` sans exposer son
+etat admin.
+
+Chaque produit est retourne avec sa disponibilite operationnelle, ses variantes et
+extras actifs, sa galerie, ses allergenes et ses tags. Un menu temporairement en
+rupture reste visible avec `is_available=false`, les groupes concernes et les
+raisons de disponibilite des produits. Son prix reste toujours `fixed_price` ; les
+prix unitaires des produits et options sont informatifs et ne definissent pas le
+prix de la formule.
+
 ### Super-admin lecture seule
 | Méthode | Path | Auth | Rôles |
 |---------|------|------|-------|
@@ -189,7 +207,12 @@ une trace dans `admin_audit_logs`.
 **Administration des menus** : le prix, l'activation et chaque changement de
 composition sont traces dans `admin_audit_logs`. Les groupes et items sont toujours
 recherches sous leur menu parent pour empecher l'utilisation d'un identifiant issu
-d'un autre menu du tenant. Aucun endpoint public client n'est expose en phase 2.
+d'un autre menu du tenant.
+
+**Lecture publique des menus** : le backend filtre les brouillons, les menus hors
+fenetre et les compositions incompletes. La complétude est calculee avant
+pagination, puis seuls les produits de la page demandee sont enrichis par lots afin
+d'eviter les appels par produit. Cette API ne cree pas encore de commande menu.
 
 **Disponibilité stock** : le résumé et le détail produit exposent une disponibilité de base via lecture du service stock existant (`get_product_availability`) sans modifier le module stock.
 

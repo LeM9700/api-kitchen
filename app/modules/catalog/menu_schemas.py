@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.modules.catalog.schemas import ExtraOut, MediaImagePublicOut, ProductSummaryOut, VariantOut
+
 
 class MenuCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
@@ -150,3 +152,36 @@ class MenuAdminListOut(BaseModel):
     page: int
     page_size: int
     pages: int
+
+
+class MenuProductPublicOut(ProductSummaryOut):
+    menu_group_item_id: int
+    display_order: int
+    variants: list[VariantOut] = Field(default_factory=list)
+    extras: list[ExtraOut] = Field(default_factory=list)
+    gallery: list[MediaImagePublicOut] = Field(default_factory=list)
+
+
+class MenuGroupPublicOut(BaseModel):
+    id: int
+    name: str
+    min_choices: int
+    max_choices: int
+    display_order: int
+    products: list[MenuProductPublicOut] = Field(default_factory=list)
+    is_available: bool
+    unavailable_reason: str | None = None
+
+
+class MenuPublicOut(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+    fixed_price: float
+    image_url: str | None = None
+    display_order: int
+    available_from: datetime | None = None
+    available_until: datetime | None = None
+    groups: list[MenuGroupPublicOut] = Field(default_factory=list)
+    is_available: bool
+    unavailable_reasons: list[str] = Field(default_factory=list)

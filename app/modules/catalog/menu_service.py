@@ -1,21 +1,36 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 from math import ceil
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.http.errors import AppError
 from app.core.http.schemas import PaginationParams
 from app.modules.admin.customers.service import record_admin_audit
+from app.modules.catalog import service as catalog_service
+from app.modules.catalog.image.image_model import MediaImage
 from app.modules.catalog.menu_schemas import (
     MenuAdminListOut,
     MenuAdminOut,
     MenuGroupAdminOut,
     MenuGroupItemAdminOut,
+    MenuGroupPublicOut,
+    MenuProductPublicOut,
+    MenuPublicOut,
 )
-from app.modules.catalog.models import Menu, MenuGroup, MenuGroupItem, Product
+from app.modules.catalog.models import (
+    Extra,
+    Menu,
+    MenuGroup,
+    MenuGroupItem,
+    Product,
+    ProductExtra,
+    ProductVariant,
+)
+from app.modules.catalog.schemas import ExtraOut, MediaImagePublicOut, VariantOut
 
 
 def _audit_value(value: Any) -> Any:
@@ -252,6 +267,276 @@ async def list_admin_menus(
 
 async def get_admin_menu(session: AsyncSession, menu_id: int) -> MenuAdminOut:
     return await _menu_output(session, await _get_menu(session, menu_id))
+
+
+def _public_menu_filter(now: datetime):
+    return (
+        Menu.is_active.is_(True),
+        or_(Menu.available_from.is_(None), Menu.available_from <= now),
+        or_(Menu.available_until.is_(None), Menu.available_until > now),
+    )
+
+
+async def _complete_public_menu_ids(session: AsyncSession, menu_ids: list[int]) -> set[int]:
+    if not menu_ids:
+        return set()
+    groups = list(
+        (
+            await session.execute(select(MenuGroup).where(MenuGroup.menu_id.in_(menu_ids)))
+        ).scalars()
+    )
+    if not groups:
+        return set()
+    group_ids = [group.id for group in groups]
+    active_counts = dict(
+        (
+            await session.execute(
+                select(MenuGroupItem.group_id, func.count(MenuGroupItem.id))
+                .join(Product, Product.id == MenuGroupItem.product_id)
+                .where(
+                    MenuGroupItem.group_id.in_(group_ids),
+                    Product.is_active.is_(True),
+                )
+                .group_by(MenuGroupItem.group_id)
+            )
+        ).all()
+    )
+    groups_by_menu: dict[int, list[MenuGroup]] = {menu_id: [] for menu_id in menu_ids}
+    for group in groups:
+        groups_by_menu[group.menu_id].append(group)
+    return {
+        menu_id
+        for menu_id, menu_groups in groups_by_menu.items()
+        if menu_groups
+        and all(active_counts.get(group.id, 0) >= group.min_choices for group in menu_groups)
+    }
+
+
+async def _build_public_menu_outputs(session: AsyncSession, menus: list[Menu]) -> list[MenuPublicOut]:
+    if not menus:
+        return []
+
+    menu_snapshots = [
+        {
+            "id": menu.id,
+            "name": menu.name,
+            "description": menu.description,
+            "fixed_price": menu.fixed_price,
+            "image_url": menu.image_url,
+            "display_order": menu.display_order,
+            "available_from": menu.available_from,
+            "available_until": menu.available_until,
+        }
+        for menu in menus
+    ]
+    menu_ids = [menu["id"] for menu in menu_snapshots]
+    groups = list(
+        (
+            await session.execute(
+                select(MenuGroup)
+                .where(MenuGroup.menu_id.in_(menu_ids))
+                .order_by(MenuGroup.menu_id, MenuGroup.display_order, MenuGroup.id)
+            )
+        ).scalars()
+    )
+    group_ids = [group.id for group in groups]
+    item_rows = []
+    if group_ids:
+        item_rows = (
+            await session.execute(
+                select(MenuGroupItem, Product)
+                .join(Product, Product.id == MenuGroupItem.product_id)
+                .where(MenuGroupItem.group_id.in_(group_ids))
+                .order_by(MenuGroupItem.group_id, MenuGroupItem.display_order, MenuGroupItem.id)
+            )
+        ).all()
+
+    active_products: dict[int, Product] = {}
+    items_by_group: dict[int, list[tuple[MenuGroupItem, Product]]] = {
+        group_id: [] for group_id in group_ids
+    }
+    for item, product in item_rows:
+        if not product.is_active:
+            continue
+        active_products[product.id] = product
+        items_by_group[item.group_id].append((item, product))
+
+    product_ids = list(active_products)
+    summaries_by_id = {}
+    if product_ids:
+        summaries = await catalog_service.build_product_summaries(
+            session,
+            list(active_products.values()),
+            include_availability=True,
+        )
+        summaries_by_id = {summary.id: summary for summary in summaries}
+
+    variants_by_product: dict[int, list[VariantOut]] = {product_id: [] for product_id in product_ids}
+    extras_by_product: dict[int, list[ExtraOut]] = {product_id: [] for product_id in product_ids}
+    gallery_by_product: dict[int, list[MediaImagePublicOut]] = {
+        product_id: [] for product_id in product_ids
+    }
+    if product_ids:
+        variants = list(
+            (
+                await session.execute(
+                    select(ProductVariant)
+                    .where(
+                        ProductVariant.product_id.in_(product_ids),
+                        ProductVariant.is_active.is_(True),
+                    )
+                    .order_by(ProductVariant.product_id, ProductVariant.name, ProductVariant.id)
+                )
+            ).scalars()
+        )
+        for variant in variants:
+            variants_by_product[variant.product_id].append(VariantOut.model_validate(variant))
+
+        extra_rows = (
+            await session.execute(
+                select(ProductExtra.product_id, Extra)
+                .join(Extra, Extra.id == ProductExtra.extra_id)
+                .where(
+                    ProductExtra.product_id.in_(product_ids),
+                    Extra.is_active.is_(True),
+                )
+                .order_by(ProductExtra.product_id, Extra.name, Extra.id)
+            )
+        ).all()
+        for product_id, extra in extra_rows:
+            extras_by_product[product_id].append(ExtraOut.model_validate(extra))
+
+        images = list(
+            (
+                await session.execute(
+                    select(MediaImage)
+                    .where(
+                        MediaImage.entity_type == "product",
+                        MediaImage.entity_id.in_(product_ids),
+                    )
+                    .order_by(MediaImage.entity_id, MediaImage.display_order, MediaImage.id)
+                )
+            ).scalars()
+        )
+        for image in images:
+            gallery_by_product[image.entity_id].append(MediaImagePublicOut.model_validate(image))
+
+    groups_by_menu: dict[int, list[MenuGroup]] = {menu_id: [] for menu_id in menu_ids}
+    for group in groups:
+        groups_by_menu[group.menu_id].append(group)
+
+    outputs: list[MenuPublicOut] = []
+    for menu in menu_snapshots:
+        menu_groups = groups_by_menu[menu["id"]]
+        if not menu_groups:
+            continue
+
+        public_groups: list[MenuGroupPublicOut] = []
+        menu_incomplete = False
+        unavailable_reasons: list[str] = []
+        for group in menu_groups:
+            group_items = items_by_group[group.id]
+            if len(group_items) < group.min_choices:
+                menu_incomplete = True
+                break
+
+            public_products: list[MenuProductPublicOut] = []
+            available_count = 0
+            for item, product in group_items:
+                summary = summaries_by_id[product.id]
+                if summary.availability is None or summary.availability.available:
+                    available_count += 1
+                public_products.append(
+                    MenuProductPublicOut(
+                        **summary.model_dump(),
+                        menu_group_item_id=item.id,
+                        display_order=item.display_order,
+                        variants=variants_by_product[product.id],
+                        extras=extras_by_product[product.id],
+                        gallery=gallery_by_product[product.id],
+                    )
+                )
+
+            group_available = available_count >= group.min_choices
+            unavailable_reason = None
+            if not group_available:
+                unavailable_reason = (
+                    f"Le groupe '{group.name}' ne dispose pas d'assez de produits disponibles."
+                )
+                unavailable_reasons.append(unavailable_reason)
+            public_groups.append(
+                MenuGroupPublicOut(
+                    id=group.id,
+                    name=group.name,
+                    min_choices=group.min_choices,
+                    max_choices=group.max_choices,
+                    display_order=group.display_order,
+                    products=public_products,
+                    is_available=group_available,
+                    unavailable_reason=unavailable_reason,
+                )
+            )
+
+        if menu_incomplete:
+            continue
+        outputs.append(
+            MenuPublicOut(
+                id=menu["id"],
+                name=menu["name"],
+                description=menu["description"],
+                fixed_price=float(menu["fixed_price"]),
+                image_url=menu["image_url"],
+                display_order=menu["display_order"],
+                available_from=menu["available_from"],
+                available_until=menu["available_until"],
+                groups=public_groups,
+                is_available=not unavailable_reasons,
+                unavailable_reasons=unavailable_reasons,
+            )
+        )
+    return outputs
+
+
+async def list_public_menus(
+    session: AsyncSession,
+    pagination: PaginationParams,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[MenuPublicOut], int]:
+    effective_now = now or datetime.now(timezone.utc)
+    menus = list(
+        (
+            await session.execute(
+                select(Menu)
+                .where(*_public_menu_filter(effective_now))
+                .order_by(Menu.display_order, Menu.name, Menu.id)
+            )
+        ).scalars()
+    )
+    complete_ids = await _complete_public_menu_ids(session, [menu.id for menu in menus])
+    complete_menus = [menu for menu in menus if menu.id in complete_ids]
+    total = len(complete_menus)
+    offset = (pagination.page - 1) * pagination.page_size
+    page_menus = complete_menus[offset : offset + pagination.page_size]
+    return await _build_public_menu_outputs(session, page_menus), total
+
+
+async def get_public_menu(
+    session: AsyncSession,
+    menu_id: int,
+    *,
+    now: datetime | None = None,
+) -> MenuPublicOut:
+    effective_now = now or datetime.now(timezone.utc)
+    menu = await session.scalar(
+        select(Menu).where(Menu.id == menu_id, *_public_menu_filter(effective_now))
+    )
+    if menu is None:
+        raise AppError("MENU_NOT_FOUND", "Menu introuvable ou indisponible", 404, "menu_id")
+    outputs = await _build_public_menu_outputs(session, [menu])
+    if not outputs:
+        raise AppError("MENU_NOT_FOUND", "Menu introuvable ou indisponible", 404, "menu_id")
+    return outputs[0]
 
 
 async def create_menu(
