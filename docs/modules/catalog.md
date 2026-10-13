@@ -85,6 +85,33 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 | GET | `/api/v1/catalog/admin/completeness` | Bearer JWT | staff, admin |
 | GET | `/api/v1/catalog/price-audit/{entity_type}/{entity_id}` | Bearer JWT | admin |
 
+### Menus composes - administration (migration `0080`)
+| Methode | Path | Permission |
+|---------|------|------------|
+| GET | `/api/v1/catalog/admin/menus` | `catalog:read` |
+| GET | `/api/v1/catalog/admin/menus/{menu_id}` | `catalog:read` |
+| POST | `/api/v1/catalog/admin/menus` | `catalog:write` |
+| PUT | `/api/v1/catalog/admin/menus/{menu_id}` | `catalog:write` |
+| DELETE | `/api/v1/catalog/admin/menus/{menu_id}` | `catalog:write` |
+| POST | `/api/v1/catalog/admin/menus/{menu_id}/groups` | `catalog:write` |
+| PUT | `/api/v1/catalog/admin/menus/{menu_id}/groups/{group_id}` | `catalog:write` |
+| DELETE | `/api/v1/catalog/admin/menus/{menu_id}/groups/{group_id}` | `catalog:write` |
+| POST | `/api/v1/catalog/admin/menus/{menu_id}/groups/{group_id}/items` | `catalog:write` |
+| PUT | `/api/v1/catalog/admin/menus/{menu_id}/groups/{group_id}/items/{item_id}` | `catalog:write` |
+| DELETE | `/api/v1/catalog/admin/menus/{menu_id}/groups/{group_id}/items/{item_id}` | `catalog:write` |
+
+Un menu est toujours cree en brouillon. La publication (`is_active=true`) est refusee
+tant qu'il manque un groupe ou qu'un groupe ne contient pas assez de produits actifs
+pour satisfaire `min_choices`. Toute modification reelle de composition depublie
+automatiquement un menu actif ; l'admin doit controler puis republier la formule.
+Les reponses exposent `is_publishable` et `validation_errors` pour alimenter l'interface.
+
+Les menus restent locaux au tenant, y compris en mode POS `connected`. Ils peuvent
+referencer un produit synchronise via son identifiant local sans modifier son nom,
+son prix, sa TVA ou son identifiant externe. Le prix fixe appartient exclusivement
+au menu. La suppression d'un menu est definitive pour sa composition et conserve
+une trace dans `admin_audit_logs`.
+
 ### Super-admin lecture seule
 | Méthode | Path | Auth | Rôles |
 |---------|------|------|-------|
@@ -158,6 +185,11 @@ Exposition du catalogue produits d'un tenant : catégories, produits, variantes,
 **Historique de prix** : toute création ou modification de prix produit/variant/extra via admin ou import CSV crée une entrée `catalog_price_audits`.
 
 **Recommandations** : associations manuelles produit → produits recommandés, avec `display_order`, `label` et soft-disable via `is_active`.
+
+**Administration des menus** : le prix, l'activation et chaque changement de
+composition sont traces dans `admin_audit_logs`. Les groupes et items sont toujours
+recherches sous leur menu parent pour empecher l'utilisation d'un identifiant issu
+d'un autre menu du tenant. Aucun endpoint public client n'est expose en phase 2.
 
 **Disponibilité stock** : le résumé et le détail produit exposent une disponibilité de base via lecture du service stock existant (`get_product_availability`) sans modifier le module stock.
 

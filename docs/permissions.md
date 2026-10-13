@@ -33,8 +33,8 @@ Permissions actuellement gate-keepées par `require_permission(...)` dans le cod
 
 | Permission                  | Domaine                                    |
 |------------------------------|---------------------------------------------|
-| `catalog:read`               | Consultation du catalogue produits          |
-| `catalog:write`               | Modification du catalogue produits          |
+| `catalog:read`               | Consultation du catalogue et des menus admin |
+| `catalog:write`              | Modification du catalogue et des menus       |
 | `catalog:availability`        | Bascule de disponibilité produit             |
 | `haccp:read`                  | Consultation des relevés HACCP               |
 | `haccp:write`                 | Démarrage d'une checklist et saisie des preuves HACCP |

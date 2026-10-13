@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from app.core.database import get_tenant_session
-from app.core.http.deps import get_arq_pool, get_pagination, require_permission, require_role
+from app.core.http.deps import get_arq_pool, get_client_ip, get_pagination, require_permission, require_role
 from app.core.http.errors import AppError
 from app.core.http.limiter import limiter, user_or_ip_key
 from app.core.http.schemas import PaginationParams
@@ -10,9 +10,19 @@ from app.core.services.cache import get_cached_json, invalidate_prefix, set_cach
 from app.core.services.fx_rates import get_cached_rate
 from app.modules.admin.tenants.schemas import SUPPORTED_CURRENCIES
 from app.modules.admin.tenants.service import get_or_create_config
-from app.modules.catalog import override_repository, service
+from app.modules.catalog import menu_service, override_repository, service
 from app.modules.catalog.deps import get_catalog_provider, require_catalog_writable
 from app.modules.catalog.models import Product
+from app.modules.catalog.menu_schemas import (
+    MenuAdminListOut,
+    MenuAdminOut,
+    MenuCreate,
+    MenuGroupCreate,
+    MenuGroupItemCreate,
+    MenuGroupItemUpdate,
+    MenuGroupUpdate,
+    MenuUpdate,
+)
 from app.modules.catalog.schemas import (
     CatalogCsvConfirmResponse,
     CatalogCsvDryRunResponse,
@@ -86,6 +96,220 @@ async def _apply_display_currency(items: list[dict], display_currency: str | Non
         if base_price is not None:
             item["display_price"] = round(float(base_price) * rate, 2)
             item["display_currency"] = display_currency
+
+
+def _menu_audit_context(request: Request) -> tuple[str | None, str | None]:
+    return get_client_ip(request), request.headers.get("user-agent")
+
+
+# ---------------------------------------------------------------------------
+# Menus - admin API
+# ---------------------------------------------------------------------------
+
+
+@router.get("/admin/menus", response_model=MenuAdminListOut)
+async def admin_list_menus(
+    pagination: PaginationParams = Depends(get_pagination),
+    current_user=Depends(require_permission("catalog:read", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.list_admin_menus(session, pagination)
+
+
+@router.get("/admin/menus/{menu_id}", response_model=MenuAdminOut)
+async def admin_get_menu(
+    menu_id: int,
+    current_user=Depends(require_permission("catalog:read", "staff", "admin")),
+):
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.get_admin_menu(session, menu_id)
+
+
+@router.post("/admin/menus", response_model=MenuAdminOut, status_code=201)
+async def admin_create_menu(
+    request: Request,
+    body: MenuCreate,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.create_menu(
+            session,
+            body,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.put("/admin/menus/{menu_id}", response_model=MenuAdminOut)
+async def admin_update_menu(
+    request: Request,
+    menu_id: int,
+    body: MenuUpdate,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.update_menu(
+            session,
+            menu_id,
+            body,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.delete("/admin/menus/{menu_id}", status_code=204)
+async def admin_delete_menu(
+    request: Request,
+    menu_id: int,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        await menu_service.delete_menu(
+            session,
+            menu_id,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.post("/admin/menus/{menu_id}/groups", response_model=MenuAdminOut, status_code=201)
+async def admin_create_menu_group(
+    request: Request,
+    menu_id: int,
+    body: MenuGroupCreate,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.create_group(
+            session,
+            menu_id,
+            body,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.put("/admin/menus/{menu_id}/groups/{group_id}", response_model=MenuAdminOut)
+async def admin_update_menu_group(
+    request: Request,
+    menu_id: int,
+    group_id: int,
+    body: MenuGroupUpdate,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.update_group(
+            session,
+            menu_id,
+            group_id,
+            body,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.delete("/admin/menus/{menu_id}/groups/{group_id}", response_model=MenuAdminOut)
+async def admin_delete_menu_group(
+    request: Request,
+    menu_id: int,
+    group_id: int,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.delete_group(
+            session,
+            menu_id,
+            group_id,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.post(
+    "/admin/menus/{menu_id}/groups/{group_id}/items",
+    response_model=MenuAdminOut,
+    status_code=201,
+)
+async def admin_add_menu_group_item(
+    request: Request,
+    menu_id: int,
+    group_id: int,
+    body: MenuGroupItemCreate,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.add_group_item(
+            session,
+            menu_id,
+            group_id,
+            body,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.put(
+    "/admin/menus/{menu_id}/groups/{group_id}/items/{item_id}",
+    response_model=MenuAdminOut,
+)
+async def admin_update_menu_group_item(
+    request: Request,
+    menu_id: int,
+    group_id: int,
+    item_id: int,
+    body: MenuGroupItemUpdate,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.update_group_item(
+            session,
+            menu_id,
+            group_id,
+            item_id,
+            body,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+
+@router.delete(
+    "/admin/menus/{menu_id}/groups/{group_id}/items/{item_id}",
+    response_model=MenuAdminOut,
+)
+async def admin_delete_menu_group_item(
+    request: Request,
+    menu_id: int,
+    group_id: int,
+    item_id: int,
+    current_user=Depends(require_permission("catalog:write", "staff", "admin")),
+):
+    ip_address, user_agent = _menu_audit_context(request)
+    async with get_tenant_session(current_user["tenant_slug"]) as session:
+        return await menu_service.delete_group_item(
+            session,
+            menu_id,
+            group_id,
+            item_id,
+            actor=current_user,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
 
 
 # ---------------------------------------------------------------------------
